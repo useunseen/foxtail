@@ -1,0 +1,28 @@
+[package]
+name = "aws-mock-data-service"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.0", features = ["full"] }
+axum = "0.7"
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "macros", "chrono"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_urlencoded = "0.7"
+quick-xml = { version = "0.37", features = ["serialize"] }
+clap = { version = "4.0", features = ["derive", "env"] }
+urlencoding = "2.1"
+aws-config = { version = "1.0", features = ["behavior-version-latest"] }
+aws-sdk-ec2 = "1.0"
+aws-sdk-rds = "1.0"
+aws-sdk-s3 = "1.0"
+aws-sdk-elasticloadbalancingv2 = "1.0"
+aws-sdk-cloudwatch = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1.0", features = ["v4"] }
+tower-http = { version = "0.5", features = ["trace", "cors"] }
+dotenvy = "0.15"

@@ -1,0 +1,10 @@
+target/
+mock_data.db
+server.log
+
+.mock_data/
+memory-bank/*
+tool_catalog/
+.worktrees/
+
+.DS_Store
