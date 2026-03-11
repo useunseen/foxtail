@@ -1,5 +1,7 @@
 target/
 mock_data.db
+mock_data.db-shm
+mock_data.db-wal
 server.log
 
 .mock_data/

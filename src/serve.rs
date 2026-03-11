@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{Row, SqlitePool};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use tracing::{debug, info, warn};
 
@@ -23,7 +23,19 @@ use crate::metrics::{self, MetricQueryParams};
 const ADMIN_TOKEN_HEADER: &str = "x-mock-admin-token";
 
 pub async fn run(pool: SqlitePool, address: String, port: u16) -> Result<()> {
-    let app = Router::new()
+    let app = build_app(pool);
+
+    let addr: SocketAddr = format!("{}:{}", address, port).parse()?;
+    info!("Starting AWS-compatible API server on {}", addr);
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+
+    Ok(())
+}
+
+fn build_app(pool: SqlitePool) -> Router {
+    Router::new()
         .route("/", post(aws_handler))
         .route("/_mock/status", get(status_handler))
         .route("/_mock/dashboard/data", get(dashboard_data_handler))
@@ -40,15 +52,7 @@ pub async fn run(pool: SqlitePool, address: String, port: u16) -> Result<()> {
             get(dashboard_cost_trends_handler),
         )
         .route("/_mock/scenario", post(scenario_handler))
-        .with_state(pool);
-
-    let addr: SocketAddr = format!("{}:{}", address, port).parse()?;
-    info!("Starting AWS-compatible API server on {}", addr);
-
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
-
-    Ok(())
+        .with_state(pool)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -66,6 +70,10 @@ struct CloudWatchQuery {
     start_time: Option<String>,
     end_time: Option<String>,
     period: Option<i32>,
+    #[serde(rename = "NextToken")]
+    next_token: Option<String>,
+    #[serde(rename = "RecentlyActive")]
+    recently_active: Option<String>,
     #[serde(rename = "Dimensions.member.1.Name")]
     dim_name_1: Option<String>,
     #[serde(rename = "Dimensions.member.1.Value")]
@@ -236,6 +244,27 @@ struct DashboardApiEntry {
     endpoint: Option<String>,
 }
 
+fn cost_explorer_api_entries(operation: &str) -> [DashboardApiEntry; 2] {
+    [
+        DashboardApiEntry {
+            service: "cost-explorer".to_string(),
+            operation: operation.to_string(),
+            protocol: "json-1.1".to_string(),
+            target: Some(format!("AWSCostExplorer.{}", operation)),
+            action: None,
+            endpoint: None,
+        },
+        DashboardApiEntry {
+            service: "cost-explorer".to_string(),
+            operation: operation.to_string(),
+            protocol: "json-1.1-alias".to_string(),
+            target: Some(format!("AWSInsightsIndexService.{}", operation)),
+            action: None,
+            endpoint: None,
+        },
+    ]
+}
+
 #[derive(Serialize)]
 struct DashboardSummary {
     resource_count: i64,
@@ -258,6 +287,18 @@ struct DashboardDataQuery {
     metric_name: Option<String>,
     top_n: Option<usize>,
     window_hours: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct NormalizedDashboardQuery {
+    scope: String,
+    resource_type: Option<String>,
+    resource_id: Option<String>,
+    namespace: Option<String>,
+    metric_name: Option<String>,
+    top_n: usize,
+    window_hours: i64,
+    min_seconds: i64,
 }
 
 #[derive(Serialize)]
@@ -335,30 +376,306 @@ struct DashboardCoverageScorecard {
     benchmarks: DashboardParityBenchmarks,
 }
 
-fn extract_resource_id_from_query(query: &CloudWatchQuery) -> Option<String> {
-    if let Some(ref name) = query.dim_name_1 {
-        if name == "InstanceId"
-            || name == "VolumeId"
-            || name == "BucketName"
-            || name == "DBInstanceIdentifier"
-        {
-            return query.dim_value_1.clone();
-        }
+type MetricBucketMap = HashMap<i64, (f64, i64)>;
+type MetricGroupMap = HashMap<String, (String, MetricBucketMap)>;
+type CostBucketMap = HashMap<i64, f64>;
+type CostGroupMap = HashMap<String, (String, CostBucketMap)>;
+
+fn normalize_dashboard_query(query: DashboardDataQuery) -> NormalizedDashboardQuery {
+    let scope = normalize_scope(query.scope);
+    let resource_type = normalize_query_value(query.resource_type);
+    let resource_id = normalize_query_value(query.resource_id);
+    let namespace = normalize_query_value(query.namespace);
+    let metric_name = normalize_query_value(query.metric_name);
+    let top_n = query.top_n.unwrap_or(50).clamp(1, 500);
+    let window_hours = query.window_hours.unwrap_or(24 * 14).clamp(24, 24 * 30);
+
+    NormalizedDashboardQuery {
+        scope,
+        resource_type,
+        resource_id,
+        namespace,
+        metric_name,
+        top_n,
+        window_hours,
+        min_seconds: -window_hours * 3600,
     }
-    if let Some(ref name) = query.dim_name_2 {
-        if name == "InstanceId"
+}
+
+fn dashboard_applied_filters(query: &NormalizedDashboardQuery) -> DashboardAppliedFilters {
+    DashboardAppliedFilters {
+        scope: query.scope.clone(),
+        resource_type: query.resource_type.clone(),
+        resource_id: query.resource_id.clone(),
+        namespace: query.namespace.clone(),
+        metric_name: query.metric_name.clone(),
+        top_n: query.top_n,
+        window_hours: query.window_hours,
+    }
+}
+
+fn dashboard_error_response() -> axum::response::Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "error": "dashboard query failed"
+        })),
+    )
+        .into_response()
+}
+
+async fn fetch_dashboard_summary(pool: &SqlitePool) -> Result<DashboardSummary> {
+    Ok(DashboardSummary {
+        resource_count: sqlx::query_scalar("SELECT COUNT(*) FROM resources")
+            .fetch_one(pool)
+            .await?,
+        metric_count: sqlx::query_scalar("SELECT COUNT(*) FROM metrics")
+            .fetch_one(pool)
+            .await?,
+        cost_record_count: sqlx::query_scalar("SELECT COUNT(*) FROM cost_records")
+            .fetch_one(pool)
+            .await?,
+    })
+}
+
+async fn fetch_dashboard_resource_catalog(
+    pool: &SqlitePool,
+    query: &NormalizedDashboardQuery,
+) -> Result<Vec<DashboardResourceEntry>> {
+    let resource_rows = sqlx::query(
+        "SELECT id, resource_type, region, scenario
+         FROM resources
+         WHERE (? IS NULL OR resource_type = ?)
+           AND (? IS NULL OR id = ?)
+         ORDER BY id ASC",
+    )
+    .bind(query.resource_type.as_deref())
+    .bind(query.resource_type.as_deref())
+    .bind(query.resource_id.as_deref())
+    .bind(query.resource_id.as_deref())
+    .fetch_all(pool)
+    .await?;
+
+    Ok(resource_rows
+        .into_iter()
+        .filter_map(|row| {
+            Some(DashboardResourceEntry {
+                resource_id: row.try_get::<String, _>("id").ok()?,
+                resource_type: row.try_get::<String, _>("resource_type").ok()?,
+                region: row.try_get::<String, _>("region").ok()?,
+                scenario: row.try_get::<String, _>("scenario").ok()?,
+            })
+        })
+        .collect())
+}
+
+async fn fetch_dashboard_cost_by_resource(
+    pool: &SqlitePool,
+    query: &NormalizedDashboardQuery,
+) -> Result<Vec<DashboardContributor>> {
+    let rows = sqlx::query(
+        "SELECT c.resource_id AS resource_id,
+                r.resource_type AS resource_type,
+                SUM(c.amount) AS total_cost
+         FROM cost_records c
+         JOIN resources r ON r.id = c.resource_id
+         WHERE c.seconds_from_now >= ?
+           AND (? IS NULL OR r.resource_type = ?)
+           AND (? IS NULL OR c.resource_id = ?)
+         GROUP BY c.resource_id, r.resource_type
+         ORDER BY total_cost DESC, c.resource_id ASC
+         LIMIT ?",
+    )
+    .bind(query.min_seconds)
+    .bind(query.resource_type.as_deref())
+    .bind(query.resource_type.as_deref())
+    .bind(query.resource_id.as_deref())
+    .bind(query.resource_id.as_deref())
+    .bind(query.top_n as i64)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            Some(DashboardContributor {
+                resource_id: row.try_get::<String, _>("resource_id").ok()?,
+                resource_type: row.try_get::<String, _>("resource_type").ok()?,
+                total_cost: row.try_get::<f64, _>("total_cost").ok()?,
+                average_utilization: None,
+            })
+        })
+        .collect())
+}
+
+async fn fetch_dashboard_low_utilization_resources(
+    pool: &SqlitePool,
+    query: &NormalizedDashboardQuery,
+    cost_by_resource: &HashMap<String, f64>,
+) -> Result<Vec<DashboardContributor>> {
+    let rows = sqlx::query(
+        "SELECT m.resource_id AS resource_id,
+                r.resource_type AS resource_type,
+                AVG(m.value) AS average_utilization
+         FROM metrics m
+         JOIN resources r ON r.id = m.resource_id
+         WHERE m.seconds_from_now >= ?
+           AND (? IS NULL OR r.resource_type = ?)
+           AND (? IS NULL OR m.resource_id = ?)
+           AND (? IS NULL OR m.namespace = ?)
+           AND (? IS NULL OR m.metric_name = ?)
+         GROUP BY m.resource_id, r.resource_type",
+    )
+    .bind(query.min_seconds)
+    .bind(query.resource_type.as_deref())
+    .bind(query.resource_type.as_deref())
+    .bind(query.resource_id.as_deref())
+    .bind(query.resource_id.as_deref())
+    .bind(query.namespace.as_deref())
+    .bind(query.namespace.as_deref())
+    .bind(query.metric_name.as_deref())
+    .bind(query.metric_name.as_deref())
+    .fetch_all(pool)
+    .await?;
+
+    let mut contributors = rows
+        .into_iter()
+        .filter_map(|row| {
+            let resource_id = row.try_get::<String, _>("resource_id").ok()?;
+            Some(DashboardContributor {
+                resource_type: row.try_get::<String, _>("resource_type").ok()?,
+                total_cost: cost_by_resource.get(&resource_id).copied().unwrap_or(0.0),
+                average_utilization: row.try_get::<f64, _>("average_utilization").ok(),
+                resource_id,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    contributors.sort_by(|a, b| {
+        let a_util = a.average_utilization.unwrap_or(f64::MAX);
+        let b_util = b.average_utilization.unwrap_or(f64::MAX);
+        a_util
+            .partial_cmp(&b_util)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                b.total_cost
+                    .partial_cmp(&a.total_cost)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| a.resource_id.cmp(&b.resource_id))
+    });
+    contributors.truncate(query.top_n);
+
+    Ok(contributors)
+}
+
+async fn fetch_dashboard_metric_rows(
+    pool: &SqlitePool,
+    query: &NormalizedDashboardQuery,
+) -> Result<Vec<sqlx::sqlite::SqliteRow>> {
+    Ok(sqlx::query(
+        "SELECT m.resource_id AS resource_id,
+                r.resource_type AS resource_type,
+                m.namespace AS namespace,
+                m.metric_name AS metric_name,
+                CAST(m.seconds_from_now AS INTEGER) AS s,
+                CAST(m.value AS REAL) AS v
+         FROM metrics m
+         JOIN resources r ON r.id = m.resource_id
+         WHERE m.seconds_from_now >= ?
+           AND (? IS NULL OR r.resource_type = ?)
+           AND (? IS NULL OR m.resource_id = ?)
+           AND (? IS NULL OR m.namespace = ?)
+           AND (? IS NULL OR m.metric_name = ?)
+         ORDER BY m.seconds_from_now ASC",
+    )
+    .bind(query.min_seconds)
+    .bind(query.resource_type.as_deref())
+    .bind(query.resource_type.as_deref())
+    .bind(query.resource_id.as_deref())
+    .bind(query.resource_id.as_deref())
+    .bind(query.namespace.as_deref())
+    .bind(query.namespace.as_deref())
+    .bind(query.metric_name.as_deref())
+    .bind(query.metric_name.as_deref())
+    .fetch_all(pool)
+    .await?)
+}
+
+async fn fetch_dashboard_cost_rows(
+    pool: &SqlitePool,
+    query: &NormalizedDashboardQuery,
+) -> Result<Vec<sqlx::sqlite::SqliteRow>> {
+    Ok(sqlx::query(
+        "SELECT c.resource_id AS resource_id,
+                r.resource_type AS resource_type,
+                CAST(c.seconds_from_now AS INTEGER) AS s,
+                CAST(c.amount AS REAL) AS amount
+         FROM cost_records c
+         JOIN resources r ON r.id = c.resource_id
+         WHERE c.seconds_from_now >= ?
+           AND (? IS NULL OR r.resource_type = ?)
+           AND (? IS NULL OR c.resource_id = ?)
+         ORDER BY c.seconds_from_now ASC",
+    )
+    .bind(query.min_seconds)
+    .bind(query.resource_type.as_deref())
+    .bind(query.resource_type.as_deref())
+    .bind(query.resource_id.as_deref())
+    .bind(query.resource_id.as_deref())
+    .fetch_all(pool)
+    .await?)
+}
+
+fn build_coverage_scorecard(implemented_api_entries: i64) -> DashboardCoverageScorecard {
+    let cloudwatch_summary = DashboardCoverageServiceSummary {
+        total_operations: 39,
+        implemented_operations: 2,
+        unimplemented_operations: 37,
+    };
+    let cost_explorer_summary = DashboardCoverageServiceSummary {
+        total_operations: 46,
+        implemented_operations: 11,
+        unimplemented_operations: 35,
+    };
+
+    DashboardCoverageScorecard {
+        implemented_api_entries,
+        implemented_tested_entries: 0,
+        cloudwatch: cloudwatch_summary,
+        cost_explorer: cost_explorer_summary,
+        benchmarks: DashboardParityBenchmarks {
+            operation_coverage: 0.0,
+            input_member_coverage: 0.0,
+            output_member_coverage: 0.0,
+            error_model_coverage: 0.0,
+            behavioral_coverage_count: 0,
+        },
+    }
+}
+
+fn extract_resource_id_from_query(query: &CloudWatchQuery) -> Option<String> {
+    if let Some(ref name) = query.dim_name_1
+        && (name == "InstanceId"
             || name == "VolumeId"
             || name == "BucketName"
-            || name == "DBInstanceIdentifier"
-        {
-            return query.dim_value_2.clone();
-        }
+            || name == "DBInstanceIdentifier")
+    {
+        return query.dim_value_1.clone();
+    }
+    if let Some(ref name) = query.dim_name_2
+        && (name == "InstanceId"
+            || name == "VolumeId"
+            || name == "BucketName"
+            || name == "DBInstanceIdentifier")
+    {
+        return query.dim_value_2.clone();
     }
     // Fallback to dim_value_1 if it looks like an ID
-    if let Some(ref val) = query.dim_value_1 {
-        if val.starts_with("i-") || val.starts_with("vol-") {
-            return Some(val.clone());
-        }
+    if let Some(ref val) = query.dim_value_1
+        && (val.starts_with("i-") || val.starts_with("vol-"))
+    {
+        return Some(val.clone());
     }
     None
 }
@@ -465,6 +782,61 @@ fn ce_service_name_from_resource_type(resource_type: &str) -> &'static str {
     }
 }
 
+fn cloudwatch_dimension_name_for_resource_type(resource_type: &str) -> Option<&'static str> {
+    match resource_type {
+        "ec2" => Some("InstanceId"),
+        "s3" => Some("BucketName"),
+        "rds" => Some("DBInstanceIdentifier"),
+        "elb" => Some("LoadBalancer"),
+        _ => None,
+    }
+}
+
+fn canonical_cost_explorer_operation(target: &str) -> Option<&str> {
+    target
+        .strip_prefix("AWSCostExplorer.")
+        .or_else(|| target.strip_prefix("AWSInsightsIndexService."))
+}
+
+fn parse_group_by_dimension(
+    group_by: Option<&Vec<Value>>,
+) -> std::result::Result<Option<&str>, CostUsageError> {
+    let Some(group_by) = group_by else {
+        return Ok(None);
+    };
+    if group_by.is_empty() {
+        return Ok(None);
+    }
+    if group_by.len() > 1 {
+        return Err(CostUsageError::Validation(
+            "Only a single GroupBy entry is supported.".to_string(),
+        ));
+    }
+
+    let entry = &group_by[0];
+    let group_type = entry
+        .get("Type")
+        .and_then(Value::as_str)
+        .unwrap_or("DIMENSION");
+    let group_key = entry.get("Key").and_then(Value::as_str).ok_or_else(|| {
+        CostUsageError::Validation("GroupBy entry must include a Key.".to_string())
+    })?;
+
+    if group_type != "DIMENSION" {
+        return Err(CostUsageError::Validation(
+            "Only GroupBy Type 'DIMENSION' is supported.".to_string(),
+        ));
+    }
+
+    match group_key {
+        "SERVICE" | "REGION" | "RESOURCE_ID" => Ok(Some(group_key)),
+        _ => Err(CostUsageError::Validation(format!(
+            "Unsupported GroupBy Key '{}'.",
+            group_key
+        ))),
+    }
+}
+
 fn parse_usize_token(
     value: Option<&str>,
     field_name: &str,
@@ -502,7 +874,7 @@ fn cloudwatch_metric_unit(namespace: Option<&str>, metric_name: Option<&str>) ->
 
 fn ensure_admin_authorized(
     headers: &HeaderMap,
-) -> std::result::Result<(), axum::response::Response> {
+) -> std::result::Result<(), Box<axum::response::Response>> {
     let expected = std::env::var("AWS_MOCK_ADMIN_TOKEN")
         .ok()
         .map(|v| v.trim().to_string())
@@ -515,13 +887,15 @@ fn ensure_admin_authorized(
             .map(str::trim);
 
         if provided != Some(token.as_str()) {
-            return Err((
-                StatusCode::UNAUTHORIZED,
-                Json(json!({
-                    "error": "Unauthorized admin request"
-                })),
-            )
-                .into_response());
+            return Err(Box::new(
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({
+                        "error": "Unauthorized admin request"
+                    })),
+                )
+                    .into_response(),
+            ));
         }
     }
 
@@ -697,32 +1071,9 @@ fn sorted_cost_keys_with_top_n(
     keys
 }
 
-fn sort_metric_keys_by_priority(
-    keys: &mut [String],
-    metric_group_base_key: &HashMap<String, String>,
-    cost_by_group: &HashMap<String, f64>,
-) {
-    keys.sort_by(|a, b| {
-        let a_base = metric_group_base_key
-            .get(a)
-            .map(String::as_str)
-            .unwrap_or(a.as_str());
-        let b_base = metric_group_base_key
-            .get(b)
-            .map(String::as_str)
-            .unwrap_or(b.as_str());
-        let a_cost = cost_by_group.get(a_base).copied().unwrap_or(0.0);
-        let b_cost = cost_by_group.get(b_base).copied().unwrap_or(0.0);
-        b_cost
-            .partial_cmp(&a_cost)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.cmp(b))
-    });
-}
-
 fn build_metric_series_set(
     group_key: &str,
-    metric_groups: &HashMap<String, (String, HashMap<i64, (f64, i64)>)>,
+    metric_groups: &MetricGroupMap,
     now: DateTime<Utc>,
 ) -> Option<DashboardSeriesSet> {
     let (label, buckets) = metric_groups.get(group_key)?;
@@ -752,7 +1103,7 @@ fn build_metric_series_set(
 
 fn build_cost_series_set(
     group_key: &str,
-    cost_groups: &HashMap<String, (String, HashMap<i64, f64>)>,
+    cost_groups: &CostGroupMap,
     now: DateTime<Utc>,
 ) -> Option<DashboardSeriesSet> {
     let (label, buckets) = cost_groups.get(group_key)?;
@@ -780,111 +1131,18 @@ fn build_cost_series_set(
 async fn build_dashboard_data(
     pool: &SqlitePool,
     query: DashboardDataQuery,
-) -> DashboardDataResponse {
+) -> Result<DashboardDataResponse> {
     let now = Utc::now();
-    let scope = normalize_scope(query.scope);
-    let resource_type_filter = normalize_query_value(query.resource_type);
-    let resource_id_filter = normalize_query_value(query.resource_id);
-    let namespace_filter = normalize_query_value(query.namespace);
-    let metric_name_filter = normalize_query_value(query.metric_name);
-    let split_metric_dimension = metric_name_filter.is_none();
-    let top_n = query.top_n.unwrap_or(50).clamp(1, 500);
-    let window_hours = query.window_hours.unwrap_or(24 * 14).clamp(24, 24 * 30);
-    let min_seconds = -window_hours * 3600;
+    let query = normalize_dashboard_query(query);
+    let split_metric_dimension = query.metric_name.is_none();
+    let summary = fetch_dashboard_summary(pool).await?;
+    let resource_catalog = fetch_dashboard_resource_catalog(pool, &query).await?;
+    let metric_rows = fetch_dashboard_metric_rows(pool, &query).await?;
+    let cost_rows = fetch_dashboard_cost_rows(pool, &query).await?;
 
-    let resource_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM resources")
-        .fetch_one(pool)
-        .await
-        .unwrap_or(0);
-    let metric_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM metrics")
-        .fetch_one(pool)
-        .await
-        .unwrap_or(0);
-    let cost_record_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cost_records")
-        .fetch_one(pool)
-        .await
-        .unwrap_or(0);
-
-    let resource_rows = sqlx::query(
-        "SELECT id, resource_type, region, scenario
-         FROM resources
-         WHERE (? IS NULL OR resource_type = ?)
-           AND (? IS NULL OR id = ?)
-         ORDER BY id ASC",
-    )
-    .bind(resource_type_filter.as_deref())
-    .bind(resource_type_filter.as_deref())
-    .bind(resource_id_filter.as_deref())
-    .bind(resource_id_filter.as_deref())
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
-
-    let resource_catalog = resource_rows
-        .into_iter()
-        .filter_map(|row| {
-            Some(DashboardResourceEntry {
-                resource_id: row.try_get::<String, _>("id").ok()?,
-                resource_type: row.try_get::<String, _>("resource_type").ok()?,
-                region: row.try_get::<String, _>("region").ok()?,
-                scenario: row.try_get::<String, _>("scenario").ok()?,
-            })
-        })
-        .collect::<Vec<_>>();
-
-    let metric_rows = sqlx::query(
-        "SELECT m.resource_id AS resource_id,
-                r.resource_type AS resource_type,
-                m.namespace AS namespace,
-                m.metric_name AS metric_name,
-                CAST(m.seconds_from_now AS INTEGER) AS s,
-                CAST(m.value AS REAL) AS v
-         FROM metrics m
-         JOIN resources r ON r.id = m.resource_id
-         WHERE m.seconds_from_now >= ?
-           AND (? IS NULL OR r.resource_type = ?)
-           AND (? IS NULL OR m.resource_id = ?)
-           AND (? IS NULL OR m.namespace = ?)
-           AND (? IS NULL OR m.metric_name = ?)
-         ORDER BY m.seconds_from_now ASC",
-    )
-    .bind(min_seconds)
-    .bind(resource_type_filter.as_deref())
-    .bind(resource_type_filter.as_deref())
-    .bind(resource_id_filter.as_deref())
-    .bind(resource_id_filter.as_deref())
-    .bind(namespace_filter.as_deref())
-    .bind(namespace_filter.as_deref())
-    .bind(metric_name_filter.as_deref())
-    .bind(metric_name_filter.as_deref())
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
-
-    let cost_rows = sqlx::query(
-        "SELECT c.resource_id AS resource_id,
-                r.resource_type AS resource_type,
-                CAST(c.seconds_from_now AS INTEGER) AS s,
-                CAST(c.amount AS REAL) AS amount
-         FROM cost_records c
-         JOIN resources r ON r.id = c.resource_id
-         WHERE c.seconds_from_now >= ?
-           AND (? IS NULL OR r.resource_type = ?)
-           AND (? IS NULL OR c.resource_id = ?)
-         ORDER BY c.seconds_from_now ASC",
-    )
-    .bind(min_seconds)
-    .bind(resource_type_filter.as_deref())
-    .bind(resource_type_filter.as_deref())
-    .bind(resource_id_filter.as_deref())
-    .bind(resource_id_filter.as_deref())
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
-
-    let mut metric_groups: HashMap<String, (String, HashMap<i64, (f64, i64)>)> = HashMap::new();
-    let mut metric_group_base_key: HashMap<String, String> = HashMap::new();
+    let mut metric_groups: MetricGroupMap = HashMap::new();
     let mut utilization_by_resource: HashMap<String, (f64, i64)> = HashMap::new();
+    let mut metric_score_by_group: HashMap<String, f64> = HashMap::new();
 
     for row in metric_rows {
         let resource_id = match row.try_get::<String, _>("resource_id") {
@@ -910,20 +1168,25 @@ async fn build_dashboard_data(
         };
 
         let (group_key, group_label, base_key) = metric_grouping_for_scope(
-            &scope,
+            &query.scope,
             &resource_type,
             &resource_id,
             &namespace,
             &metric_name,
             split_metric_dimension,
         );
-        metric_group_base_key.insert(group_key.clone(), base_key);
         let (_, buckets) = metric_groups
-            .entry(group_key)
+            .entry(group_key.clone())
             .or_insert_with(|| (group_label, HashMap::new()));
         let bucket = buckets.entry(seconds_from_now).or_insert((0.0, 0));
         bucket.0 += value;
         bucket.1 += 1;
+        let score_key = if split_metric_dimension {
+            group_key
+        } else {
+            base_key
+        };
+        *metric_score_by_group.entry(score_key).or_insert(0.0) += value.abs();
 
         let utilization = utilization_by_resource
             .entry(resource_id)
@@ -932,9 +1195,7 @@ async fn build_dashboard_data(
         utilization.1 += 1;
     }
 
-    let mut cost_groups: HashMap<String, (String, HashMap<i64, f64>)> = HashMap::new();
-    let mut cost_by_resource: HashMap<String, f64> = HashMap::new();
-    let mut resource_type_by_resource: HashMap<String, String> = HashMap::new();
+    let mut cost_groups: CostGroupMap = HashMap::new();
     let mut cost_by_group: HashMap<String, f64> = HashMap::new();
 
     for row in cost_rows {
@@ -954,66 +1215,69 @@ async fn build_dashboard_data(
             Err(_) => continue,
         };
 
-        resource_type_by_resource
-            .entry(resource_id.clone())
-            .or_insert_with(|| resource_type.clone());
-
-        let (group_key, group_label) = grouping_for_scope(&scope, &resource_type, &resource_id);
+        let (group_key, group_label) =
+            grouping_for_scope(&query.scope, &resource_type, &resource_id);
         let (_, buckets) = cost_groups
             .entry(group_key.clone())
             .or_insert_with(|| (group_label, HashMap::new()));
         *buckets.entry(seconds_from_now).or_insert(0.0) += amount;
         *cost_by_group.entry(group_key).or_insert(0.0) += amount;
-        *cost_by_resource.entry(resource_id).or_insert(0.0) += amount;
     }
 
-    let selected_cost_group_keys = if scope == "aggregate" {
+    let selected_cost_group_keys = if query.scope == "aggregate" {
         vec!["aggregate".to_string()]
-    } else if scope == "resource" {
-        if let Some(resource_id) = resource_id_filter.clone() {
+    } else if query.scope == "resource" {
+        if let Some(resource_id) = query.resource_id.clone() {
             vec![resource_id]
         } else {
-            sorted_cost_keys_with_top_n(&cost_groups, &cost_by_group, top_n)
+            sorted_cost_keys_with_top_n(&cost_groups, &cost_by_group, query.top_n)
         }
-    } else if scope == "service" {
-        if let Some(resource_type) = resource_type_filter.clone() {
+    } else if query.scope == "service" {
+        if let Some(resource_type) = query.resource_type.clone() {
             vec![resource_type]
         } else {
-            sorted_cost_keys_with_top_n(&cost_groups, &cost_by_group, top_n)
+            sorted_cost_keys_with_top_n(&cost_groups, &cost_by_group, query.top_n)
         }
     } else {
-        sorted_cost_keys_with_top_n(&cost_groups, &cost_by_group, top_n)
+        sorted_cost_keys_with_top_n(&cost_groups, &cost_by_group, query.top_n)
     };
 
     let mut selected_metric_group_keys = if !split_metric_dimension {
-        if scope == "aggregate" {
+        if query.scope == "aggregate" {
             vec!["aggregate".to_string()]
-        } else if scope == "resource" {
-            if let Some(resource_id) = resource_id_filter.clone() {
+        } else if query.scope == "resource" {
+            if let Some(resource_id) = query.resource_id.clone() {
                 vec![resource_id]
             } else {
-                sorted_cost_keys_with_top_n(&cost_groups, &cost_by_group, top_n)
+                sorted_cost_keys_with_top_n(&cost_groups, &cost_by_group, query.top_n)
             }
-        } else if scope == "service" {
-            if let Some(resource_type) = resource_type_filter.clone() {
+        } else if query.scope == "service" {
+            if let Some(resource_type) = query.resource_type.clone() {
                 vec![resource_type]
             } else {
-                sorted_cost_keys_with_top_n(&cost_groups, &cost_by_group, top_n)
+                sorted_cost_keys_with_top_n(&cost_groups, &cost_by_group, query.top_n)
             }
         } else {
-            sorted_cost_keys_with_top_n(&cost_groups, &cost_by_group, top_n)
+            sorted_cost_keys_with_top_n(&cost_groups, &cost_by_group, query.top_n)
         }
     } else {
         let mut keys: Vec<String> = metric_groups.keys().cloned().collect();
-        if let Some(resource_id) = resource_id_filter.clone() {
+        if let Some(resource_id) = query.resource_id.clone() {
             keys.retain(|key| key.starts_with(&format!("{}::", resource_id)));
-        } else if scope == "service" {
-            if let Some(resource_type) = resource_type_filter.clone() {
-                keys.retain(|key| key.starts_with(&format!("{}::", resource_type)));
-            }
+        } else if query.scope == "service"
+            && let Some(resource_type) = query.resource_type.clone()
+        {
+            keys.retain(|key| key.starts_with(&format!("{}::", resource_type)));
         }
-        sort_metric_keys_by_priority(&mut keys, &metric_group_base_key, &cost_by_group);
-        keys.truncate(top_n);
+        keys.sort_by(|a, b| {
+            let a_score = metric_score_by_group.get(a).copied().unwrap_or(0.0);
+            let b_score = metric_score_by_group.get(b).copied().unwrap_or(0.0);
+            b_score
+                .partial_cmp(&a_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.cmp(b))
+        });
+        keys.truncate(query.top_n);
         keys
     };
 
@@ -1042,73 +1306,26 @@ async fn build_dashboard_data(
         .map(|set| set.points.clone())
         .unwrap_or_default();
 
-    let mut top_cost_resources = cost_by_resource
+    let mut top_cost_resources = fetch_dashboard_cost_by_resource(pool, &query).await?;
+    for contributor in &mut top_cost_resources {
+        contributor.average_utilization = utilization_by_resource
+            .get(&contributor.resource_id)
+            .and_then(|(sum, count)| {
+                if *count > 0 {
+                    Some(sum / *count as f64)
+                } else {
+                    None
+                }
+            });
+    }
+    let cost_map = top_cost_resources
         .iter()
-        .map(|(resource_id, total_cost)| {
-            let average_utilization =
-                utilization_by_resource
-                    .get(resource_id)
-                    .and_then(|(sum, count)| {
-                        if *count > 0 {
-                            Some(sum / *count as f64)
-                        } else {
-                            None
-                        }
-                    });
-            DashboardContributor {
-                resource_id: resource_id.clone(),
-                resource_type: resource_type_by_resource
-                    .get(resource_id)
-                    .cloned()
-                    .unwrap_or_else(|| "unknown".to_string()),
-                total_cost: *total_cost,
-                average_utilization,
-            }
-        })
-        .collect::<Vec<_>>();
+        .map(|entry| (entry.resource_id.clone(), entry.total_cost))
+        .collect::<HashMap<_, _>>();
+    let top_low_utilization_resources =
+        fetch_dashboard_low_utilization_resources(pool, &query, &cost_map).await?;
 
-    top_cost_resources.sort_by(|a, b| {
-        b.total_cost
-            .partial_cmp(&a.total_cost)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.resource_id.cmp(&b.resource_id))
-    });
-    top_cost_resources.truncate(top_n);
-
-    let mut top_low_utilization_resources = utilization_by_resource
-        .iter()
-        .filter_map(|(resource_id, (sum, count))| {
-            if *count <= 0 {
-                return None;
-            }
-            Some(DashboardContributor {
-                resource_id: resource_id.clone(),
-                resource_type: resource_type_by_resource
-                    .get(resource_id)
-                    .cloned()
-                    .unwrap_or_else(|| "unknown".to_string()),
-                total_cost: cost_by_resource.get(resource_id).copied().unwrap_or(0.0),
-                average_utilization: Some(sum / *count as f64),
-            })
-        })
-        .collect::<Vec<_>>();
-
-    top_low_utilization_resources.sort_by(|a, b| {
-        let a_util = a.average_utilization.unwrap_or(f64::MAX);
-        let b_util = b.average_utilization.unwrap_or(f64::MAX);
-        a_util
-            .partial_cmp(&b_util)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| {
-                b.total_cost
-                    .partial_cmp(&a.total_cost)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .then_with(|| a.resource_id.cmp(&b.resource_id))
-    });
-    top_low_utilization_resources.truncate(top_n);
-
-    let supported_apis = vec![
+    let mut supported_apis = vec![
         DashboardApiEntry {
             service: "cloudwatch".to_string(),
             operation: "GetMetricData".to_string(),
@@ -1126,99 +1343,11 @@ async fn build_dashboard_data(
             endpoint: None,
         },
         DashboardApiEntry {
-            service: "cost-explorer".to_string(),
-            operation: "GetCostAndUsage".to_string(),
-            protocol: "json-1.1".to_string(),
-            target: Some("AWSCostExplorer.GetCostAndUsage".to_string()),
-            action: None,
-            endpoint: None,
-        },
-        DashboardApiEntry {
-            service: "cost-explorer".to_string(),
-            operation: "GetCostAndUsage".to_string(),
-            protocol: "json-1.1-alias".to_string(),
-            target: Some("AWSInsightsIndexService.GetCostAndUsage".to_string()),
-            action: None,
-            endpoint: None,
-        },
-        DashboardApiEntry {
-            service: "cost-explorer".to_string(),
-            operation: "GetCostForecast".to_string(),
-            protocol: "json-1.1".to_string(),
-            target: Some("AWSCostExplorer.GetCostForecast".to_string()),
-            action: None,
-            endpoint: None,
-        },
-        DashboardApiEntry {
-            service: "cost-explorer".to_string(),
-            operation: "GetDimensionValues".to_string(),
-            protocol: "json-1.1".to_string(),
-            target: Some("AWSCostExplorer.GetDimensionValues".to_string()),
-            action: None,
-            endpoint: None,
-        },
-        DashboardApiEntry {
-            service: "cost-explorer".to_string(),
-            operation: "GetReservationCoverage".to_string(),
-            protocol: "json-1.1".to_string(),
-            target: Some("AWSCostExplorer.GetReservationCoverage".to_string()),
-            action: None,
-            endpoint: None,
-        },
-        DashboardApiEntry {
-            service: "cost-explorer".to_string(),
-            operation: "GetReservationUtilization".to_string(),
-            protocol: "json-1.1".to_string(),
-            target: Some("AWSCostExplorer.GetReservationUtilization".to_string()),
-            action: None,
-            endpoint: None,
-        },
-        DashboardApiEntry {
-            service: "cost-explorer".to_string(),
-            operation: "GetSavingsPlansCoverage".to_string(),
-            protocol: "json-1.1".to_string(),
-            target: Some("AWSCostExplorer.GetSavingsPlansCoverage".to_string()),
-            action: None,
-            endpoint: None,
-        },
-        DashboardApiEntry {
-            service: "cost-explorer".to_string(),
-            operation: "GetSavingsPlansUtilization".to_string(),
-            protocol: "json-1.1".to_string(),
-            target: Some("AWSCostExplorer.GetSavingsPlansUtilization".to_string()),
-            action: None,
-            endpoint: None,
-        },
-        DashboardApiEntry {
-            service: "cost-explorer".to_string(),
-            operation: "GetRightsizingRecommendation".to_string(),
-            protocol: "json-1.1".to_string(),
-            target: Some("AWSCostExplorer.GetRightsizingRecommendation".to_string()),
-            action: None,
-            endpoint: None,
-        },
-        DashboardApiEntry {
-            service: "cost-explorer".to_string(),
-            operation: "GetAnomalies".to_string(),
-            protocol: "json-1.1".to_string(),
-            target: Some("AWSCostExplorer.GetAnomalies".to_string()),
-            action: None,
-            endpoint: None,
-        },
-        DashboardApiEntry {
-            service: "cost-explorer".to_string(),
-            operation: "GetAnomalyMonitors".to_string(),
-            protocol: "json-1.1".to_string(),
-            target: Some("AWSCostExplorer.GetAnomalyMonitors".to_string()),
-            action: None,
-            endpoint: None,
-        },
-        DashboardApiEntry {
-            service: "cost-explorer".to_string(),
-            operation: "GetAnomalySubscriptions".to_string(),
-            protocol: "json-1.1".to_string(),
-            target: Some("AWSCostExplorer.GetAnomalySubscriptions".to_string()),
-            action: None,
+            service: "cloudwatch".to_string(),
+            operation: "ListMetrics".to_string(),
+            protocol: "query-xml".to_string(),
+            target: None,
+            action: Some("ListMetrics".to_string()),
             endpoint: None,
         },
         DashboardApiEntry {
@@ -1262,39 +1391,28 @@ async fn build_dashboard_data(
             endpoint: Some("/_mock/dashboard/trends/cost".to_string()),
         },
     ];
+    for operation in [
+        "GetCostAndUsage",
+        "GetCostForecast",
+        "GetDimensionValues",
+        "GetReservationCoverage",
+        "GetReservationUtilization",
+        "GetSavingsPlansCoverage",
+        "GetSavingsPlansUtilization",
+        "GetRightsizingRecommendation",
+        "GetAnomalies",
+        "GetAnomalyMonitors",
+        "GetAnomalySubscriptions",
+    ] {
+        supported_apis.extend(cost_explorer_api_entries(operation));
+    }
 
-    let cloudwatch_summary = DashboardCoverageServiceSummary {
-        total_operations: 39,
-        implemented_operations: 2,
-        unimplemented_operations: 37,
-    };
-    let cost_explorer_summary = DashboardCoverageServiceSummary {
-        total_operations: 46,
-        implemented_operations: 11,
-        unimplemented_operations: 35,
-    };
-    let coverage_scorecard = DashboardCoverageScorecard {
-        implemented_api_entries: supported_apis.len() as i64,
-        implemented_tested_entries: supported_apis.len() as i64,
-        cloudwatch: cloudwatch_summary,
-        cost_explorer: cost_explorer_summary,
-        benchmarks: DashboardParityBenchmarks {
-            operation_coverage: 1.0,
-            input_member_coverage: 1.0,
-            output_member_coverage: 1.0,
-            error_model_coverage: 1.0,
-            behavioral_coverage_count: 9,
-        },
-    };
+    let implemented_api_entries = supported_apis.len() as i64;
 
-    DashboardDataResponse {
+    Ok(DashboardDataResponse {
         generated_at: now.to_rfc3339(),
         supported_apis,
-        summary: DashboardSummary {
-            resource_count,
-            metric_count,
-            cost_record_count,
-        },
+        summary,
         cloudwatch_series,
         cost_series,
         cloudwatch_series_sets,
@@ -1302,62 +1420,204 @@ async fn build_dashboard_data(
         resource_catalog,
         top_cost_resources,
         top_low_utilization_resources,
-        applied_filters: DashboardAppliedFilters {
-            scope,
-            resource_type: resource_type_filter,
-            resource_id: resource_id_filter,
-            namespace: namespace_filter,
-            metric_name: metric_name_filter,
-            top_n,
-            window_hours,
-        },
-        coverage_scorecard,
-    }
+        applied_filters: dashboard_applied_filters(&query),
+        coverage_scorecard: build_coverage_scorecard(implemented_api_entries),
+    })
 }
 
 async fn dashboard_data_handler(
     State(pool): State<SqlitePool>,
     Query(query): Query<DashboardDataQuery>,
-) -> impl IntoResponse {
-    Json(build_dashboard_data(&pool, query).await)
+) -> axum::response::Response {
+    match build_dashboard_data(&pool, query).await {
+        Ok(data) => Json(data).into_response(),
+        Err(_) => dashboard_error_response(),
+    }
 }
 
 async fn dashboard_resources_handler(
     State(pool): State<SqlitePool>,
     Query(query): Query<DashboardDataQuery>,
-) -> impl IntoResponse {
-    let data = build_dashboard_data(&pool, query).await;
+) -> axum::response::Response {
+    let now = Utc::now();
+    let query = normalize_dashboard_query(query);
+    let top_cost_resources = match fetch_dashboard_cost_by_resource(&pool, &query).await {
+        Ok(value) => value,
+        Err(_) => return dashboard_error_response(),
+    };
+    let cost_map = top_cost_resources
+        .iter()
+        .map(|entry| (entry.resource_id.clone(), entry.total_cost))
+        .collect::<HashMap<_, _>>();
+    let resource_catalog = match fetch_dashboard_resource_catalog(&pool, &query).await {
+        Ok(value) => value,
+        Err(_) => return dashboard_error_response(),
+    };
+    let top_low_utilization_resources =
+        match fetch_dashboard_low_utilization_resources(&pool, &query, &cost_map).await {
+            Ok(value) => value,
+            Err(_) => return dashboard_error_response(),
+        };
+
     Json(json!({
-        "generated_at": data.generated_at,
-        "applied_filters": data.applied_filters,
-        "resource_catalog": data.resource_catalog,
-        "top_cost_resources": data.top_cost_resources,
-        "top_low_utilization_resources": data.top_low_utilization_resources
+        "generated_at": now.to_rfc3339(),
+        "applied_filters": dashboard_applied_filters(&query),
+        "resource_catalog": resource_catalog,
+        "top_cost_resources": top_cost_resources,
+        "top_low_utilization_resources": top_low_utilization_resources
     }))
+    .into_response()
 }
 
 async fn dashboard_cloudwatch_trends_handler(
     State(pool): State<SqlitePool>,
     Query(query): Query<DashboardDataQuery>,
-) -> impl IntoResponse {
-    let data = build_dashboard_data(&pool, query).await;
+) -> axum::response::Response {
+    let now = Utc::now();
+    let query = normalize_dashboard_query(query);
+    let split_metric_dimension = query.metric_name.is_none();
+    let metric_rows = match fetch_dashboard_metric_rows(&pool, &query).await {
+        Ok(value) => value,
+        Err(_) => return dashboard_error_response(),
+    };
+
+    let mut metric_groups: MetricGroupMap = HashMap::new();
+    let mut metric_score_by_group: HashMap<String, f64> = HashMap::new();
+    for row in metric_rows {
+        let resource_id = match row.try_get::<String, _>("resource_id") {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let resource_type = row
+            .try_get::<String, _>("resource_type")
+            .unwrap_or_else(|_| "unknown".to_string());
+        let namespace = row
+            .try_get::<String, _>("namespace")
+            .unwrap_or_else(|_| "unknown".to_string());
+        let metric_name = row
+            .try_get::<String, _>("metric_name")
+            .unwrap_or_else(|_| "unknown".to_string());
+        let seconds_from_now = match row.try_get::<i64, _>("s") {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let value = match row.try_get::<f64, _>("v") {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+
+        let (group_key, group_label, _) = metric_grouping_for_scope(
+            &query.scope,
+            &resource_type,
+            &resource_id,
+            &namespace,
+            &metric_name,
+            split_metric_dimension,
+        );
+        let (_, buckets) = metric_groups
+            .entry(group_key.clone())
+            .or_insert_with(|| (group_label, HashMap::new()));
+        let bucket = buckets.entry(seconds_from_now).or_insert((0.0, 0));
+        bucket.0 += value;
+        bucket.1 += 1;
+        *metric_score_by_group.entry(group_key).or_insert(0.0) += value.abs();
+    }
+
+    let mut selected_metric_group_keys: Vec<String> = metric_groups.keys().cloned().collect();
+    selected_metric_group_keys.sort_by(|a, b| {
+        let a_score = metric_score_by_group.get(a).copied().unwrap_or(0.0);
+        let b_score = metric_score_by_group.get(b).copied().unwrap_or(0.0);
+        b_score
+            .partial_cmp(&a_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.cmp(b))
+    });
+    selected_metric_group_keys.truncate(query.top_n);
+
+    let cloudwatch_series_sets = selected_metric_group_keys
+        .iter()
+        .filter_map(|group_key| build_metric_series_set(group_key, &metric_groups, now))
+        .filter(|set| !set.points.is_empty())
+        .collect::<Vec<_>>();
+
     Json(json!({
-        "generated_at": data.generated_at,
-        "applied_filters": data.applied_filters,
-        "cloudwatch_series_sets": data.cloudwatch_series_sets
+        "generated_at": now.to_rfc3339(),
+        "applied_filters": dashboard_applied_filters(&query),
+        "cloudwatch_series_sets": cloudwatch_series_sets
     }))
+    .into_response()
 }
 
 async fn dashboard_cost_trends_handler(
     State(pool): State<SqlitePool>,
     Query(query): Query<DashboardDataQuery>,
-) -> impl IntoResponse {
-    let data = build_dashboard_data(&pool, query).await;
+) -> axum::response::Response {
+    let now = Utc::now();
+    let query = normalize_dashboard_query(query);
+    let cost_rows = match fetch_dashboard_cost_rows(&pool, &query).await {
+        Ok(value) => value,
+        Err(_) => return dashboard_error_response(),
+    };
+
+    let mut cost_groups: HashMap<String, (String, HashMap<i64, f64>)> = HashMap::new();
+    let mut cost_by_group: HashMap<String, f64> = HashMap::new();
+
+    for row in cost_rows {
+        let resource_id = match row.try_get::<String, _>("resource_id") {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let resource_type = row
+            .try_get::<String, _>("resource_type")
+            .unwrap_or_else(|_| "unknown".to_string());
+        let seconds_from_now = match row.try_get::<i64, _>("s") {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let amount = match row.try_get::<f64, _>("amount") {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+
+        let (group_key, group_label) =
+            grouping_for_scope(&query.scope, &resource_type, &resource_id);
+        let (_, buckets) = cost_groups
+            .entry(group_key.clone())
+            .or_insert_with(|| (group_label, HashMap::new()));
+        *buckets.entry(seconds_from_now).or_insert(0.0) += amount;
+        *cost_by_group.entry(group_key).or_insert(0.0) += amount;
+    }
+
+    let selected_cost_group_keys = if query.scope == "aggregate" {
+        vec!["aggregate".to_string()]
+    } else if query.scope == "resource" {
+        if let Some(resource_id) = query.resource_id.clone() {
+            vec![resource_id]
+        } else {
+            sorted_cost_keys_with_top_n(&cost_groups, &cost_by_group, query.top_n)
+        }
+    } else if query.scope == "service" {
+        if let Some(resource_type) = query.resource_type.clone() {
+            vec![resource_type]
+        } else {
+            sorted_cost_keys_with_top_n(&cost_groups, &cost_by_group, query.top_n)
+        }
+    } else {
+        sorted_cost_keys_with_top_n(&cost_groups, &cost_by_group, query.top_n)
+    };
+
+    let cost_series_sets = selected_cost_group_keys
+        .iter()
+        .filter_map(|group_key| build_cost_series_set(group_key, &cost_groups, now))
+        .filter(|set| !set.points.is_empty())
+        .collect::<Vec<_>>();
+
     Json(json!({
-        "generated_at": data.generated_at,
-        "applied_filters": data.applied_filters,
-        "cost_series_sets": data.cost_series_sets
+        "generated_at": now.to_rfc3339(),
+        "applied_filters": dashboard_applied_filters(&query),
+        "cost_series_sets": cost_series_sets
     }))
+    .into_response()
 }
 
 async fn scenario_handler(
@@ -1366,7 +1626,7 @@ async fn scenario_handler(
     Json(req): Json<ScenarioRequest>,
 ) -> axum::response::Response {
     if let Err(response) = ensure_admin_authorized(&headers) {
-        return response;
+        return *response;
     }
 
     match generator::apply_scenario(&pool, req.scenario, req.resource_id.as_deref()).await {
@@ -1388,30 +1648,8 @@ async fn handle_cost_explorer(
     protocol: Protocol,
     _injected_now: Option<DateTime<Utc>>,
 ) -> axum::response::Response {
-    match target {
-        "AWSCostExplorer.GetCostAndUsage" | "AWSInsightsIndexService.GetCostAndUsage" => {
-            match handle_get_cost_and_usage(pool, body).await {
-                Ok(res) => (
-                    StatusCode::OK,
-                    [(header::CONTENT_TYPE, "application/x-amz-json-1.1")],
-                    Json(res),
-                )
-                    .into_response(),
-                Err(CostUsageError::Validation(message)) => error_response(
-                    protocol,
-                    "ValidationException",
-                    &message,
-                    StatusCode::BAD_REQUEST,
-                ),
-                Err(CostUsageError::Internal(error)) => error_response(
-                    protocol,
-                    "InternalFailure",
-                    &error.to_string(),
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                ),
-            }
-        }
-        "AWSCostExplorer.GetCostForecast" => match handle_get_cost_forecast(pool, body).await {
+    match canonical_cost_explorer_operation(target) {
+        Some("GetCostAndUsage") => match handle_get_cost_and_usage(pool, body).await {
             Ok(res) => (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "application/x-amz-json-1.1")],
@@ -1431,8 +1669,7 @@ async fn handle_cost_explorer(
                 StatusCode::INTERNAL_SERVER_ERROR,
             ),
         },
-        "AWSCostExplorer.GetDimensionValues" => match handle_get_dimension_values(pool, body).await
-        {
+        Some("GetCostForecast") => match handle_get_cost_forecast(pool, body).await {
             Ok(res) => (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "application/x-amz-json-1.1")],
@@ -1452,29 +1689,47 @@ async fn handle_cost_explorer(
                 StatusCode::INTERNAL_SERVER_ERROR,
             ),
         },
-        "AWSCostExplorer.GetReservationCoverage" => {
-            match handle_get_reservation_coverage(pool, body).await {
-                Ok(res) => (
-                    StatusCode::OK,
-                    [(header::CONTENT_TYPE, "application/x-amz-json-1.1")],
-                    Json(res),
-                )
-                    .into_response(),
-                Err(CostUsageError::Validation(message)) => error_response(
-                    protocol,
-                    "ValidationException",
-                    &message,
-                    StatusCode::BAD_REQUEST,
-                ),
-                Err(CostUsageError::Internal(error)) => error_response(
-                    protocol,
-                    "InternalFailure",
-                    &error.to_string(),
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                ),
-            }
-        }
-        "AWSCostExplorer.GetReservationUtilization" => {
+        Some("GetDimensionValues") => match handle_get_dimension_values(pool, body).await {
+            Ok(res) => (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/x-amz-json-1.1")],
+                Json(res),
+            )
+                .into_response(),
+            Err(CostUsageError::Validation(message)) => error_response(
+                protocol,
+                "ValidationException",
+                &message,
+                StatusCode::BAD_REQUEST,
+            ),
+            Err(CostUsageError::Internal(error)) => error_response(
+                protocol,
+                "InternalFailure",
+                &error.to_string(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        },
+        Some("GetReservationCoverage") => match handle_get_reservation_coverage(pool, body).await {
+            Ok(res) => (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/x-amz-json-1.1")],
+                Json(res),
+            )
+                .into_response(),
+            Err(CostUsageError::Validation(message)) => error_response(
+                protocol,
+                "ValidationException",
+                &message,
+                StatusCode::BAD_REQUEST,
+            ),
+            Err(CostUsageError::Internal(error)) => error_response(
+                protocol,
+                "InternalFailure",
+                &error.to_string(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        },
+        Some("GetReservationUtilization") => {
             match handle_get_reservation_utilization(pool, body).await {
                 Ok(res) => (
                     StatusCode::OK,
@@ -1496,7 +1751,7 @@ async fn handle_cost_explorer(
                 ),
             }
         }
-        "AWSCostExplorer.GetSavingsPlansCoverage" => {
+        Some("GetSavingsPlansCoverage") => {
             match handle_get_savings_plans_coverage(pool, body).await {
                 Ok(res) => (
                     StatusCode::OK,
@@ -1518,7 +1773,7 @@ async fn handle_cost_explorer(
                 ),
             }
         }
-        "AWSCostExplorer.GetSavingsPlansUtilization" => {
+        Some("GetSavingsPlansUtilization") => {
             match handle_get_savings_plans_utilization(pool, body).await {
                 Ok(res) => (
                     StatusCode::OK,
@@ -1540,7 +1795,7 @@ async fn handle_cost_explorer(
                 ),
             }
         }
-        "AWSCostExplorer.GetRightsizingRecommendation" => {
+        Some("GetRightsizingRecommendation") => {
             match handle_get_rightsizing_recommendation(pool, body).await {
                 Ok(res) => (
                     StatusCode::OK,
@@ -1562,7 +1817,7 @@ async fn handle_cost_explorer(
                 ),
             }
         }
-        "AWSCostExplorer.GetAnomalies" => match handle_get_anomalies(pool, body).await {
+        Some("GetAnomalies") => match handle_get_anomalies(pool, body).await {
             Ok(res) => (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "application/x-amz-json-1.1")],
@@ -1582,7 +1837,7 @@ async fn handle_cost_explorer(
                 StatusCode::INTERNAL_SERVER_ERROR,
             ),
         },
-        "AWSCostExplorer.GetAnomalyMonitors" => match handle_get_anomaly_monitors(body).await {
+        Some("GetAnomalyMonitors") => match handle_get_anomaly_monitors(body).await {
             Ok(res) => (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "application/x-amz-json-1.1")],
@@ -1602,28 +1857,26 @@ async fn handle_cost_explorer(
                 StatusCode::INTERNAL_SERVER_ERROR,
             ),
         },
-        "AWSCostExplorer.GetAnomalySubscriptions" => {
-            match handle_get_anomaly_subscriptions(body).await {
-                Ok(res) => (
-                    StatusCode::OK,
-                    [(header::CONTENT_TYPE, "application/x-amz-json-1.1")],
-                    Json(res),
-                )
-                    .into_response(),
-                Err(CostUsageError::Validation(message)) => error_response(
-                    protocol,
-                    "ValidationException",
-                    &message,
-                    StatusCode::BAD_REQUEST,
-                ),
-                Err(CostUsageError::Internal(error)) => error_response(
-                    protocol,
-                    "InternalFailure",
-                    &error.to_string(),
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                ),
-            }
-        }
+        Some("GetAnomalySubscriptions") => match handle_get_anomaly_subscriptions(body).await {
+            Ok(res) => (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/x-amz-json-1.1")],
+                Json(res),
+            )
+                .into_response(),
+            Err(CostUsageError::Validation(message)) => error_response(
+                protocol,
+                "ValidationException",
+                &message,
+                StatusCode::BAD_REQUEST,
+            ),
+            Err(CostUsageError::Internal(error)) => error_response(
+                protocol,
+                "InternalFailure",
+                &error.to_string(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        },
         _ => error_response(
             protocol,
             "UnsupportedAction",
@@ -1642,11 +1895,117 @@ async fn handle_get_cost_and_usage(
 
     let now = Utc::now();
     let total_cost = sum_cost_records_for_window(&pool, &req.time_period, now).await?;
+    let start = parse_day_start_utc("TimePeriod.Start", &req.time_period.start)
+        .map_err(CostUsageError::Validation)?;
+    let end = parse_day_start_utc("TimePeriod.End", &req.time_period.end)
+        .map_err(CostUsageError::Validation)?;
+    let start_offset = (start - now).num_seconds();
+    let end_offset = (end - now).num_seconds();
+    let group_dimension = parse_group_by_dimension(req.group_by.as_ref())?;
+    let daily = req.granularity.as_deref() == Some("DAILY");
 
-    let mut response = json!({
-        "GroupDefinitions": req.group_by.clone().unwrap_or_default(),
-        "DimensionValueAttributes": [],
-        "ResultsByTime": [{
+    let results_by_time = if let Some(group_dimension) = group_dimension {
+        let rows = sqlx::query(
+            "SELECT c.resource_id, c.seconds_from_now, c.amount, r.resource_type, r.region
+             FROM cost_records c
+             JOIN resources r ON r.id = c.resource_id
+             WHERE c.seconds_from_now >= ? AND c.seconds_from_now <= ?
+             ORDER BY c.seconds_from_now ASC, c.resource_id ASC",
+        )
+        .bind(start_offset)
+        .bind(end_offset)
+        .fetch_all(&pool)
+        .await
+        .map_err(|e| CostUsageError::Internal(e.into()))?;
+
+        let mut bucket_groups: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
+        let mut bucket_totals: BTreeMap<String, f64> = BTreeMap::new();
+        let mut bucket_ranges: BTreeMap<String, String> = BTreeMap::new();
+
+        if daily {
+            let mut cursor = start;
+            while cursor < end {
+                let bucket_start = cursor.format("%Y-%m-%d").to_string();
+                let bucket_end = (cursor + chrono::Duration::days(1))
+                    .format("%Y-%m-%d")
+                    .to_string();
+                bucket_groups.insert(bucket_start.clone(), BTreeMap::new());
+                bucket_totals.insert(bucket_start.clone(), 0.0);
+                bucket_ranges.insert(bucket_start, bucket_end);
+                cursor += chrono::Duration::days(1);
+            }
+        } else {
+            bucket_groups.insert(req.time_period.start.clone(), BTreeMap::new());
+            bucket_totals.insert(req.time_period.start.clone(), total_cost);
+            bucket_ranges.insert(req.time_period.start.clone(), req.time_period.end.clone());
+        }
+
+        for row in rows {
+            let resource_id = row.get::<String, _>("resource_id");
+            let resource_type = row.get::<String, _>("resource_type");
+            let region = row.get::<String, _>("region");
+            let amount = row.get::<f64, _>("amount");
+            let seconds_from_now = row.get::<i64, _>("seconds_from_now");
+
+            let bucket_start = if daily {
+                (now + chrono::Duration::seconds(seconds_from_now))
+                    .format("%Y-%m-%d")
+                    .to_string()
+            } else {
+                req.time_period.start.clone()
+            };
+
+            let group_key = match group_dimension {
+                "SERVICE" => ce_service_name_from_resource_type(&resource_type).to_string(),
+                "REGION" => region,
+                "RESOURCE_ID" => resource_id,
+                _ => unreachable!("group dimension validated above"),
+            };
+
+            if let Some(groups) = bucket_groups.get_mut(&bucket_start) {
+                *groups.entry(group_key).or_insert(0.0) += amount;
+                if daily {
+                    *bucket_totals.entry(bucket_start).or_insert(0.0) += amount;
+                }
+            }
+        }
+
+        bucket_groups
+            .into_iter()
+            .map(|(bucket_start, groups)| {
+                let bucket_total = bucket_totals.get(&bucket_start).copied().unwrap_or(0.0);
+                let bucket_end = bucket_ranges
+                    .get(&bucket_start)
+                    .cloned()
+                    .unwrap_or_else(|| req.time_period.end.clone());
+                json!({
+                    "TimePeriod": {
+                        "Start": bucket_start,
+                        "End": bucket_end
+                    },
+                    "Total": {
+                        "UnblendedCost": {
+                            "Amount": format!("{:.2}", bucket_total),
+                            "Unit": "USD"
+                        }
+                    },
+                    "Groups": groups.into_iter().map(|(group_key, amount)| {
+                        json!({
+                            "Keys": [group_key],
+                            "Metrics": {
+                                "UnblendedCost": {
+                                    "Amount": format!("{:.2}", amount),
+                                    "Unit": "USD"
+                                }
+                            }
+                        })
+                    }).collect::<Vec<Value>>(),
+                    "Estimated": true
+                })
+            })
+            .collect::<Vec<Value>>()
+    } else {
+        vec![json!({
             "TimePeriod": {
                 "Start": req.time_period.start,
                 "End": req.time_period.end
@@ -1659,7 +2018,13 @@ async fn handle_get_cost_and_usage(
             },
             "Groups": [],
             "Estimated": true
-        }]
+        })]
+    };
+
+    let mut response = json!({
+        "GroupDefinitions": req.group_by.clone().unwrap_or_default(),
+        "DimensionValueAttributes": [],
+        "ResultsByTime": results_by_time
     });
 
     // Include token key when caller is traversing pages so parity coverage can
@@ -1687,6 +2052,9 @@ async fn handle_get_cost_forecast(
 
     let metric = req.metric.clone().ok_or_else(|| {
         CostUsageError::Validation("Missing required field 'Metric'.".to_string())
+    })?;
+    let granularity = req.granularity.clone().ok_or_else(|| {
+        CostUsageError::Validation("Missing required field 'Granularity'.".to_string())
     })?;
 
     let now = Utc::now();
@@ -1719,9 +2087,7 @@ async fn handle_get_cost_forecast(
         }]
     });
 
-    if req.granularity.is_some() {
-        response["Granularity"] = json!(req.granularity);
-    }
+    response["Granularity"] = json!(granularity);
     response["Metric"] = json!(metric);
     if req.filter.is_some() {
         response["FilterApplied"] = json!(true);
@@ -1743,60 +2109,121 @@ async fn handle_get_dimension_values(
     let _end = parse_day_start_utc("TimePeriod.End", &req.time_period.end)
         .map_err(CostUsageError::Validation)?;
 
-    let mut values: Vec<String> = match req.dimension.as_str() {
-        "SERVICE" => {
-            let rows =
-                sqlx::query("SELECT DISTINCT resource_type FROM resources ORDER BY resource_type")
-                    .fetch_all(&pool)
-                    .await
-                    .map_err(|e| CostUsageError::Internal(e.into()))?;
-            rows.into_iter()
-                .filter_map(|row| row.try_get::<String, _>("resource_type").ok())
-                .map(|rt| ce_service_name_from_resource_type(&rt).to_string())
-                .collect()
-        }
-        "REGION" => {
-            let rows = sqlx::query("SELECT DISTINCT region FROM resources ORDER BY region")
-                .fetch_all(&pool)
-                .await
-                .map_err(|e| CostUsageError::Internal(e.into()))?;
-            rows.into_iter()
-                .filter_map(|row| row.try_get::<String, _>("region").ok())
-                .collect()
-        }
-        "RESOURCE_ID" => {
-            let rows = sqlx::query("SELECT id FROM resources ORDER BY id")
-                .fetch_all(&pool)
-                .await
-                .map_err(|e| CostUsageError::Internal(e.into()))?;
-            rows.into_iter()
-                .filter_map(|row| row.try_get::<String, _>("id").ok())
-                .collect()
-        }
-        "LINKED_ACCOUNT" => vec!["123456789012".to_string()],
-        _ => Vec::new(),
-    };
-
-    values.sort();
-    values.dedup();
-
-    if let Some(search) = req.search_string.as_ref().map(|s| s.to_lowercase()) {
-        values.retain(|value| value.to_lowercase().contains(&search));
-    }
-
     let page_start = match req.next_page_token.as_deref() {
         Some(raw) if !raw.trim().is_empty() => raw
             .parse::<usize>()
             .map_err(|_| CostUsageError::Validation("Invalid NextPageToken value.".to_string()))?,
         _ => 0,
     };
+    let page_size = req.max_results.unwrap_or(100).clamp(1, 1000) as i64;
+
+    let (mut values, total_size): (Vec<String>, usize) = match req.dimension.as_str() {
+        "SERVICE" => {
+            let rows =
+                sqlx::query("SELECT DISTINCT resource_type FROM resources ORDER BY resource_type")
+                    .fetch_all(&pool)
+                    .await
+                    .map_err(|e| CostUsageError::Internal(e.into()))?;
+            let values = rows
+                .into_iter()
+                .filter_map(|row| row.try_get::<String, _>("resource_type").ok())
+                .map(|rt| ce_service_name_from_resource_type(&rt).to_string())
+                .collect::<Vec<_>>();
+            let total_size = values.len();
+            (values, total_size)
+        }
+        "REGION" => {
+            let search = req
+                .search_string
+                .as_ref()
+                .map(|s| format!("%{}%", s.to_lowercase()));
+            let total_size = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(DISTINCT region)
+                 FROM resources
+                 WHERE (? IS NULL OR lower(region) LIKE ?)",
+            )
+            .bind(search.as_deref())
+            .bind(search.as_deref())
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| CostUsageError::Internal(e.into()))? as usize;
+            let rows = sqlx::query(
+                "SELECT DISTINCT region
+                 FROM resources
+                 WHERE (? IS NULL OR lower(region) LIKE ?)
+                 ORDER BY region
+                 LIMIT ? OFFSET ?",
+            )
+            .bind(search.as_deref())
+            .bind(search.as_deref())
+            .bind(page_size)
+            .bind(page_start as i64)
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| CostUsageError::Internal(e.into()))?;
+            (
+                rows.into_iter()
+                    .filter_map(|row| row.try_get::<String, _>("region").ok())
+                    .collect(),
+                total_size,
+            )
+        }
+        "RESOURCE_ID" => {
+            let search = req
+                .search_string
+                .as_ref()
+                .map(|s| format!("%{}%", s.to_lowercase()));
+            let total_size = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*)
+                 FROM resources
+                 WHERE (? IS NULL OR lower(id) LIKE ?)",
+            )
+            .bind(search.as_deref())
+            .bind(search.as_deref())
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| CostUsageError::Internal(e.into()))? as usize;
+            let rows = sqlx::query(
+                "SELECT id
+                 FROM resources
+                 WHERE (? IS NULL OR lower(id) LIKE ?)
+                 ORDER BY id
+                 LIMIT ? OFFSET ?",
+            )
+            .bind(search.as_deref())
+            .bind(search.as_deref())
+            .bind(page_size)
+            .bind(page_start as i64)
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| CostUsageError::Internal(e.into()))?;
+            (
+                rows.into_iter()
+                    .filter_map(|row| row.try_get::<String, _>("id").ok())
+                    .collect(),
+                total_size,
+            )
+        }
+        "LINKED_ACCOUNT" => (vec!["123456789012".to_string()], 1),
+        _ => (Vec::new(), 0),
+    };
+
+    values.sort();
+    values.dedup();
+
+    if matches!(req.dimension.as_str(), "SERVICE")
+        && let Some(search) = req.search_string.as_ref().map(|s| s.to_lowercase())
+    {
+        values.retain(|value| value.to_lowercase().contains(&search));
+    }
+
     if page_start > values.len() {
         return Err(CostUsageError::Validation(
             "NextPageToken points past available results.".to_string(),
         ));
     }
 
-    let page_size = req.max_results.unwrap_or(100).clamp(1, 1000) as usize;
+    let page_size = page_size as usize;
     let page_end = std::cmp::min(page_start + page_size, values.len());
     let page_values = &values[page_start..page_end];
 
@@ -1808,10 +2235,10 @@ async fn handle_get_dimension_values(
             })
         }).collect::<Vec<Value>>(),
         "ReturnSize": page_values.len(),
-        "TotalSize": values.len()
+        "TotalSize": total_size
     });
 
-    if page_end < values.len() {
+    if page_start + page_values.len() < total_size {
         response["NextPageToken"] = json!(page_end.to_string());
     }
     if req.context.is_some() {
@@ -2270,6 +2697,15 @@ async fn handle_cloudwatch_query(
     debug!("CloudWatch Query Action: {}", query.action);
 
     match query.action.as_str() {
+        "ListMetrics" => match handle_list_metrics(pool, query).await {
+            Ok(xml) => (StatusCode::OK, [(header::CONTENT_TYPE, "text/xml")], xml).into_response(),
+            Err(message) => error_response(
+                protocol,
+                "InvalidParameterValueException",
+                &message,
+                StatusCode::BAD_REQUEST,
+            ),
+        },
         "GetMetricStatistics" => {
             if query.namespace.is_none()
                 || query.metric_name.is_none()
@@ -2320,6 +2756,109 @@ async fn handle_cloudwatch_query(
             StatusCode::BAD_REQUEST,
         ),
     }
+}
+
+async fn handle_list_metrics(
+    pool: SqlitePool,
+    query: CloudWatchQuery,
+) -> std::result::Result<String, String> {
+    if let Some(recently_active) = query.recently_active.as_deref()
+        && recently_active != "PT3H"
+    {
+        return Err("RecentlyActive must be PT3H when provided.".to_string());
+    }
+
+    let page_start = match query.next_token.as_deref() {
+        Some(raw) if !raw.trim().is_empty() => raw
+            .parse::<usize>()
+            .map_err(|_| "Invalid NextToken value.".to_string())?,
+        _ => 0,
+    };
+
+    let rows = sqlx::query(
+        "SELECT DISTINCT m.namespace, m.metric_name, r.resource_type, r.id
+         FROM metrics m
+         JOIN resources r ON r.id = m.resource_id
+         ORDER BY m.namespace, m.metric_name, r.resource_type, r.id",
+    )
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let metrics = rows
+        .into_iter()
+        .filter_map(|row| {
+            let namespace = row.try_get::<String, _>("namespace").ok()?;
+            let metric_name = row.try_get::<String, _>("metric_name").ok()?;
+            let resource_type = row.try_get::<String, _>("resource_type").ok()?;
+            let resource_id = row.try_get::<String, _>("id").ok()?;
+            let dimension_name = cloudwatch_dimension_name_for_resource_type(&resource_type)?;
+            Some(cw::Metric {
+                namespace,
+                metric_name,
+                dimensions: cw::Dimensions {
+                    members: vec![cw::Dimension {
+                        name: dimension_name.to_string(),
+                        value: resource_id,
+                    }],
+                },
+            })
+        })
+        .filter(|metric| {
+            query
+                .namespace
+                .as_deref()
+                .is_none_or(|namespace| metric.namespace == namespace)
+                && query
+                    .metric_name
+                    .as_deref()
+                    .is_none_or(|metric_name| metric.metric_name == metric_name)
+                && query.dim_name_1.as_deref().is_none_or(|name| {
+                    metric.dimensions.members.iter().any(|dimension| {
+                        dimension.name == name
+                            && query
+                                .dim_value_1
+                                .as_deref()
+                                .is_none_or(|value| dimension.value == value)
+                    })
+                })
+                && query.dim_name_2.as_deref().is_none_or(|name| {
+                    metric.dimensions.members.iter().any(|dimension| {
+                        dimension.name == name
+                            && query
+                                .dim_value_2
+                                .as_deref()
+                                .is_none_or(|value| dimension.value == value)
+                    })
+                })
+        })
+        .collect::<Vec<_>>();
+
+    if page_start > metrics.len() {
+        return Err("NextToken points past available results.".to_string());
+    }
+
+    let total_metrics = metrics.len();
+    let page_end = std::cmp::min(page_start + 500, total_metrics);
+    let next_token = (page_end < total_metrics).then(|| page_end.to_string());
+    let metrics = metrics
+        .into_iter()
+        .skip(page_start)
+        .take(page_end - page_start)
+        .collect::<Vec<_>>();
+
+    let response = cw::ListMetricsResponse {
+        xmlns: "http://monitoring.amazonaws.com/doc/2010-08-01/".to_string(),
+        result: cw::ListMetricsResult {
+            metrics: cw::Metrics { members: metrics },
+            next_token,
+        },
+        metadata: cw::ResponseMetadata {
+            request_id: "mock-id".to_string(),
+        },
+    };
+
+    cw::to_xml(&response).map_err(|e| e.to_string())
 }
 
 async fn handle_get_metric_data_xml(
@@ -2492,6 +3031,16 @@ async fn handle_get_metric_data(
         .ok_or_else(|| {
             MetricDataError::Validation("Missing required field 'MetricDataQueries'.".to_string())
         })?;
+    if queries.is_empty() {
+        return Err(MetricDataError::Validation(
+            "MetricDataQueries must include at least one query.".to_string(),
+        ));
+    }
+    if queries.len() > 50 {
+        return Err(MetricDataError::Validation(
+            "MetricDataQueries may contain at most 50 queries.".to_string(),
+        ));
+    }
 
     let max_datapoints = req
         .get("MaxDatapoints")
@@ -2589,12 +3138,6 @@ async fn handle_get_metric_data(
         }));
     }
 
-    if results.is_empty() {
-        return Err(MetricDataError::Validation(
-            "MetricDataQueries must include at least one query.".to_string(),
-        ));
-    }
-
     let mut response = json!({
         "MetricDataResults": results
     });
@@ -2605,4 +3148,504 @@ async fn handle_get_metric_data(
     }
 
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use serde_json::Value;
+    use tower::ServiceExt;
+
+    async fn test_pool() -> SqlitePool {
+        let path = std::env::temp_dir().join(format!("foxtail-test-{}.db", uuid::Uuid::new_v4()));
+        let database_url = format!("sqlite:{}", path.display());
+        crate::db::init(&database_url)
+            .await
+            .expect("test database should initialize")
+    }
+
+    async fn response_json(response: axum::response::Response) -> Value {
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should read");
+        serde_json::from_slice(&body).expect("response body should be valid JSON")
+    }
+
+    #[tokio::test]
+    async fn status_route_reports_counts() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO resources (id, resource_type, region, scenario, tags)
+             VALUES ('i-test', 'ec2', 'us-east-1', 'Baseline', '{}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO metrics (resource_id, namespace, metric_name, seconds_from_now, value)
+             VALUES ('i-test', 'AWS/EC2', 'CPUUtilization', -3600, 12.0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let app = build_app(pool);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/_mock/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["resource_count"], 1);
+        assert_eq!(body["metric_count"], 1);
+    }
+
+    #[tokio::test]
+    async fn dashboard_data_reports_untested_scorecard() {
+        let pool = test_pool().await;
+        let app = build_app(pool);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/_mock/dashboard/data")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["coverage_scorecard"]["implemented_tested_entries"], 0);
+        assert_eq!(
+            body["coverage_scorecard"]["benchmarks"]["operation_coverage"],
+            0.0
+        );
+        assert_eq!(
+            body["coverage_scorecard"]["benchmarks"]["behavioral_coverage_count"],
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn dashboard_data_returns_500_when_pool_is_closed() {
+        let pool = test_pool().await;
+        let app = build_app(pool.clone());
+        pool.close().await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/_mock/dashboard/data")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response_json(response).await;
+        assert_eq!(body["error"], "dashboard query failed");
+    }
+
+    #[tokio::test]
+    async fn cloudwatch_metric_data_emits_next_token_when_truncated() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO resources (id, resource_type, region, scenario, tags)
+             VALUES ('i-test', 'ec2', 'us-east-1', 'Baseline', '{}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (offset, value) in [(-7200, 10.0), (-3600, 20.0), (0, 30.0)] {
+            sqlx::query(
+                "INSERT INTO metrics (resource_id, namespace, metric_name, seconds_from_now, value)
+                 VALUES ('i-test', 'AWS/EC2', 'CPUUtilization', ?, ?)",
+            )
+            .bind(offset)
+            .bind(value)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let app = build_app(pool);
+        let body = json!({
+            "StartTime": "2026-03-11T10:00:00Z",
+            "EndTime": "2026-03-11T12:00:00Z",
+            "MaxDatapoints": 2,
+            "MetricDataQueries": [{
+                "Id": "m1",
+                "MetricStat": {
+                    "Metric": {
+                        "Namespace": "AWS/EC2",
+                        "MetricName": "CPUUtilization",
+                        "Dimensions": [{
+                            "Name": "InstanceId",
+                            "Value": "i-test"
+                        }]
+                    }
+                }
+            }]
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-amz-json-1.1")
+                    .header(
+                        "x-amz-target",
+                        "GraniteServiceVersion20100801.GetMetricData",
+                    )
+                    .header("x-mock-now", "2026-03-11T12:00:00Z")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["NextToken"], "2");
+        assert_eq!(
+            body["MetricDataResults"][0]["Values"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn cost_explorer_dimension_values_paginates_resource_ids() {
+        let pool = test_pool().await;
+        for id in ["i-a", "i-b", "i-c"] {
+            sqlx::query(
+                "INSERT INTO resources (id, resource_type, region, scenario, tags)
+                 VALUES (?, 'ec2', 'us-east-1', 'Baseline', '{}')",
+            )
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let app = build_app(pool);
+        let body = json!({
+            "TimePeriod": {
+                "Start": "2026-03-01",
+                "End": "2026-03-11"
+            },
+            "Dimension": "RESOURCE_ID",
+            "MaxResults": 2
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-amz-json-1.1")
+                    .header("x-amz-target", "AWSCostExplorer.GetDimensionValues")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["ReturnSize"], 2);
+        assert_eq!(body["NextPageToken"], "2");
+    }
+
+    #[tokio::test]
+    async fn cost_explorer_alias_dimension_values_uses_cli_target_prefix() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO resources (id, resource_type, region, scenario, tags)
+             VALUES ('i-test', 'ec2', 'us-east-1', 'Baseline', '{}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let app = build_app(pool);
+        let body = json!({
+            "TimePeriod": {
+                "Start": "2026-03-01",
+                "End": "2026-03-11"
+            },
+            "Dimension": "SERVICE"
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-amz-json-1.1")
+                    .header("x-amz-target", "AWSInsightsIndexService.GetDimensionValues")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(
+            body["DimensionValues"][0]["Value"],
+            "Amazon Elastic Compute Cloud - Compute"
+        );
+    }
+
+    #[tokio::test]
+    async fn cost_explorer_group_by_service_returns_populated_groups() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO resources (id, resource_type, region, scenario, tags)
+             VALUES ('i-ec2', 'ec2', 'us-east-1', 'Baseline', '{}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO resources (id, resource_type, region, scenario, tags)
+             VALUES ('db-rds', 'rds', 'us-east-1', 'Baseline', '{}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO cost_records (resource_id, seconds_from_now, amount)
+             VALUES ('i-ec2', -86400, 12.5), ('db-rds', -86400, 7.5)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let app = build_app(pool);
+        let body = json!({
+            "TimePeriod": {
+                "Start": "2026-03-10",
+                "End": "2026-03-11"
+            },
+            "Granularity": "DAILY",
+            "Metrics": ["UnblendedCost"],
+            "GroupBy": [{
+                "Type": "DIMENSION",
+                "Key": "SERVICE"
+            }]
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-amz-json-1.1")
+                    .header("x-amz-target", "AWSInsightsIndexService.GetCostAndUsage")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        let groups = body["ResultsByTime"][0]["Groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups[0]["Metrics"]["UnblendedCost"]["Unit"],
+            Value::String("USD".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn cost_forecast_requires_granularity() {
+        let pool = test_pool().await;
+        let app = build_app(pool);
+        let body = json!({
+            "TimePeriod": {
+                "Start": "2026-03-01",
+                "End": "2026-03-11"
+            },
+            "Metric": "UNBLENDED_COST"
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-amz-json-1.1")
+                    .header("x-amz-target", "AWSInsightsIndexService.GetCostForecast")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert_eq!(body["__type"], "ValidationException");
+    }
+
+    #[tokio::test]
+    async fn cost_explorer_alias_anomaly_monitors_returns_data() {
+        let pool = test_pool().await;
+        let app = build_app(pool);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-amz-json-1.1")
+                    .header("x-amz-target", "AWSInsightsIndexService.GetAnomalyMonitors")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["AnomalyMonitors"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cloudwatch_query_xml_returns_metric_statistics() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO resources (id, resource_type, region, scenario, tags)
+             VALUES ('i-test', 'ec2', 'us-east-1', 'Baseline', '{}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO metrics (resource_id, namespace, metric_name, seconds_from_now, value)
+             VALUES ('i-test', 'AWS/EC2', 'CPUUtilization', -3600, 12.0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let app = build_app(pool);
+        let form = "Action=GetMetricStatistics&Namespace=AWS%2FEC2&MetricName=CPUUtilization&StartTime=2026-03-11T11%3A00%3A00Z&EndTime=2026-03-11T12%3A00%3A00Z&Period=60&Dimensions.member.1.Name=InstanceId&Dimensions.member.1.Value=i-test";
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header("x-mock-now", "2026-03-11T12:00:00Z")
+                    .body(Body::from(form))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let xml = String::from_utf8(body.to_vec()).unwrap();
+        assert!(xml.contains("GetMetricStatisticsResponse"));
+        assert!(xml.contains("CPUUtilization"));
+    }
+
+    #[tokio::test]
+    async fn cloudwatch_query_xml_list_metrics_returns_seeded_metric() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO resources (id, resource_type, region, scenario, tags)
+             VALUES ('i-test', 'ec2', 'us-east-1', 'Baseline', '{}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO metrics (resource_id, namespace, metric_name, seconds_from_now, value)
+             VALUES ('i-test', 'AWS/EC2', 'CPUUtilization', -3600, 12.0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let app = build_app(pool);
+        let form =
+            "Action=ListMetrics&Version=2010-08-01&Namespace=AWS%2FEC2&MetricName=CPUUtilization";
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(form))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let xml = String::from_utf8(body.to_vec()).unwrap();
+        assert!(xml.contains("ListMetricsResponse"));
+        assert!(xml.contains("CPUUtilization"));
+        assert!(xml.contains("InstanceId"));
+        assert!(xml.contains("i-test"));
+    }
+
+    #[tokio::test]
+    async fn scenario_endpoint_updates_resource_scenario() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO resources (id, resource_type, region, scenario, tags)
+             VALUES ('i-test', 'ec2', 'us-east-1', 'Baseline', '{}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let app = build_app(pool.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_mock/scenario")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "scenario": "Spike",
+                            "resource_id": "i-test"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let scenario: String =
+            sqlx::query_scalar("SELECT scenario FROM resources WHERE id = 'i-test'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(scenario, "Spike");
+    }
 }

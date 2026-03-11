@@ -107,6 +107,55 @@ pub struct ResponseMetadata {
     pub request_id: String,
 }
 
+#[derive(Serialize)]
+#[serde(rename = "ListMetricsResponse")]
+pub struct ListMetricsResponse {
+    #[serde(rename = "@xmlns")]
+    pub xmlns: String,
+    #[serde(rename = "ListMetricsResult")]
+    pub result: ListMetricsResult,
+    #[serde(rename = "ResponseMetadata")]
+    pub metadata: ResponseMetadata,
+}
+
+#[derive(Serialize)]
+pub struct ListMetricsResult {
+    #[serde(rename = "Metrics")]
+    pub metrics: Metrics,
+    #[serde(rename = "NextToken", skip_serializing_if = "Option::is_none")]
+    pub next_token: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct Metrics {
+    #[serde(rename = "member")]
+    pub members: Vec<Metric>,
+}
+
+#[derive(Serialize)]
+pub struct Metric {
+    #[serde(rename = "Namespace")]
+    pub namespace: String,
+    #[serde(rename = "MetricName")]
+    pub metric_name: String,
+    #[serde(rename = "Dimensions")]
+    pub dimensions: Dimensions,
+}
+
+#[derive(Serialize)]
+pub struct Dimensions {
+    #[serde(rename = "member")]
+    pub members: Vec<Dimension>,
+}
+
+#[derive(Serialize)]
+pub struct Dimension {
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "Value")]
+    pub value: String,
+}
+
 pub fn to_xml<T: Serialize>(val: &T) -> Result<String> {
     Ok(to_string(val)?)
 }

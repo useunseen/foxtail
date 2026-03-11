@@ -205,6 +205,7 @@ dependencies = [
  "serde_urlencoded",
  "sqlx",
  "tokio",
+ "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",

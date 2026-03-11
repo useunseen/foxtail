@@ -3,7 +3,7 @@
 BIN := target/debug/aws-mock-data-service
 DB_PATH := mock_data.db
 
-.PHONY: build build-release run gen gen-baseline gen-spike gen-idle-heavy serve setup setup-mock help
+.PHONY: build build-release run gen gen-baseline gen-spike gen-idle-heavy serve setup setup-mock verify-cli-interoperability help
 
 help:
 	@echo "AWS Mock Data Service"
@@ -15,6 +15,7 @@ help:
 	@echo "  make gen-idle-heavy - Regenerate data with IdleHeavy scenario"
 	@echo "  make serve  - Start the API server"
 	@echo "  make setup  - Build and generate data"
+	@echo "  make verify-cli-interoperability - Run AWS CLI smoke checks against a local server"
 
 build:
 	cargo build
@@ -41,3 +42,6 @@ setup: build gen
 
 # Compatibility alias so users can run this target from service dir or repo root.
 setup-mock: setup
+
+verify-cli-interoperability:
+	bash scripts/verify_cli_interop.sh
