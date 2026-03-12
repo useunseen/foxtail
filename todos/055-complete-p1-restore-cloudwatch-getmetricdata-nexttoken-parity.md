@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p1
 issue_id: "055"
 tags: [code-review, rust, cloudwatch, parity, documentation]
@@ -59,15 +59,14 @@ The branch currently claims CloudWatch `GetMetricData` pagination parity is vali
 
 ## Recommended Action
 
-To be filled during triage.
+Complete in this extracted service repo. The current Rust handler now emits `NextToken` for truncated JSON `GetMetricData` responses, and the repo-local verification surface is the Rust test suite plus `scripts/verify_cli_interop.sh`, not the stale cross-repo Python parity references in the original review note.
 
 ## Technical Details
 
 **Affected files:**
-- `services/aws-mock-data-service/src/serve.rs`
-- `tests/integration/test_pagination_contracts.py`
-- `docs/testing/aws-mock-api-coverage-status.md`
-- `docs/testing/aws-api-priority-roadmap.md`
+- `src/serve.rs`
+- `scripts/verify_cli_interop.sh`
+- `README.md`
 
 **Related components:**
 - CloudWatch JSON handler
@@ -85,10 +84,10 @@ To be filled during triage.
 
 ## Acceptance Criteria
 
-- [ ] `test_cloudwatch_metric_data_emits_nexttoken_when_truncated` passes.
-- [ ] Truncated `GetMetricData` responses include `NextToken` when more datapoints remain.
-- [ ] Coverage docs and roadmap status match the real test state.
-- [ ] Targeted parity suite passes without xfail/skip for this behavior.
+- [x] `serve::tests::cloudwatch_metric_data_emits_next_token_when_truncated` passes.
+- [x] Truncated `GetMetricData` responses include `NextToken` when more datapoints remain.
+- [x] Repo-local docs and smoke verification match the real test state.
+- [x] Repo-local verification for this behavior passes without skips.
 
 ## Work Log
 
@@ -105,3 +104,18 @@ To be filled during triage.
 **Learnings:**
 - The branch’s CloudWatch pagination claim is ahead of reality.
 - This is the only failure in the targeted parity set that was run during review.
+
+### 2026-03-12 - Repo-Local Closure
+
+**By:** Codex
+
+**Actions:**
+- Re-verified the current `GetMetricData` JSON pagination behavior against the extracted Rust service repo.
+- Ran `cargo test cloudwatch_metric_data -- --nocapture` and confirmed the truncation test passes.
+- Ran `cargo test cloudwatch_query_xml_metric_data_preserves_query_id_and_aggregates -- --nocapture` and confirmed the Query/XML path still passes.
+- Ran `bash scripts/verify_cli_interop.sh` and confirmed the AWS CLI smoke suite passes end to end.
+- Confirmed that the original Python parity test and `docs/testing/*` references are not present in this extracted repo, so repo-local Rust tests and docs are the authoritative verification surface here.
+
+**Learnings:**
+- The original finding was valid when filed, but it is stale relative to the current service code.
+- The remaining cross-repo parity/documentation references belong to a broader parent project, not this standalone Rust service checkout.

@@ -44,3 +44,31 @@
   - `cargo test`
   - `cargo clippy --all-targets --all-features`
   - `bash scripts/verify_cli_interop.sh`
+
+## Next Planning Focus
+
+- [x] Clean up `cloudwatch get-metric-data` response quality so public CloudWatch output is query-scoped, period-aware, and deterministic.
+- [x] Replace raw-row output with basic period/stat aggregation and stronger result-shape guarantees.
+- [x] Extend route tests and CLI smoke checks to assert `GetMetricData` output quality, not just callability.
+- [x] Implement the details captured in `docs/plans/2026-03-11-fix-cloudwatch-getmetricdata-response-quality-plan.md`.
+
+## GetMetricData Results
+
+- Added typed `GetMetricData` parsing plus shared aggregation logic across the JSON target and the Query/XML path used by the AWS CLI.
+- `cloudwatch get-metric-data` now preserves the caller query id, buckets timestamps cleanly by period, and returns aligned timestamp/value arrays.
+- Pagination now stays deterministic across multiple query series and no longer errors when a shorter series is exhausted before a longer one.
+- Added route tests for JSON aggregation, Query/XML aggregation, and later-page handling for shorter result sets.
+- Strengthened `scripts/verify_cli_interop.sh` so the smoke run asserts `GetMetricData` shape quality instead of only checking for a 200.
+- Added `README.md` covering the supported make targets, binary subcommands, public AWS-compatible commands, and local `/_mock/*` helper routes.
+- Verification completed successfully:
+  - `cargo fmt`
+  - `cargo test`
+  - `cargo clippy --all-targets --all-features`
+  - `bash scripts/verify_cli_interop.sh`
+  - manual `aws cloudwatch get-metric-data` check on `127.0.0.1:8080`
+
+## Pending Todo Triage
+
+- Closed todo `055` in this repo after re-running the repo-local `GetMetricData` pagination tests and AWS CLI smoke verification.
+- Triaged todo `056` as external to this extracted service repo because the referenced runtime files do not exist in this checkout.
+- No remaining repo-local implementation todo is queued in `tasks/todo.md`; the remaining open items are external runtime work or intentionally out of scope for this local-only service.

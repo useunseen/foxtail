@@ -82,6 +82,26 @@ struct CloudWatchQuery {
     dim_name_2: Option<String>,
     #[serde(rename = "Dimensions.member.2.Value")]
     dim_value_2: Option<String>,
+    #[serde(rename = "MetricDataQueries.member.1.Id")]
+    metric_data_query_id_1: Option<String>,
+    #[serde(rename = "MetricDataQueries.member.1.Label")]
+    metric_data_label_1: Option<String>,
+    #[serde(rename = "MetricDataQueries.member.1.MetricStat.Metric.Namespace")]
+    metric_data_namespace_1: Option<String>,
+    #[serde(rename = "MetricDataQueries.member.1.MetricStat.Metric.MetricName")]
+    metric_data_metric_name_1: Option<String>,
+    #[serde(rename = "MetricDataQueries.member.1.MetricStat.Period")]
+    metric_data_period_1: Option<i64>,
+    #[serde(rename = "MetricDataQueries.member.1.MetricStat.Stat")]
+    metric_data_stat_1: Option<String>,
+    #[serde(rename = "MetricDataQueries.member.1.MetricStat.Metric.Dimensions.member.1.Name")]
+    metric_data_dim_name_1_1: Option<String>,
+    #[serde(rename = "MetricDataQueries.member.1.MetricStat.Metric.Dimensions.member.1.Value")]
+    metric_data_dim_value_1_1: Option<String>,
+    #[serde(rename = "MetricDataQueries.member.1.MetricStat.Metric.Dimensions.member.2.Name")]
+    metric_data_dim_name_1_2: Option<String>,
+    #[serde(rename = "MetricDataQueries.member.1.MetricStat.Metric.Dimensions.member.2.Value")]
+    metric_data_dim_value_1_2: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -223,6 +243,48 @@ struct TimePeriod {
     end: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct GetMetricDataRequest {
+    start_time: String,
+    end_time: String,
+    metric_data_queries: Vec<GetMetricDataQuery>,
+    next_token: Option<String>,
+    max_datapoints: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct GetMetricDataQuery {
+    id: String,
+    metric_stat: Option<GetMetricStatRequest>,
+    expression: Option<String>,
+    label: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct GetMetricStatRequest {
+    metric: GetMetricRequest,
+    period: i64,
+    stat: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct GetMetricRequest {
+    namespace: String,
+    metric_name: String,
+    dimensions: Option<Vec<GetMetricDimension>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct GetMetricDimension {
+    name: String,
+    value: String,
+}
+
 enum CostUsageError {
     Validation(String),
     Internal(anyhow::Error),
@@ -232,6 +294,26 @@ enum MetricDataError {
     Validation(String),
     InvalidNextToken(String),
     Internal(anyhow::Error),
+}
+
+struct MetricDataSeries {
+    id: String,
+    label: String,
+    timestamps: Vec<String>,
+    values: Vec<f64>,
+}
+
+struct MetricDataSeriesRequest {
+    id: String,
+    label: String,
+    namespace: String,
+    metric_name: String,
+    resource_id: Option<String>,
+    stat: String,
+    period: i64,
+    start_time: DateTime<Utc>,
+    end_time: DateTime<Utc>,
+    injected_now: Option<DateTime<Utc>>,
 }
 
 #[derive(Serialize)]
@@ -680,6 +762,65 @@ fn extract_resource_id_from_query(query: &CloudWatchQuery) -> Option<String> {
     None
 }
 
+fn extract_resource_id_from_metric_data_query(query: &CloudWatchQuery) -> Option<String> {
+    for (name, value) in [
+        (
+            query.metric_data_dim_name_1_1.as_deref(),
+            query.metric_data_dim_value_1_1.as_deref(),
+        ),
+        (
+            query.metric_data_dim_name_1_2.as_deref(),
+            query.metric_data_dim_value_1_2.as_deref(),
+        ),
+    ] {
+        if matches!(
+            name,
+            Some("InstanceId" | "VolumeId" | "BucketName" | "DBInstanceIdentifier")
+        ) {
+            return value.map(ToOwned::to_owned);
+        }
+    }
+    None
+}
+
+async fn build_metric_data_series(
+    pool: &SqlitePool,
+    request: MetricDataSeriesRequest,
+) -> std::result::Result<MetricDataSeries, MetricDataError> {
+    let points = metrics::query_metrics(
+        pool,
+        MetricQueryParams {
+            resource_id: request.resource_id,
+            metric_name: Some(request.metric_name),
+            namespace: Some(request.namespace),
+            start_time: Some(request.start_time),
+            end_time: Some(request.end_time),
+            limit: Some(10_000),
+            injected_now: request.injected_now,
+        },
+    )
+    .await
+    .map_err(MetricDataError::Internal)?;
+
+    let aggregated = aggregate_metric_points(
+        &points,
+        request.start_time,
+        request.end_time,
+        request.period,
+        &request.stat,
+    )?;
+
+    Ok(MetricDataSeries {
+        id: request.id,
+        label: request.label,
+        timestamps: aggregated
+            .iter()
+            .map(|point| point.timestamp.to_rfc3339())
+            .collect(),
+        values: aggregated.iter().map(|point| point.value).collect(),
+    })
+}
+
 fn error_response(
     protocol: Protocol,
     code: &str,
@@ -870,6 +1011,79 @@ fn cloudwatch_metric_unit(namespace: Option<&str>, metric_name: Option<&str>) ->
         (_, "FreeableMemory") | (_, "BucketSizeBytes") => "Bytes",
         _ => "None",
     }
+}
+
+fn extract_resource_id_from_dimensions(
+    dimensions: Option<&[GetMetricDimension]>,
+) -> Option<String> {
+    dimensions.and_then(|dims| {
+        dims.iter().find_map(|dimension| {
+            if dimension.name == "InstanceId"
+                || dimension.name == "VolumeId"
+                || dimension.name == "BucketName"
+                || dimension.name == "DBInstanceIdentifier"
+            {
+                return Some(dimension.value.clone());
+            }
+            None
+        })
+    })
+}
+
+fn aggregate_metric_points(
+    points: &[metrics::MetricPoint],
+    start_time: DateTime<Utc>,
+    end_time: DateTime<Utc>,
+    period_seconds: i64,
+    stat: &str,
+) -> std::result::Result<Vec<metrics::MetricPoint>, MetricDataError> {
+    if period_seconds <= 0 {
+        return Err(MetricDataError::Validation(
+            "MetricStat.Period must be greater than 0.".to_string(),
+        ));
+    }
+
+    let stat_key = stat.to_ascii_lowercase();
+    if !matches!(stat_key.as_str(), "average" | "sum" | "minimum" | "maximum") {
+        return Err(MetricDataError::Validation(format!(
+            "Unsupported MetricStat.Stat '{}'.",
+            stat
+        )));
+    }
+
+    let mut buckets: BTreeMap<i64, Vec<f64>> = BTreeMap::new();
+    for point in points {
+        if point.timestamp < start_time || point.timestamp > end_time {
+            continue;
+        }
+        let offset_seconds = (point.timestamp - start_time).num_seconds();
+        if offset_seconds < 0 {
+            continue;
+        }
+        let bucket_index = offset_seconds / period_seconds;
+        buckets.entry(bucket_index).or_default().push(point.value);
+    }
+
+    Ok(buckets
+        .into_iter()
+        .map(|(bucket_index, values)| {
+            let timestamp = start_time + chrono::Duration::seconds(bucket_index * period_seconds);
+            let value = match stat_key.as_str() {
+                "average" => values.iter().sum::<f64>() / values.len() as f64,
+                "sum" => values.iter().sum::<f64>(),
+                "minimum" => values
+                    .iter()
+                    .copied()
+                    .fold(f64::INFINITY, |acc, value| acc.min(value)),
+                "maximum" => values
+                    .iter()
+                    .copied()
+                    .fold(f64::NEG_INFINITY, |acc, value| acc.max(value)),
+                _ => unreachable!("validated above"),
+            };
+            metrics::MetricPoint { value, timestamp }
+        })
+        .collect())
 }
 
 fn ensure_admin_authorized(
@@ -2742,10 +2956,22 @@ async fn handle_cloudwatch_query(
         }
         "GetMetricData" => match handle_get_metric_data_xml(pool, query, injected_now).await {
             Ok(xml) => (StatusCode::OK, [(header::CONTENT_TYPE, "text/xml")], xml).into_response(),
-            Err(e) => error_response(
+            Err(MetricDataError::Validation(message)) => error_response(
+                protocol,
+                "InvalidParameterValueException",
+                &message,
+                StatusCode::BAD_REQUEST,
+            ),
+            Err(MetricDataError::InvalidNextToken(message)) => error_response(
+                protocol,
+                "InvalidNextToken",
+                &message,
+                StatusCode::BAD_REQUEST,
+            ),
+            Err(MetricDataError::Internal(error)) => error_response(
                 protocol,
                 "InternalFailure",
-                &e.to_string(),
+                &error.to_string(),
                 StatusCode::INTERNAL_SERVER_ERROR,
             ),
         },
@@ -2865,39 +3091,74 @@ async fn handle_get_metric_data_xml(
     pool: SqlitePool,
     query: CloudWatchQuery,
     injected_now: Option<DateTime<Utc>>,
-) -> Result<String> {
-    let params = MetricQueryParams {
-        resource_id: extract_resource_id_from_query(&query),
-        metric_name: query.metric_name,
-        namespace: query.namespace,
-        start_time: query.start_time.and_then(|s| {
-            DateTime::parse_from_rfc3339(&s)
-                .ok()
-                .map(|t| t.with_timezone(&Utc))
-        }),
-        end_time: query.end_time.and_then(|s| {
-            DateTime::parse_from_rfc3339(&s)
-                .ok()
-                .map(|t| t.with_timezone(&Utc))
-        }),
-        limit: Some(100),
-        injected_now,
-    };
+) -> std::result::Result<String, MetricDataError> {
+    let start_time = parse_rfc3339_required("StartTime", query.start_time.as_deref())
+        .map_err(MetricDataError::Validation)?;
+    let end_time = parse_rfc3339_required("EndTime", query.end_time.as_deref())
+        .map_err(MetricDataError::Validation)?;
+    let query_id = query.metric_data_query_id_1.clone().ok_or_else(|| {
+        MetricDataError::Validation(
+            "Missing required field 'MetricDataQueries.member.1.Id'.".to_string(),
+        )
+    })?;
+    let namespace = query.metric_data_namespace_1.clone().ok_or_else(|| {
+        MetricDataError::Validation(
+            "Missing required field 'MetricDataQueries.member.1.MetricStat.Metric.Namespace'."
+                .to_string(),
+        )
+    })?;
+    let metric_name = query.metric_data_metric_name_1.clone().ok_or_else(|| {
+        MetricDataError::Validation(
+            "Missing required field 'MetricDataQueries.member.1.MetricStat.Metric.MetricName'."
+                .to_string(),
+        )
+    })?;
+    let period = query.metric_data_period_1.ok_or_else(|| {
+        MetricDataError::Validation(
+            "Missing required field 'MetricDataQueries.member.1.MetricStat.Period'.".to_string(),
+        )
+    })?;
+    let stat = query.metric_data_stat_1.clone().ok_or_else(|| {
+        MetricDataError::Validation(
+            "Missing required field 'MetricDataQueries.member.1.MetricStat.Stat'.".to_string(),
+        )
+    })?;
 
-    let points = metrics::query_metrics(&pool, params).await?;
+    let resource_id = extract_resource_id_from_metric_data_query(&query);
+    let label = query
+        .metric_data_label_1
+        .clone()
+        .unwrap_or_else(|| metric_name.clone());
+
+    let series = build_metric_data_series(
+        &pool,
+        MetricDataSeriesRequest {
+            id: query_id,
+            label,
+            namespace,
+            metric_name,
+            resource_id,
+            stat,
+            period,
+            start_time,
+            end_time,
+            injected_now,
+        },
+    )
+    .await?;
 
     let response = cw::GetMetricDataResponse {
         xmlns: "http://monitoring.amazonaws.com/doc/2010-08-01/".to_string(),
         result: cw::GetMetricDataResult {
             results: cw::MetricDataResults {
                 members: vec![cw::MetricDataResult {
-                    id: "m1".to_string(),
+                    id: series.id,
                     status_code: "Complete".to_string(),
                     values: cw::Values {
-                        members: points.iter().map(|p| p.value).collect(),
+                        members: series.values,
                     },
                     timestamps: cw::Timestamps {
-                        members: points.iter().map(|p| p.timestamp.to_rfc3339()).collect(),
+                        members: series.timestamps,
                     },
                 }],
             },
@@ -2907,7 +3168,7 @@ async fn handle_get_metric_data_xml(
         },
     };
 
-    cw::to_xml(&response)
+    cw::to_xml(&response).map_err(MetricDataError::Internal)
 }
 
 async fn handle_get_metric_statistics(
@@ -3016,127 +3277,104 @@ async fn handle_get_metric_data(
     body: Bytes,
     injected_now: Option<DateTime<Utc>>,
 ) -> std::result::Result<Value, MetricDataError> {
-    let req: Value = serde_json::from_slice(&body)
+    let req: GetMetricDataRequest = serde_json::from_slice(&body)
         .map_err(|e| MetricDataError::Validation(format!("Invalid JSON body: {}", e)))?;
 
-    let start_time =
-        parse_rfc3339_required("StartTime", req.get("StartTime").and_then(Value::as_str))
-            .map_err(MetricDataError::Validation)?;
-    let end_time = parse_rfc3339_required("EndTime", req.get("EndTime").and_then(Value::as_str))
+    let start_time = parse_rfc3339_required("StartTime", Some(req.start_time.as_str()))
         .map_err(MetricDataError::Validation)?;
-
-    let queries = req
-        .get("MetricDataQueries")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            MetricDataError::Validation("Missing required field 'MetricDataQueries'.".to_string())
-        })?;
-    if queries.is_empty() {
+    let end_time = parse_rfc3339_required("EndTime", Some(req.end_time.as_str()))
+        .map_err(MetricDataError::Validation)?;
+    if req.metric_data_queries.is_empty() {
         return Err(MetricDataError::Validation(
             "MetricDataQueries must include at least one query.".to_string(),
         ));
     }
-    if queries.len() > 50 {
+    if req.metric_data_queries.len() > 50 {
         return Err(MetricDataError::Validation(
             "MetricDataQueries may contain at most 50 queries.".to_string(),
         ));
     }
 
-    let max_datapoints = req
-        .get("MaxDatapoints")
-        .and_then(Value::as_u64)
-        .unwrap_or(1000) as usize;
+    let max_datapoints = req.max_datapoints.unwrap_or(1000) as usize;
     if max_datapoints == 0 {
         return Err(MetricDataError::Validation(
             "MaxDatapoints must be greater than 0.".to_string(),
         ));
     }
 
-    let page_start = match req.get("NextToken").and_then(Value::as_str) {
+    let page_start = match req.next_token.as_deref() {
         Some(raw) if !raw.trim().is_empty() => raw.parse::<usize>().map_err(|_| {
             MetricDataError::InvalidNextToken("Invalid NextToken value.".to_string())
         })?,
         _ => 0,
     };
 
-    let mut results = Vec::with_capacity(queries.len());
-    let mut has_more = false;
+    let mut series_list = Vec::with_capacity(req.metric_data_queries.len());
+    let mut max_series_len = 0usize;
 
-    for query in queries {
-        let query_id = query
-            .get("Id")
-            .and_then(Value::as_str)
-            .unwrap_or("m1")
-            .to_string();
-
-        let metric = query.get("MetricStat").and_then(|s| s.get("Metric"));
-
-        let metric_name = metric
-            .and_then(|m| m.get("MetricName"))
-            .and_then(Value::as_str)
-            .map(|s| s.to_string());
-        let namespace = metric
-            .and_then(|m| m.get("Namespace"))
-            .and_then(Value::as_str)
-            .map(|s| s.to_string());
-
-        let resource_id = metric
-            .and_then(|m| m.get("Dimensions"))
-            .and_then(Value::as_array)
-            .and_then(|dims| {
-                dims.iter().find_map(|d| {
-                    let name = d.get("Name")?.as_str()?;
-                    if name == "InstanceId"
-                        || name == "VolumeId"
-                        || name == "BucketName"
-                        || name == "DBInstanceIdentifier"
-                    {
-                        return d.get("Value")?.as_str().map(|s| s.to_string());
-                    }
-                    None
-                })
-            });
-
-        let params = MetricQueryParams {
-            resource_id,
-            metric_name,
-            namespace,
-            start_time: Some(start_time),
-            end_time: Some(end_time),
-            limit: Some(10_000),
-            injected_now,
-        };
-
-        let points = metrics::query_metrics(&pool, params)
-            .await
-            .map_err(MetricDataError::Internal)?;
-
-        if page_start > points.len() {
-            return Err(MetricDataError::InvalidNextToken(
-                "NextToken points past available results.".to_string(),
+    for query in req.metric_data_queries {
+        if query.expression.is_some() {
+            return Err(MetricDataError::Validation(
+                "Metric math expressions are not supported.".to_string(),
             ));
         }
+        let metric_stat = query.metric_stat.ok_or_else(|| {
+            MetricDataError::Validation("MetricDataQueries must include MetricStat.".to_string())
+        })?;
 
-        let page_end = std::cmp::min(page_start + max_datapoints, points.len());
-        if page_end < points.len() {
-            has_more = true;
-        }
-        let page_points = &points[page_start..page_end];
+        let metric = metric_stat.metric;
+        let series = build_metric_data_series(
+            &pool,
+            MetricDataSeriesRequest {
+                id: query.id,
+                label: query.label.unwrap_or(metric.metric_name.clone()),
+                namespace: metric.namespace,
+                metric_name: metric.metric_name,
+                resource_id: extract_resource_id_from_dimensions(metric.dimensions.as_deref()),
+                stat: metric_stat.stat,
+                period: metric_stat.period,
+                start_time,
+                end_time,
+                injected_now,
+            },
+        )
+        .await?;
 
-        let mut timestamps = Vec::with_capacity(page_points.len());
-        let mut values = Vec::with_capacity(page_points.len());
-        for point in page_points {
-            timestamps.push(point.timestamp.to_rfc3339());
-            values.push(point.value);
-        }
-
-        results.push(json!({
-            "Id": query_id,
-            "StatusCode": "Complete",
-            "Values": values,
-            "Timestamps": timestamps
-        }));
+        max_series_len = max_series_len.max(series.timestamps.len());
+        series_list.push(series);
     }
+
+    if page_start > max_series_len {
+        return Err(MetricDataError::InvalidNextToken(
+            "NextToken points past available results.".to_string(),
+        ));
+    }
+
+    let page_end = page_start.saturating_add(max_datapoints);
+    let has_more = page_end < max_series_len;
+
+    let results = series_list
+        .into_iter()
+        .map(|series| {
+            let series_end = std::cmp::min(page_end, series.timestamps.len());
+            let (timestamps, values) = if page_start >= series.timestamps.len() {
+                (Vec::new(), Vec::new())
+            } else {
+                (
+                    series.timestamps[page_start..series_end].to_vec(),
+                    series.values[page_start..series_end].to_vec(),
+                )
+            };
+
+            json!({
+                "Id": series.id,
+                "Label": series.label,
+                "StatusCode": "Complete",
+                "Values": values,
+                "Timestamps": timestamps
+            })
+        })
+        .collect::<Vec<_>>();
 
     let mut response = json!({
         "MetricDataResults": results
@@ -3293,7 +3531,9 @@ mod tests {
                             "Name": "InstanceId",
                             "Value": "i-test"
                         }]
-                    }
+                    },
+                    "Period": 3600,
+                    "Stat": "Average"
                 }
             }]
         });
@@ -3318,12 +3558,215 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
         assert_eq!(body["NextToken"], "2");
+        assert_eq!(body["MetricDataResults"][0]["Id"], "m1");
         assert_eq!(
             body["MetricDataResults"][0]["Values"]
                 .as_array()
                 .unwrap()
                 .len(),
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn cloudwatch_metric_data_preserves_query_id_and_aggregates_average() {
+        let pool = test_pool().await;
+        for resource_id in ["i-test", "i-other"] {
+            sqlx::query(
+                "INSERT INTO resources (id, resource_type, region, scenario, tags)
+                 VALUES (?, 'ec2', 'us-east-1', 'Baseline', '{}')",
+            )
+            .bind(resource_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        for (resource_id, offset, value) in [
+            ("i-test", -7200, 10.0),
+            ("i-test", -7100, 30.0),
+            ("i-test", -3600, 20.0),
+            ("i-other", -7150, 100.0),
+        ] {
+            sqlx::query(
+                "INSERT INTO metrics (resource_id, namespace, metric_name, seconds_from_now, value)
+                 VALUES (?, 'AWS/EC2', 'CPUUtilization', ?, ?)",
+            )
+            .bind(resource_id)
+            .bind(offset)
+            .bind(value)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let app = build_app(pool);
+        let body = json!({
+            "StartTime": "2026-03-11T10:00:00Z",
+            "EndTime": "2026-03-11T12:00:00Z",
+            "MetricDataQueries": [{
+                "Id": "cpu",
+                "MetricStat": {
+                    "Metric": {
+                        "Namespace": "AWS/EC2",
+                        "MetricName": "CPUUtilization",
+                        "Dimensions": [{
+                            "Name": "InstanceId",
+                            "Value": "i-test"
+                        }]
+                    },
+                    "Period": 3600,
+                    "Stat": "Average"
+                }
+            }]
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-amz-json-1.1")
+                    .header(
+                        "x-amz-target",
+                        "GraniteServiceVersion20100801.GetMetricData",
+                    )
+                    .header("x-mock-now", "2026-03-11T12:00:00Z")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["MetricDataResults"][0]["Id"], "cpu");
+        assert_eq!(body["MetricDataResults"][0]["Label"], "CPUUtilization");
+        assert_eq!(
+            body["MetricDataResults"][0]["Timestamps"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            body["MetricDataResults"][0]["Timestamps"][0],
+            "2026-03-11T10:00:00+00:00"
+        );
+        assert_eq!(body["MetricDataResults"][0]["Values"][0], json!(20.0));
+        assert_eq!(body["MetricDataResults"][0]["Values"][1], json!(20.0));
+    }
+
+    #[tokio::test]
+    async fn cloudwatch_metric_data_pagination_keeps_shorter_queries_empty_on_later_pages() {
+        let pool = test_pool().await;
+        for resource_id in ["i-long", "i-short"] {
+            sqlx::query(
+                "INSERT INTO resources (id, resource_type, region, scenario, tags)
+                 VALUES (?, 'ec2', 'us-east-1', 'Baseline', '{}')",
+            )
+            .bind(resource_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        for (resource_id, offset, value) in [
+            ("i-long", -10800, 10.0),
+            ("i-long", -7200, 20.0),
+            ("i-long", -3600, 30.0),
+            ("i-short", -3600, 40.0),
+        ] {
+            sqlx::query(
+                "INSERT INTO metrics (resource_id, namespace, metric_name, seconds_from_now, value)
+                 VALUES (?, 'AWS/EC2', 'CPUUtilization', ?, ?)",
+            )
+            .bind(resource_id)
+            .bind(offset)
+            .bind(value)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let app = build_app(pool);
+        let body = json!({
+            "StartTime": "2026-03-11T09:00:00Z",
+            "EndTime": "2026-03-11T12:00:00Z",
+            "MaxDatapoints": 2,
+            "NextToken": "2",
+            "MetricDataQueries": [
+                {
+                    "Id": "long",
+                    "MetricStat": {
+                        "Metric": {
+                            "Namespace": "AWS/EC2",
+                            "MetricName": "CPUUtilization",
+                            "Dimensions": [{
+                                "Name": "InstanceId",
+                                "Value": "i-long"
+                            }]
+                        },
+                        "Period": 3600,
+                        "Stat": "Average"
+                    }
+                },
+                {
+                    "Id": "short",
+                    "MetricStat": {
+                        "Metric": {
+                            "Namespace": "AWS/EC2",
+                            "MetricName": "CPUUtilization",
+                            "Dimensions": [{
+                                "Name": "InstanceId",
+                                "Value": "i-short"
+                            }]
+                        },
+                        "Period": 3600,
+                        "Stat": "Average"
+                    }
+                }
+            ]
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-amz-json-1.1")
+                    .header(
+                        "x-amz-target",
+                        "GraniteServiceVersion20100801.GetMetricData",
+                    )
+                    .header("x-mock-now", "2026-03-11T12:00:00Z")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert!(body.get("NextToken").is_none());
+        assert_eq!(
+            body["MetricDataResults"][0]["Timestamps"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            body["MetricDataResults"][1]["Timestamps"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            body["MetricDataResults"][1]["Values"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
         );
     }
 
@@ -3565,6 +4008,62 @@ mod tests {
         let xml = String::from_utf8(body.to_vec()).unwrap();
         assert!(xml.contains("GetMetricStatisticsResponse"));
         assert!(xml.contains("CPUUtilization"));
+    }
+
+    #[tokio::test]
+    async fn cloudwatch_query_xml_metric_data_preserves_query_id_and_aggregates() {
+        let pool = test_pool().await;
+        for resource_id in ["i-test", "i-other"] {
+            sqlx::query(
+                "INSERT INTO resources (id, resource_type, region, scenario, tags)
+                 VALUES (?, 'ec2', 'us-east-1', 'Baseline', '{}')",
+            )
+            .bind(resource_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        for (resource_id, offset, value) in [
+            ("i-test", -7200, 10.0),
+            ("i-test", -7100, 30.0),
+            ("i-test", -3600, 20.0),
+            ("i-other", -7150, 100.0),
+        ] {
+            sqlx::query(
+                "INSERT INTO metrics (resource_id, namespace, metric_name, seconds_from_now, value)
+                 VALUES (?, 'AWS/EC2', 'CPUUtilization', ?, ?)",
+            )
+            .bind(resource_id)
+            .bind(offset)
+            .bind(value)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let app = build_app(pool);
+        let form = "Action=GetMetricData&Version=2010-08-01&MetricDataQueries.member.1.Id=cpu&MetricDataQueries.member.1.MetricStat.Metric.Namespace=AWS%2FEC2&MetricDataQueries.member.1.MetricStat.Metric.MetricName=CPUUtilization&MetricDataQueries.member.1.MetricStat.Metric.Dimensions.member.1.Name=InstanceId&MetricDataQueries.member.1.MetricStat.Metric.Dimensions.member.1.Value=i-test&MetricDataQueries.member.1.MetricStat.Period=3600&MetricDataQueries.member.1.MetricStat.Stat=Average&StartTime=2026-03-11T10%3A00%3A00Z&EndTime=2026-03-11T12%3A00%3A00Z";
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header("x-mock-now", "2026-03-11T12:00:00Z")
+                    .body(Body::from(form))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let xml = String::from_utf8(body.to_vec()).unwrap();
+        assert!(xml.contains("GetMetricDataResponse"));
+        assert!(xml.contains("<Id>cpu</Id>"));
+        assert_eq!(xml.matches("2026-03-11T10:00:00+00:00").count(), 1);
+        assert_eq!(xml.matches("2026-03-11T11:00:00+00:00").count(), 1);
     }
 
     #[tokio::test]

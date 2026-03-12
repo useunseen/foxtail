@@ -61,7 +61,7 @@ The branch adds substantial mock-service parity for Cost Explorer and some Cloud
 
 ## Recommended Action
 
-To be filled during triage.
+Not actionable in this extracted Rust service repo. The runtime files named in this finding (`graph_builder.py`, `models.py`, and orchestrator modules) are not present here, so this work should stay with the parent runtime repository or be rewritten as a service-local todo if new repo-local requirements emerge.
 
 ## Technical Details
 
@@ -113,3 +113,15 @@ To be filled during triage.
 **Learnings:**
 - The branch has strong mock-service parity progress, but end-to-end CE/CUR/CloudWatch support is still only partial.
 - The missing work is primarily runtime evidence integration plus the entire CUR analytics path.
+
+### 2026-03-12 - Repo Scope Triage
+
+**By:** Codex
+
+**Actions:**
+- Re-checked the extracted service repo for the runtime files referenced by this todo.
+- Confirmed that `graph_builder.py`, `models.py`, `orchestrator_tools_analysis.py`, and `orchestrator_tools_plan.py` are not present in this checkout.
+- Triaged the finding as an external follow-up for the parent runtime repo rather than the next actionable task in this standalone service repo.
+
+**Learnings:**
+- Some review findings were carried over from a larger multi-repo context and need repo-local triage before they are treated as executable work.

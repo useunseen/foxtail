@@ -154,9 +154,30 @@ cat >"$QUERY_FILE" <<EOF
 ]
 EOF
 
-aws_json cloudwatch get-metric-data \
+METRIC_DATA_OUTPUT="$(aws_json cloudwatch get-metric-data \
   --metric-data-queries "file://$QUERY_FILE" \
   --start-time 2026-03-11T00:00:00Z \
-  --end-time 2026-03-11T12:00:00Z >/dev/null
+  --end-time 2026-03-11T12:00:00Z)"
+
+METRIC_DATA_OUTPUT="$METRIC_DATA_OUTPUT" python3 - <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ["METRIC_DATA_OUTPUT"])
+results = payload.get("MetricDataResults", [])
+if len(results) != 1:
+    raise SystemExit("expected exactly one MetricDataResult")
+
+result = results[0]
+if result.get("Id") != "cpu":
+    raise SystemExit("MetricDataResult Id did not preserve caller query id")
+
+timestamps = result.get("Timestamps", [])
+values = result.get("Values", [])
+if len(timestamps) != len(values):
+    raise SystemExit("timestamps and values are not aligned")
+if len(timestamps) != len(set(timestamps)):
+    raise SystemExit("duplicate timestamps found in MetricDataResult")
+PY
 
 echo "CLI interoperability verification passed on $ENDPOINT"
