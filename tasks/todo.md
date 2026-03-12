@@ -72,3 +72,29 @@
 - Closed todo `055` in this repo after re-running the repo-local `GetMetricData` pagination tests and AWS CLI smoke verification.
 - Triaged todo `056` as external to this extracted service repo because the referenced runtime files do not exist in this checkout.
 - No remaining repo-local implementation todo is queued in `tasks/todo.md`; the remaining open items are external runtime work or intentionally out of scope for this local-only service.
+
+## Scenario Data Quality Verification
+
+- [x] Compare generated metric and cost outputs across `baseline`, `spike`, and `idle-heavy` on an isolated temp database.
+- [x] Validate that public AWS-compatible commands reflect the expected scenario-specific behavior for cost and utilization.
+- [x] Record whether the observed datapoints match the generator’s intended shapes and identify any quality gaps.
+
+## Scenario Verification Results
+
+- Ran a three-scenario sweep (`Baseline`, `Spike`, `IdleHeavy`) against an isolated copied database behind a temporary local server on `127.0.0.1:18081`.
+- Verified the expected directional behavior from the generator:
+  - `Spike` materially increases EC2/RDS CPU, EC2 network throughput, ELB request/error rates, and 30-day cost totals.
+  - `IdleHeavy` materially lowers utilization metrics while raising cost totals, which matches the intended “expensive but idle” FinOps scenario.
+  - `Baseline` stays in the middle for utilization and spend, with modest error events and moderate throughput.
+- Observed aggregate values:
+  - `Baseline`: EC2 CPU `17.06`, EC2 NetworkIn `20.97M`, ELB RequestCount `535.18`, total raw cost `429.88`
+  - `Spike`: EC2 CPU `76.28`, EC2 NetworkIn `72.21M`, ELB RequestCount `2000.78`, total raw cost `2032.91`
+  - `IdleHeavy`: EC2 CPU `3.79`, EC2 NetworkIn `4.32M`, ELB RequestCount `54.66`, total raw cost `4376.77`
+- Public AWS-compatible checks matched the same directional story:
+  - `ce get-cost-and-usage`
+  - `ce get-cost-and-usage --group-by Type=DIMENSION,Key=SERVICE`
+  - `cloudwatch list-metrics`
+  - `cloudwatch get-metric-statistics`
+- The main quality caveat is semantic realism rather than correctness:
+  - `IdleHeavy` uses a flat high-cost multiplier across all resource types, so the scenario is useful for FinOps “high spend, low usage” exercises but less realistic as a production-like cost shape.
+  - Cost Explorer totals over a requested time window are lower than the full raw `cost_records` sum because the API query window is narrower/end-exclusive relative to the entire seeded table, which is expected.
