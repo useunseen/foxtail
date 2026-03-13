@@ -139,6 +139,34 @@ aws --endpoint-url http://127.0.0.1:8080 ce get-cost-and-usage \
   --group-by Type=DIMENSION,Key=SERVICE
 ```
 
+### Resource Groups Tagging API
+
+Supported:
+
+- `resourcegroupstaggingapi get-resources`
+
+Example:
+
+```bash
+aws --endpoint-url http://127.0.0.1:8080 resourcegroupstaggingapi get-resources \
+  --resources-per-page 5
+```
+
+### Pricing
+
+Supported:
+
+- `pricing get-products`
+
+Example:
+
+```bash
+aws --endpoint-url http://127.0.0.1:8080 pricing get-products \
+  --service-code AmazonEC2 \
+  --format-version aws_v1 \
+  --filters Type=TERM_MATCH,Field=instanceType,Value=m6i.large
+```
+
 ### CloudWatch
 
 CloudWatch support is split by protocol:

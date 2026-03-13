@@ -124,6 +124,16 @@ RESOURCE_TAGS="$(aws_json ce get-tags \
   --tag-key Name)"
 log_step "Verified Cost Explorer: get-tags"
 
+TAGGED_RESOURCES="$(aws_json resourcegroupstaggingapi get-resources \
+  --resources-per-page 5)"
+log_step "Verified Resource Groups Tagging API: get-resources"
+
+PRICING_PRODUCTS="$(aws_json pricing get-products \
+  --service-code AmazonEC2 \
+  --format-version aws_v1 \
+  --filters Type=TERM_MATCH,Field=instanceType,Value=m6i.large)"
+log_step "Verified Pricing: get-products"
+
 log_step "Verified Cost Explorer: get-cost-forecast"
 aws_json ce get-cost-forecast \
   --time-period "Start=$CE_START_DAY,End=$CE_END_DAY" \
@@ -150,6 +160,8 @@ INSTANCE_ID="$(
   GROUPED_COSTS="$GROUPED_COSTS" \
   RESOURCE_COSTS="$RESOURCE_COSTS" \
   RESOURCE_TAGS="$RESOURCE_TAGS" \
+  TAGGED_RESOURCES="$TAGGED_RESOURCES" \
+  PRICING_PRODUCTS="$PRICING_PRODUCTS" \
   EC2_METRICS="$EC2_METRICS" \
   python3 - <<'PY'
 import json
@@ -173,6 +185,14 @@ if not resource_results or not any(bucket.get("Groups") for bucket in resource_r
 resource_tags = json.loads(os.environ["RESOURCE_TAGS"])
 if not resource_tags.get("Tags"):
     raise SystemExit("tag discovery returned no tag values")
+
+tagged_resources = json.loads(os.environ["TAGGED_RESOURCES"])
+if not tagged_resources.get("ResourceTagMappingList"):
+    raise SystemExit("tagged resource inventory is empty")
+
+pricing_products = json.loads(os.environ["PRICING_PRODUCTS"])
+if not pricing_products.get("PriceList"):
+    raise SystemExit("pricing product list is empty")
 
 metrics = json.loads(os.environ["EC2_METRICS"]).get("Metrics", [])
 for metric in metrics:

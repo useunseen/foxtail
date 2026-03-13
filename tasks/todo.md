@@ -122,3 +122,26 @@
   - `cargo test`
   - `cargo clippy --all-targets --all-features`
   - `bash scripts/verify_cli_interop.sh`
+
+## Next Inventory And Pricing API Work
+
+- [x] Add `resourcegroupstaggingapi get-resources` so tagged inventory is available from the public AWS CLI surface.
+- [x] Add `pricing get-products` with a minimal mock price catalog for the seeded AWS services.
+- [x] Add focused route tests and extend the CLI smoke script for the new inventory and pricing APIs.
+- [x] Re-run formatting, tests, clippy, and the CLI smoke suite after the new handlers land.
+
+## Inventory And Pricing API Results
+
+- Added `ResourceGroupsTaggingAPI_20170126.GetResources` with tag-filter, resource-type-filter, ARN-filter, and pagination support over the seeded resources table.
+- Added `AWSPriceListService.GetProducts` with a small mock catalog for `AmazonEC2`, `AmazonRDS`, `AmazonS3`, and `AWSELB`, including CLI-compatible `PriceList` string payloads.
+- Added route coverage with tests for:
+  - tagged resource inventory pagination
+  - pricing catalog filtering and output shape
+- Extended `scripts/verify_cli_interop.sh` to exercise:
+  - `resourcegroupstaggingapi get-resources`
+  - `pricing get-products`
+- Verification completed successfully:
+  - `cargo fmt`
+  - `cargo test`
+  - `cargo clippy --all-targets --all-features`
+  - `bash scripts/verify_cli_interop.sh`

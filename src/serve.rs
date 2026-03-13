@@ -157,6 +157,45 @@ struct GetTagsRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
+struct GetResourcesRequest {
+    pagination_token: Option<String>,
+    resources_per_page: Option<u64>,
+    tags_per_page: Option<u64>,
+    resource_arn_list: Option<Vec<String>>,
+    resource_type_filters: Option<Vec<String>>,
+    tag_filters: Option<Vec<TagFilterInput>>,
+    include_compliance_details: Option<bool>,
+    exclude_compliant_resources: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct TagFilterInput {
+    key: String,
+    values: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct GetProductsRequest {
+    service_code: String,
+    filters: Option<Vec<PricingFilterInput>>,
+    format_version: Option<String>,
+    max_results: Option<u64>,
+    next_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct PricingFilterInput {
+    field: String,
+    #[serde(rename = "Type")]
+    filter_type: String,
+    value: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
 struct GetReservationCoverageRequest {
     time_period: TimePeriod,
     granularity: Option<String>,
@@ -322,6 +361,23 @@ struct CostRow {
     amount: f64,
     seconds_from_now: i64,
     tags_json: Option<String>,
+}
+
+#[derive(Clone)]
+struct TaggedResource {
+    arn: String,
+    resource_type_filter: String,
+    tags: Vec<(String, String)>,
+}
+
+#[derive(Clone)]
+struct PricingProduct {
+    service_code: &'static str,
+    attributes: BTreeMap<&'static str, String>,
+    rate_code: String,
+    description: String,
+    unit: &'static str,
+    price_per_unit_usd: String,
 }
 
 struct MetricDataSeries {
@@ -967,6 +1023,86 @@ fn canonical_cost_explorer_operation(target: &str) -> Option<&str> {
         .or_else(|| target.strip_prefix("AWSInsightsIndexService."))
 }
 
+fn canonical_tagging_operation(target: &str) -> Option<&str> {
+    target.strip_prefix("ResourceGroupsTaggingAPI_20170126.")
+}
+
+fn canonical_pricing_operation(target: &str) -> Option<&str> {
+    target.strip_prefix("AWSPriceListService.")
+}
+
+fn mock_account_id() -> &'static str {
+    "123456789012"
+}
+
+fn resource_arn(resource_type: &str, region: &str, resource_id: &str) -> String {
+    match resource_type {
+        "ec2" => format!(
+            "arn:aws:ec2:{region}:{}:instance/{resource_id}",
+            mock_account_id()
+        ),
+        "rds" => format!(
+            "arn:aws:rds:{region}:{}:db:{resource_id}",
+            mock_account_id()
+        ),
+        "s3" => format!("arn:aws:s3:::{resource_id}"),
+        "elb" => format!(
+            "arn:aws:elasticloadbalancing:{region}:{}:loadbalancer/app/{resource_id}/mock",
+            mock_account_id()
+        ),
+        _ => format!(
+            "arn:aws:{resource_type}:{region}:{}:{resource_id}",
+            mock_account_id()
+        ),
+    }
+}
+
+fn tagging_resource_type_filter(resource_type: &str) -> &'static str {
+    match resource_type {
+        "ec2" => "ec2:instance",
+        "rds" => "rds:db",
+        "s3" => "s3:bucket",
+        "elb" => "elasticloadbalancing:loadbalancer",
+        _ => "resource",
+    }
+}
+
+fn resource_matches_type_filters(resource_type_filter: &str, filters: &[String]) -> bool {
+    if filters.is_empty() {
+        return true;
+    }
+    let normalized = resource_type_filter.to_ascii_lowercase();
+    let normalized_service = normalized.split(':').next().unwrap_or(normalized.as_str());
+    filters.iter().any(|filter| {
+        let filter_lower = filter.to_ascii_lowercase();
+        filter_lower == normalized
+            || filter_lower == normalized_service
+            || normalized.starts_with(&filter_lower)
+    })
+}
+
+fn tagged_resource_matches_filters(resource: &TaggedResource, filters: &[TagFilterInput]) -> bool {
+    if filters.is_empty() {
+        return true;
+    }
+
+    let tags = resource
+        .tags
+        .iter()
+        .cloned()
+        .collect::<HashMap<String, String>>();
+
+    filters.iter().all(|filter| {
+        let Some(value) = tags.get(&filter.key) else {
+            return false;
+        };
+        match filter.values.as_ref() {
+            Some(values) if !values.is_empty() => values.iter().any(|candidate| candidate == value),
+            _ => true,
+        }
+    })
+}
+
 fn merge_filter_values(
     slot: &mut Option<BTreeSet<String>>,
     incoming: BTreeSet<String>,
@@ -1212,6 +1348,162 @@ async fn fetch_cost_rows_for_window(
         .collect())
 }
 
+async fn fetch_tagged_resources(
+    pool: &SqlitePool,
+) -> std::result::Result<Vec<TaggedResource>, CostUsageError> {
+    let rows = sqlx::query("SELECT id, resource_type, region, tags FROM resources ORDER BY id ASC")
+        .fetch_all(pool)
+        .await
+        .map_err(|e| CostUsageError::Internal(e.into()))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let resource_id = row.get::<String, _>("id");
+            let resource_type = row.get::<String, _>("resource_type");
+            let region = row.get::<String, _>("region");
+            let tags = parse_resource_tags(
+                row.try_get::<Option<String>, _>("tags")
+                    .ok()
+                    .flatten()
+                    .as_deref(),
+            )
+            .into_iter()
+            .collect::<Vec<_>>();
+
+            TaggedResource {
+                arn: resource_arn(&resource_type, &region, &resource_id),
+                resource_type_filter: tagging_resource_type_filter(&resource_type).to_string(),
+                tags,
+            }
+        })
+        .collect())
+}
+
+fn pricing_catalog() -> Vec<PricingProduct> {
+    let mut ec2 = BTreeMap::new();
+    ec2.insert("servicecode", "AmazonEC2".to_string());
+    ec2.insert("location", "US East (N. Virginia)".to_string());
+    ec2.insert("locationType", "AWS Region".to_string());
+    ec2.insert("instanceType", "m6i.large".to_string());
+    ec2.insert("operatingSystem", "Linux".to_string());
+    ec2.insert("tenancy", "Shared".to_string());
+    ec2.insert("capacitystatus", "Used".to_string());
+    ec2.insert("preInstalledSw", "NA".to_string());
+    ec2.insert("productFamily", "Compute Instance".to_string());
+
+    let mut rds = BTreeMap::new();
+    rds.insert("servicecode", "AmazonRDS".to_string());
+    rds.insert("location", "US East (N. Virginia)".to_string());
+    rds.insert("locationType", "AWS Region".to_string());
+    rds.insert("instanceType", "db.t3.medium".to_string());
+    rds.insert("databaseEngine", "PostgreSQL".to_string());
+    rds.insert("deploymentOption", "Single-AZ".to_string());
+    rds.insert("productFamily", "Database Instance".to_string());
+
+    let mut s3 = BTreeMap::new();
+    s3.insert("servicecode", "AmazonS3".to_string());
+    s3.insert("location", "US East (N. Virginia)".to_string());
+    s3.insert("locationType", "AWS Region".to_string());
+    s3.insert("storageClass", "General Purpose".to_string());
+    s3.insert("volumeType", "Standard".to_string());
+    s3.insert("productFamily", "Storage".to_string());
+
+    let mut elb = BTreeMap::new();
+    elb.insert("servicecode", "AWSELB".to_string());
+    elb.insert("location", "US East (N. Virginia)".to_string());
+    elb.insert("locationType", "AWS Region".to_string());
+    elb.insert("productFamily", "Load Balancer".to_string());
+    elb.insert("loadBalancerType", "Application".to_string());
+
+    vec![
+        PricingProduct {
+            service_code: "AmazonEC2",
+            attributes: ec2,
+            rate_code: "AmazonEC2.m6i.large.ondemand".to_string(),
+            description: "m6i.large On Demand Linux instance usage".to_string(),
+            unit: "Hrs",
+            price_per_unit_usd: "0.0960".to_string(),
+        },
+        PricingProduct {
+            service_code: "AmazonRDS",
+            attributes: rds,
+            rate_code: "AmazonRDS.db.t3.medium.ondemand".to_string(),
+            description: "db.t3.medium Single-AZ PostgreSQL instance usage".to_string(),
+            unit: "Hrs",
+            price_per_unit_usd: "0.0670".to_string(),
+        },
+        PricingProduct {
+            service_code: "AmazonS3",
+            attributes: s3,
+            rate_code: "AmazonS3.standard.storage".to_string(),
+            description: "Amazon S3 Standard storage usage".to_string(),
+            unit: "GB-Mo",
+            price_per_unit_usd: "0.0230".to_string(),
+        },
+        PricingProduct {
+            service_code: "AWSELB",
+            attributes: elb,
+            rate_code: "AWSELB.alb.usage".to_string(),
+            description: "Application Load Balancer hourly usage".to_string(),
+            unit: "Hrs",
+            price_per_unit_usd: "0.0225".to_string(),
+        },
+    ]
+}
+
+fn pricing_product_matches_filters(
+    product: &PricingProduct,
+    filters: &[PricingFilterInput],
+) -> bool {
+    filters.iter().all(|filter| {
+        if !filter.filter_type.eq_ignore_ascii_case("TERM_MATCH") {
+            return false;
+        }
+        if filter.field.eq_ignore_ascii_case("ServiceCode") {
+            return product.service_code == filter.value;
+        }
+        product
+            .attributes
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(filter.field.as_str()))
+            .is_some_and(|(_, value)| value == &filter.value)
+    })
+}
+
+fn pricing_product_to_value(product: &PricingProduct) -> Value {
+    let sku = format!("sku-{}", product.rate_code);
+    let attributes = product
+        .attributes
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), Value::String(v.clone())))
+        .collect::<serde_json::Map<String, Value>>();
+
+    json!({
+        "product": {
+            "sku": sku,
+            "productFamily": product.attributes.get("productFamily").cloned().unwrap_or_else(|| "Service".to_string()),
+            "attributes": Value::Object(attributes)
+        },
+        "serviceCode": product.service_code,
+        "terms": {
+            "OnDemand": {
+                product.rate_code.clone(): {
+                    "priceDimensions": {
+                        format!("{}.dimension", product.rate_code): {
+                            "unit": product.unit,
+                            "description": product.description,
+                            "pricePerUnit": {
+                                "USD": product.price_per_unit_usd
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
 fn parse_usize_token(
     value: Option<&str>,
     field_name: &str,
@@ -1396,6 +1688,10 @@ async fn dispatch_aws_request(
 ) -> axum::response::Response {
     if target.starts_with("AWSCostExplorer.") || target.starts_with("AWSInsightsIndexService.") {
         handle_cost_explorer(target, pool, body, protocol, injected_now).await
+    } else if target.starts_with("ResourceGroupsTaggingAPI_20170126.") {
+        handle_resource_groups_tagging(target, pool, body, protocol).await
+    } else if target.starts_with("AWSPriceListService.") {
+        handle_pricing(target, body, protocol).await
     } else if target.starts_with("GraniteServiceVersion20100801.") {
         handle_cloudwatch_json(target, pool, body, protocol, injected_now).await
     } else if target.is_empty() && content_type.contains("application/x-www-form-urlencoded") {
@@ -1411,6 +1707,73 @@ async fn dispatch_aws_request(
             "The action is not supported",
             StatusCode::NOT_FOUND,
         )
+    }
+}
+
+async fn handle_resource_groups_tagging(
+    target: &str,
+    pool: SqlitePool,
+    body: Bytes,
+    protocol: Protocol,
+) -> axum::response::Response {
+    match canonical_tagging_operation(target) {
+        Some("GetResources") => match handle_get_resources(pool, body).await {
+            Ok(res) => (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/x-amz-json-1.1")],
+                Json(res),
+            )
+                .into_response(),
+            Err(CostUsageError::Validation(message)) => error_response(
+                protocol,
+                "InvalidParameterException",
+                &message,
+                StatusCode::BAD_REQUEST,
+            ),
+            Err(CostUsageError::Internal(error)) => error_response(
+                protocol,
+                "InternalServiceException",
+                &error.to_string(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        },
+        _ => error_response(
+            protocol,
+            "UnknownAction",
+            "The action is not supported",
+            StatusCode::BAD_REQUEST,
+        ),
+    }
+}
+
+async fn handle_pricing(target: &str, body: Bytes, protocol: Protocol) -> axum::response::Response {
+    match canonical_pricing_operation(target) {
+        Some("GetProducts") => match handle_get_products(body).await {
+            Ok(res) => (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/x-amz-json-1.1")],
+                Json(res),
+            )
+                .into_response(),
+            Err(CostUsageError::Validation(message)) => error_response(
+                protocol,
+                "InvalidParameterException",
+                &message,
+                StatusCode::BAD_REQUEST,
+            ),
+            Err(CostUsageError::Internal(error)) => error_response(
+                protocol,
+                "InternalErrorException",
+                &error.to_string(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        },
+        _ => error_response(
+            protocol,
+            "UnknownAction",
+            "The action is not supported",
+            StatusCode::BAD_REQUEST,
+        ),
     }
 }
 
@@ -1856,6 +2219,22 @@ async fn build_dashboard_data(
     ] {
         supported_apis.extend(cost_explorer_api_entries(operation));
     }
+    supported_apis.push(DashboardApiEntry {
+        service: "resource-groups-tagging-api".to_string(),
+        operation: "GetResources".to_string(),
+        protocol: "json-1.1".to_string(),
+        target: Some("ResourceGroupsTaggingAPI_20170126.GetResources".to_string()),
+        action: None,
+        endpoint: None,
+    });
+    supported_apis.push(DashboardApiEntry {
+        service: "pricing".to_string(),
+        operation: "GetProducts".to_string(),
+        protocol: "json-1.1".to_string(),
+        target: Some("AWSPriceListService.GetProducts".to_string()),
+        action: None,
+        endpoint: None,
+    });
 
     let implemented_api_entries = supported_apis.len() as i64;
 
@@ -2830,6 +3209,132 @@ async fn handle_get_tags(
     }
     if req.search_string.is_some() {
         response["SearchStringApplied"] = json!(true);
+    }
+
+    Ok(response)
+}
+
+async fn handle_get_resources(
+    pool: SqlitePool,
+    body: Bytes,
+) -> std::result::Result<Value, CostUsageError> {
+    let req: GetResourcesRequest = serde_json::from_slice(&body)
+        .map_err(|e| CostUsageError::Validation(format!("Invalid JSON body: {}", e)))?;
+
+    if req.include_compliance_details.unwrap_or(false)
+        || req.exclude_compliant_resources.unwrap_or(false)
+    {
+        return Err(CostUsageError::Validation(
+            "Compliance detail options are not supported.".to_string(),
+        ));
+    }
+    if let Some(resource_arn_list) = req.resource_arn_list.as_ref()
+        && resource_arn_list.len() > 100
+    {
+        return Err(CostUsageError::Validation(
+            "ResourceARNList may contain at most 100 entries.".to_string(),
+        ));
+    }
+
+    let page_start = parse_usize_token(req.pagination_token.as_deref(), "PaginationToken")?;
+    let page_size = req.resources_per_page.unwrap_or(50).clamp(1, 100) as usize;
+    let tags_per_page = req.tags_per_page.unwrap_or(100).clamp(1, 500) as usize;
+    let resource_type_filters = req.resource_type_filters.unwrap_or_default();
+    let tag_filters = req.tag_filters.unwrap_or_default();
+    let resource_arn_filter = req
+        .resource_arn_list
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+
+    let resources = fetch_tagged_resources(&pool).await?;
+    let mut filtered = resources
+        .into_iter()
+        .filter(|resource| {
+            (resource_arn_filter.is_empty() || resource_arn_filter.contains(&resource.arn))
+                && resource_matches_type_filters(
+                    &resource.resource_type_filter,
+                    &resource_type_filters,
+                )
+                && tagged_resource_matches_filters(resource, &tag_filters)
+        })
+        .collect::<Vec<_>>();
+
+    if page_start > filtered.len() {
+        return Err(CostUsageError::Validation(
+            "PaginationToken points past available results.".to_string(),
+        ));
+    }
+
+    filtered.sort_by(|a, b| a.arn.cmp(&b.arn));
+    let total_size = filtered.len();
+    let page_end = std::cmp::min(page_start + page_size, total_size);
+    let page_values = filtered[page_start..page_end]
+        .iter()
+        .map(|resource| {
+            let tags = resource
+                .tags
+                .iter()
+                .take(tags_per_page)
+                .map(|(key, value)| json!({ "Key": key, "Value": value }))
+                .collect::<Vec<_>>();
+            json!({
+                "ResourceARN": resource.arn,
+                "Tags": tags
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut response = json!({
+        "ResourceTagMappingList": page_values
+    });
+    if page_end < total_size {
+        response["PaginationToken"] = json!(page_end.to_string());
+    }
+
+    Ok(response)
+}
+
+async fn handle_get_products(body: Bytes) -> std::result::Result<Value, CostUsageError> {
+    let req: GetProductsRequest = serde_json::from_slice(&body)
+        .map_err(|e| CostUsageError::Validation(format!("Invalid JSON body: {}", e)))?;
+
+    if req.format_version.as_deref() != Some("aws_v1") {
+        return Err(CostUsageError::Validation(
+            "FormatVersion must be 'aws_v1'.".to_string(),
+        ));
+    }
+
+    let page_start = parse_usize_token(req.next_token.as_deref(), "NextToken")?;
+    let page_size = req.max_results.unwrap_or(100).clamp(1, 100) as usize;
+    let filters = req.filters.unwrap_or_default();
+    let mut products = pricing_catalog()
+        .into_iter()
+        .filter(|product| product.service_code == req.service_code)
+        .filter(|product| pricing_product_matches_filters(product, &filters))
+        .collect::<Vec<_>>();
+
+    if page_start > products.len() {
+        return Err(CostUsageError::Validation(
+            "NextToken points past available results.".to_string(),
+        ));
+    }
+
+    products.sort_by(|a, b| a.rate_code.cmp(&b.rate_code));
+    let total_size = products.len();
+    let page_end = std::cmp::min(page_start + page_size, total_size);
+    let price_list = products[page_start..page_end]
+        .iter()
+        .map(pricing_product_to_value)
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>();
+
+    let mut response = json!({
+        "FormatVersion": "aws_v1",
+        "PriceList": price_list
+    });
+    if page_end < total_size {
+        response["NextToken"] = json!(page_end.to_string());
     }
 
     Ok(response)
@@ -4448,6 +4953,95 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
         assert_eq!(body["AnomalyMonitors"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tagging_get_resources_returns_tagged_inventory_with_pagination() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO resources (id, resource_type, region, scenario, tags)
+             VALUES
+             ('i-a', 'ec2', 'us-east-1', 'Baseline', '{\"Environment\":\"prod\",\"Name\":\"api-a\"}'),
+             ('i-b', 'ec2', 'us-east-1', 'Baseline', '{\"Environment\":\"prod\",\"Name\":\"api-b\"}'),
+             ('db-a', 'rds', 'us-east-1', 'Baseline', '{\"Environment\":\"dev\",\"Name\":\"db-a\"}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let app = build_app(pool);
+        let body = json!({
+            "ResourcesPerPage": 1,
+            "ResourceTypeFilters": ["ec2"],
+            "TagFilters": [{
+                "Key": "Environment",
+                "Values": ["prod"]
+            }]
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-amz-json-1.1")
+                    .header(
+                        "x-amz-target",
+                        "ResourceGroupsTaggingAPI_20170126.GetResources",
+                    )
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        let mappings = body["ResourceTagMappingList"].as_array().unwrap();
+        assert_eq!(mappings.len(), 1);
+        assert!(
+            mappings[0]["ResourceARN"]
+                .as_str()
+                .unwrap()
+                .contains(":instance/")
+        );
+        assert_eq!(body["PaginationToken"], "1");
+    }
+
+    #[tokio::test]
+    async fn pricing_get_products_returns_price_list_strings() {
+        let pool = test_pool().await;
+        let app = build_app(pool);
+        let body = json!({
+            "ServiceCode": "AmazonEC2",
+            "FormatVersion": "aws_v1",
+            "Filters": [{
+                "Type": "TERM_MATCH",
+                "Field": "instanceType",
+                "Value": "m6i.large"
+            }]
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-amz-json-1.1")
+                    .header("x-amz-target", "AWSPriceListService.GetProducts")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        let price_list = body["PriceList"].as_array().unwrap();
+        assert_eq!(body["FormatVersion"], "aws_v1");
+        assert_eq!(price_list.len(), 1);
+        assert!(price_list[0].as_str().unwrap().contains("AmazonEC2"));
+        assert!(price_list[0].as_str().unwrap().contains("m6i.large"));
     }
 
     #[tokio::test]
