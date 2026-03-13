@@ -98,3 +98,27 @@
 - The main quality caveat is semantic realism rather than correctness:
   - `IdleHeavy` uses a flat high-cost multiplier across all resource types, so the scenario is useful for FinOps “high spend, low usage” exercises but less realistic as a production-like cost shape.
   - Cost Explorer totals over a requested time window are lower than the full raw `cost_records` sum because the API query window is narrower/end-exclusive relative to the entire seeded table, which is expected.
+
+## Next FinOps API Work
+
+- [x] Add `ce get-cost-and-usage-with-resources` with resource-level groups for AWS CLI-driven FinOps analysis.
+- [x] Add `ce get-tags` backed by `resources.tags` so cost allocation metadata is discoverable from the public CE surface.
+- [x] Add focused route tests and extend `scripts/verify_cli_interop.sh` to exercise both new operations.
+- [x] Re-run formatting, tests, clippy, and the CLI smoke suite after the new handlers land.
+
+## FinOps API Results
+
+- Added `GetCostAndUsageWithResources` on the Cost Explorer JSON path, defaulting to `RESOURCE_ID` grouping so the AWS CLI can retrieve resource-level cost slices.
+- Added `GetTags` backed by distinct values from `resources.tags`, with search and pagination support.
+- Added first-pass Cost Explorer filter support for `SERVICE`, `RESOURCE_ID`, `REGION`, and exact tag-key/tag-value matching, which is enough to drive the new resource-level CE flow from the AWS CLI.
+- Extended route coverage with tests for:
+  - resource-level `GetCostAndUsageWithResources`
+  - paginated `GetTags`
+- Extended `scripts/verify_cli_interop.sh` to exercise:
+  - `ce get-cost-and-usage-with-resources --filter ...`
+  - `ce get-tags --tag-key Name`
+- Verification completed successfully:
+  - `cargo fmt`
+  - `cargo test`
+  - `cargo clippy --all-targets --all-features`
+  - `bash scripts/verify_cli_interop.sh`

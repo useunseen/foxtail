@@ -71,33 +71,69 @@ export AWS_DEFAULT_REGION=us-east-1
 export AWS_PAGER=""
 
 ENDPOINT="http://127.0.0.1:$PORT"
+readarray -t VERIFY_DATES < <(python3 - <<'PY'
+from datetime import datetime, timedelta, timezone
+
+now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+print((now.date() - timedelta(days=10)).isoformat())
+print(now.date().isoformat())
+print((now - timedelta(hours=12)).isoformat().replace("+00:00", "Z"))
+print(now.isoformat().replace("+00:00", "Z"))
+PY
+)
+CE_START_DAY="${VERIFY_DATES[0]}"
+CE_END_DAY="${VERIFY_DATES[1]}"
+CW_START_TIME="${VERIFY_DATES[2]}"
+CW_END_TIME="${VERIFY_DATES[3]}"
 
 aws_json() {
   aws --output json --endpoint-url "$ENDPOINT" "$@"
 }
 
 SERVICE_DIMENSIONS="$(aws_json ce get-dimension-values \
-  --time-period Start=2026-03-01,End=2026-03-11 \
+  --time-period "Start=$CE_START_DAY,End=$CE_END_DAY" \
   --dimension SERVICE)"
 log_step "Verified Cost Explorer: get-dimension-values"
 
 GROUPED_COSTS="$(aws_json ce get-cost-and-usage \
-  --time-period Start=2026-03-01,End=2026-03-11 \
+  --time-period "Start=$CE_START_DAY,End=$CE_END_DAY" \
   --granularity DAILY \
   --metrics UnblendedCost \
   --group-by Type=DIMENSION,Key=SERVICE)"
 log_step "Verified Cost Explorer: get-cost-and-usage with group-by SERVICE"
 
+RESOURCE_FILTER_FILE="$TMP_DIR/resource_filter.json"
+cat >"$RESOURCE_FILTER_FILE" <<'EOF'
+{
+  "Dimensions": {
+    "Key": "SERVICE",
+    "Values": ["Amazon Elastic Compute Cloud - Compute"]
+  }
+}
+EOF
+
+RESOURCE_COSTS="$(aws_json ce get-cost-and-usage-with-resources \
+  --time-period "Start=$CE_START_DAY,End=$CE_END_DAY" \
+  --granularity DAILY \
+  --metrics UnblendedCost \
+  --filter "file://$RESOURCE_FILTER_FILE")"
+log_step "Verified Cost Explorer: get-cost-and-usage-with-resources"
+
+RESOURCE_TAGS="$(aws_json ce get-tags \
+  --time-period "Start=$CE_START_DAY,End=$CE_END_DAY" \
+  --tag-key Name)"
+log_step "Verified Cost Explorer: get-tags"
+
 log_step "Verified Cost Explorer: get-cost-forecast"
 aws_json ce get-cost-forecast \
-  --time-period Start=2026-03-01,End=2026-03-11 \
+  --time-period "Start=$CE_START_DAY,End=$CE_END_DAY" \
   --metric UNBLENDED_COST \
   --granularity DAILY >/dev/null
 
 log_step "Verified Cost Explorer: get-rightsizing-recommendation"
 aws_json ce get-rightsizing-recommendation --service AmazonEC2 >/dev/null
 log_step "Verified Cost Explorer: get-anomalies"
-aws_json ce get-anomalies --date-interval StartDate=2026-03-01,EndDate=2026-03-11 >/dev/null
+aws_json ce get-anomalies --date-interval "StartDate=$CE_START_DAY,EndDate=$CE_END_DAY" >/dev/null
 log_step "Verified Cost Explorer: get-anomaly-monitors"
 aws_json ce get-anomaly-monitors >/dev/null
 log_step "Verified Cost Explorer: get-anomaly-subscriptions"
@@ -112,6 +148,8 @@ log_step "Derived a test InstanceId from list-metrics output"
 INSTANCE_ID="$(
   SERVICE_DIMENSIONS="$SERVICE_DIMENSIONS" \
   GROUPED_COSTS="$GROUPED_COSTS" \
+  RESOURCE_COSTS="$RESOURCE_COSTS" \
+  RESOURCE_TAGS="$RESOURCE_TAGS" \
   EC2_METRICS="$EC2_METRICS" \
   python3 - <<'PY'
 import json
@@ -126,6 +164,15 @@ grouped = json.loads(os.environ["GROUPED_COSTS"])
 results = grouped.get("ResultsByTime", [])
 if not results or not any(bucket.get("Groups") for bucket in results):
     raise SystemExit("grouped cost results are empty")
+
+resource_costs = json.loads(os.environ["RESOURCE_COSTS"])
+resource_results = resource_costs.get("ResultsByTime", [])
+if not resource_results or not any(bucket.get("Groups") for bucket in resource_results):
+    raise SystemExit("resource-level cost results are empty")
+
+resource_tags = json.loads(os.environ["RESOURCE_TAGS"])
+if not resource_tags.get("Tags"):
+    raise SystemExit("tag discovery returned no tag values")
 
 metrics = json.loads(os.environ["EC2_METRICS"]).get("Metrics", [])
 for metric in metrics:
@@ -144,8 +191,8 @@ aws_json cloudwatch get-metric-statistics \
   --metric-name CPUUtilization \
   --statistics Average \
   --period 3600 \
-  --start-time 2026-03-11T00:00:00Z \
-  --end-time 2026-03-11T12:00:00Z \
+  --start-time "$CW_START_TIME" \
+  --end-time "$CW_END_TIME" \
   --dimensions Name=InstanceId,Value="$INSTANCE_ID" >/dev/null
 
 QUERY_FILE="$TMP_DIR/metric_queries.json"
@@ -173,8 +220,8 @@ EOF
 
 METRIC_DATA_OUTPUT="$(aws_json cloudwatch get-metric-data \
   --metric-data-queries "file://$QUERY_FILE" \
-  --start-time 2026-03-11T00:00:00Z \
-  --end-time 2026-03-11T12:00:00Z)"
+  --start-time "$CW_START_TIME" \
+  --end-time "$CW_END_TIME")"
 log_step "Verified CloudWatch: get-metric-data"
 
 METRIC_DATA_OUTPUT="$METRIC_DATA_OUTPUT" python3 - <<'PY'

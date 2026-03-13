@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{Row, SqlitePool};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
 use tracing::{debug, info, warn};
 
@@ -138,6 +138,17 @@ struct GetDimensionValuesRequest {
     time_period: TimePeriod,
     dimension: String,
     context: Option<String>,
+    search_string: Option<String>,
+    filter: Option<Value>,
+    next_page_token: Option<String>,
+    max_results: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct GetTagsRequest {
+    time_period: TimePeriod,
+    tag_key: String,
     search_string: Option<String>,
     filter: Option<Value>,
     next_page_token: Option<String>,
@@ -294,6 +305,23 @@ enum MetricDataError {
     Validation(String),
     InvalidNextToken(String),
     Internal(anyhow::Error),
+}
+
+#[derive(Default, Clone)]
+struct CeFilterCriteria {
+    services: Option<BTreeSet<String>>,
+    resource_ids: Option<BTreeSet<String>>,
+    regions: Option<BTreeSet<String>>,
+    tags: BTreeMap<String, BTreeSet<String>>,
+}
+
+struct CostRow {
+    resource_id: String,
+    resource_type: String,
+    region: String,
+    amount: f64,
+    seconds_from_now: i64,
+    tags_json: Option<String>,
 }
 
 struct MetricDataSeries {
@@ -717,8 +745,8 @@ fn build_coverage_scorecard(implemented_api_entries: i64) -> DashboardCoverageSc
     };
     let cost_explorer_summary = DashboardCoverageServiceSummary {
         total_operations: 46,
-        implemented_operations: 11,
-        unimplemented_operations: 35,
+        implemented_operations: 13,
+        unimplemented_operations: 33,
     };
 
     DashboardCoverageScorecard {
@@ -939,6 +967,145 @@ fn canonical_cost_explorer_operation(target: &str) -> Option<&str> {
         .or_else(|| target.strip_prefix("AWSInsightsIndexService."))
 }
 
+fn merge_filter_values(
+    slot: &mut Option<BTreeSet<String>>,
+    incoming: BTreeSet<String>,
+) -> std::result::Result<(), CostUsageError> {
+    if incoming.is_empty() {
+        return Ok(());
+    }
+
+    match slot {
+        Some(existing) => {
+            let intersection = existing
+                .intersection(&incoming)
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            *existing = intersection;
+        }
+        None => {
+            *slot = Some(incoming);
+        }
+    }
+
+    Ok(())
+}
+
+fn merge_tag_filter_values(
+    tags: &mut BTreeMap<String, BTreeSet<String>>,
+    key: String,
+    values: BTreeSet<String>,
+) {
+    if values.is_empty() {
+        return;
+    }
+
+    if let Some(existing) = tags.get_mut(&key) {
+        let intersection = existing
+            .intersection(&values)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        *existing = intersection;
+    } else {
+        tags.insert(key, values);
+    }
+}
+
+fn parse_ce_filter_expr(
+    expr: &Value,
+    criteria: &mut CeFilterCriteria,
+) -> std::result::Result<(), CostUsageError> {
+    let Some(obj) = expr.as_object() else {
+        return Err(CostUsageError::Validation(
+            "Cost Explorer Filter must be a JSON object.".to_string(),
+        ));
+    };
+
+    if let Some(and_values) = obj.get("And") {
+        let items = and_values.as_array().ok_or_else(|| {
+            CostUsageError::Validation("Filter.And must be an array.".to_string())
+        })?;
+        for item in items {
+            parse_ce_filter_expr(item, criteria)?;
+        }
+        return Ok(());
+    }
+
+    if obj.contains_key("Or") || obj.contains_key("Not") {
+        return Err(CostUsageError::Validation(
+            "Only Filter.Dimensions, Filter.Tags, and Filter.And are supported.".to_string(),
+        ));
+    }
+
+    if let Some(dimensions) = obj.get("Dimensions") {
+        let dim_obj = dimensions.as_object().ok_or_else(|| {
+            CostUsageError::Validation("Filter.Dimensions must be an object.".to_string())
+        })?;
+        let key = dim_obj.get("Key").and_then(Value::as_str).ok_or_else(|| {
+            CostUsageError::Validation("Filter.Dimensions must include Key.".to_string())
+        })?;
+        let values = dim_obj
+            .get("Values")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                CostUsageError::Validation("Filter.Dimensions must include Values.".to_string())
+            })?
+            .iter()
+            .filter_map(Value::as_str)
+            .map(ToOwned::to_owned)
+            .collect::<BTreeSet<_>>();
+
+        match key {
+            "SERVICE" => merge_filter_values(&mut criteria.services, values)?,
+            "RESOURCE_ID" => merge_filter_values(&mut criteria.resource_ids, values)?,
+            "REGION" => merge_filter_values(&mut criteria.regions, values)?,
+            _ => {
+                return Err(CostUsageError::Validation(format!(
+                    "Unsupported Filter.Dimensions Key '{}'.",
+                    key
+                )));
+            }
+        }
+
+        return Ok(());
+    }
+
+    if let Some(tags) = obj.get("Tags") {
+        let tag_obj = tags.as_object().ok_or_else(|| {
+            CostUsageError::Validation("Filter.Tags must be an object.".to_string())
+        })?;
+        let key = tag_obj.get("Key").and_then(Value::as_str).ok_or_else(|| {
+            CostUsageError::Validation("Filter.Tags must include Key.".to_string())
+        })?;
+        let values = tag_obj
+            .get("Values")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                CostUsageError::Validation("Filter.Tags must include Values.".to_string())
+            })?
+            .iter()
+            .filter_map(Value::as_str)
+            .map(ToOwned::to_owned)
+            .collect::<BTreeSet<_>>();
+        merge_tag_filter_values(&mut criteria.tags, key.to_string(), values);
+        return Ok(());
+    }
+
+    Err(CostUsageError::Validation(
+        "Unsupported Cost Explorer filter expression.".to_string(),
+    ))
+}
+
+fn parse_ce_filter(
+    filter: Option<&Value>,
+) -> std::result::Result<CeFilterCriteria, CostUsageError> {
+    let mut criteria = CeFilterCriteria::default();
+    if let Some(filter) = filter {
+        parse_ce_filter_expr(filter, &mut criteria)?;
+    }
+    Ok(criteria)
+}
+
 fn parse_group_by_dimension(
     group_by: Option<&Vec<Value>>,
 ) -> std::result::Result<Option<&str>, CostUsageError> {
@@ -976,6 +1143,73 @@ fn parse_group_by_dimension(
             group_key
         ))),
     }
+}
+
+fn parse_resource_tags(tags_json: Option<&str>) -> HashMap<String, String> {
+    tags_json
+        .and_then(|raw| serde_json::from_str::<HashMap<String, String>>(raw).ok())
+        .unwrap_or_default()
+}
+
+fn cost_row_matches_filter(row: &CostRow, criteria: &CeFilterCriteria) -> bool {
+    if let Some(services) = criteria.services.as_ref()
+        && !services.contains(ce_service_name_from_resource_type(&row.resource_type))
+    {
+        return false;
+    }
+    if let Some(resource_ids) = criteria.resource_ids.as_ref()
+        && !resource_ids.contains(&row.resource_id)
+    {
+        return false;
+    }
+    if let Some(regions) = criteria.regions.as_ref()
+        && !regions.contains(&row.region)
+    {
+        return false;
+    }
+    if !criteria.tags.is_empty() {
+        let tags = parse_resource_tags(row.tags_json.as_deref());
+        for (key, allowed_values) in &criteria.tags {
+            let Some(value) = tags.get(key) else {
+                return false;
+            };
+            if !allowed_values.contains(value) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+async fn fetch_cost_rows_for_window(
+    pool: &SqlitePool,
+    start_offset: i64,
+    end_offset: i64,
+) -> std::result::Result<Vec<CostRow>, CostUsageError> {
+    let rows = sqlx::query(
+        "SELECT c.resource_id, c.seconds_from_now, c.amount, r.resource_type, r.region, r.tags
+         FROM cost_records c
+         JOIN resources r ON r.id = c.resource_id
+         WHERE c.seconds_from_now >= ? AND c.seconds_from_now <= ?
+         ORDER BY c.seconds_from_now ASC, c.resource_id ASC",
+    )
+    .bind(start_offset)
+    .bind(end_offset)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| CostUsageError::Internal(e.into()))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| CostRow {
+            resource_id: row.get::<String, _>("resource_id"),
+            resource_type: row.get::<String, _>("resource_type"),
+            region: row.get::<String, _>("region"),
+            amount: row.get::<f64, _>("amount"),
+            seconds_from_now: row.get::<i64, _>("seconds_from_now"),
+            tags_json: row.try_get::<Option<String>, _>("tags").ok().flatten(),
+        })
+        .collect())
 }
 
 fn parse_usize_token(
@@ -1607,8 +1841,10 @@ async fn build_dashboard_data(
     ];
     for operation in [
         "GetCostAndUsage",
+        "GetCostAndUsageWithResources",
         "GetCostForecast",
         "GetDimensionValues",
+        "GetTags",
         "GetReservationCoverage",
         "GetReservationUtilization",
         "GetSavingsPlansCoverage",
@@ -1883,6 +2119,28 @@ async fn handle_cost_explorer(
                 StatusCode::INTERNAL_SERVER_ERROR,
             ),
         },
+        Some("GetCostAndUsageWithResources") => {
+            match handle_get_cost_and_usage_with_resources(pool, body).await {
+                Ok(res) => (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/x-amz-json-1.1")],
+                    Json(res),
+                )
+                    .into_response(),
+                Err(CostUsageError::Validation(message)) => error_response(
+                    protocol,
+                    "ValidationException",
+                    &message,
+                    StatusCode::BAD_REQUEST,
+                ),
+                Err(CostUsageError::Internal(error)) => error_response(
+                    protocol,
+                    "InternalFailure",
+                    &error.to_string(),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                ),
+            }
+        }
         Some("GetCostForecast") => match handle_get_cost_forecast(pool, body).await {
             Ok(res) => (
                 StatusCode::OK,
@@ -1904,6 +2162,26 @@ async fn handle_cost_explorer(
             ),
         },
         Some("GetDimensionValues") => match handle_get_dimension_values(pool, body).await {
+            Ok(res) => (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/x-amz-json-1.1")],
+                Json(res),
+            )
+                .into_response(),
+            Err(CostUsageError::Validation(message)) => error_response(
+                protocol,
+                "ValidationException",
+                &message,
+                StatusCode::BAD_REQUEST,
+            ),
+            Err(CostUsageError::Internal(error)) => error_response(
+                protocol,
+                "InternalFailure",
+                &error.to_string(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        },
+        Some("GetTags") => match handle_get_tags(pool, body).await {
             Ok(res) => (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "application/x-amz-json-1.1")],
@@ -2107,31 +2385,43 @@ async fn handle_get_cost_and_usage(
     let req: GetCostAndUsageRequest = serde_json::from_slice(&body)
         .map_err(|e| CostUsageError::Validation(format!("Invalid JSON body: {}", e)))?;
 
+    build_cost_usage_response(&pool, &req, None).await
+}
+
+async fn handle_get_cost_and_usage_with_resources(
+    pool: SqlitePool,
+    body: Bytes,
+) -> std::result::Result<Value, CostUsageError> {
+    let req: GetCostAndUsageRequest = serde_json::from_slice(&body)
+        .map_err(|e| CostUsageError::Validation(format!("Invalid JSON body: {}", e)))?;
+
+    build_cost_usage_response(&pool, &req, Some("RESOURCE_ID")).await
+}
+
+async fn build_cost_usage_response(
+    pool: &SqlitePool,
+    req: &GetCostAndUsageRequest,
+    default_group_dimension: Option<&str>,
+) -> std::result::Result<Value, CostUsageError> {
     let now = Utc::now();
-    let total_cost = sum_cost_records_for_window(&pool, &req.time_period, now).await?;
     let start = parse_day_start_utc("TimePeriod.Start", &req.time_period.start)
         .map_err(CostUsageError::Validation)?;
     let end = parse_day_start_utc("TimePeriod.End", &req.time_period.end)
         .map_err(CostUsageError::Validation)?;
     let start_offset = (start - now).num_seconds();
     let end_offset = (end - now).num_seconds();
-    let group_dimension = parse_group_by_dimension(req.group_by.as_ref())?;
     let daily = req.granularity.as_deref() == Some("DAILY");
+    let group_dimension =
+        parse_group_by_dimension(req.group_by.as_ref())?.or(default_group_dimension);
+    let filter = parse_ce_filter(req.filter.as_ref())?;
+    let rows = fetch_cost_rows_for_window(pool, start_offset, end_offset).await?;
+    let filtered_rows = rows
+        .into_iter()
+        .filter(|row| cost_row_matches_filter(row, &filter))
+        .collect::<Vec<_>>();
+    let total_cost = filtered_rows.iter().map(|row| row.amount).sum::<f64>();
 
     let results_by_time = if let Some(group_dimension) = group_dimension {
-        let rows = sqlx::query(
-            "SELECT c.resource_id, c.seconds_from_now, c.amount, r.resource_type, r.region
-             FROM cost_records c
-             JOIN resources r ON r.id = c.resource_id
-             WHERE c.seconds_from_now >= ? AND c.seconds_from_now <= ?
-             ORDER BY c.seconds_from_now ASC, c.resource_id ASC",
-        )
-        .bind(start_offset)
-        .bind(end_offset)
-        .fetch_all(&pool)
-        .await
-        .map_err(|e| CostUsageError::Internal(e.into()))?;
-
         let mut bucket_groups: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
         let mut bucket_totals: BTreeMap<String, f64> = BTreeMap::new();
         let mut bucket_ranges: BTreeMap<String, String> = BTreeMap::new();
@@ -2154,15 +2444,9 @@ async fn handle_get_cost_and_usage(
             bucket_ranges.insert(req.time_period.start.clone(), req.time_period.end.clone());
         }
 
-        for row in rows {
-            let resource_id = row.get::<String, _>("resource_id");
-            let resource_type = row.get::<String, _>("resource_type");
-            let region = row.get::<String, _>("region");
-            let amount = row.get::<f64, _>("amount");
-            let seconds_from_now = row.get::<i64, _>("seconds_from_now");
-
+        for row in filtered_rows {
             let bucket_start = if daily {
-                (now + chrono::Duration::seconds(seconds_from_now))
+                (now + chrono::Duration::seconds(row.seconds_from_now))
                     .format("%Y-%m-%d")
                     .to_string()
             } else {
@@ -2170,16 +2454,16 @@ async fn handle_get_cost_and_usage(
             };
 
             let group_key = match group_dimension {
-                "SERVICE" => ce_service_name_from_resource_type(&resource_type).to_string(),
-                "REGION" => region,
-                "RESOURCE_ID" => resource_id,
+                "SERVICE" => ce_service_name_from_resource_type(&row.resource_type).to_string(),
+                "REGION" => row.region.clone(),
+                "RESOURCE_ID" => row.resource_id.clone(),
                 _ => unreachable!("group dimension validated above"),
             };
 
             if let Some(groups) = bucket_groups.get_mut(&bucket_start) {
-                *groups.entry(group_key).or_insert(0.0) += amount;
+                *groups.entry(group_key).or_insert(0.0) += row.amount;
                 if daily {
-                    *bucket_totals.entry(bucket_start).or_insert(0.0) += amount;
+                    *bucket_totals.entry(bucket_start).or_insert(0.0) += row.amount;
                 }
             }
         }
@@ -2221,8 +2505,8 @@ async fn handle_get_cost_and_usage(
     } else {
         vec![json!({
             "TimePeriod": {
-                "Start": req.time_period.start,
-                "End": req.time_period.end
+                "Start": req.time_period.start.clone(),
+                "End": req.time_period.end.clone()
             },
             "Total": {
                 "UnblendedCost": {
@@ -2235,8 +2519,19 @@ async fn handle_get_cost_and_usage(
         })]
     };
 
+    let group_definitions = if let Some(group_by) = req.group_by.clone() {
+        group_by
+    } else if let Some(default_group_dimension) = default_group_dimension {
+        vec![json!({
+            "Type": "DIMENSION",
+            "Key": default_group_dimension
+        })]
+    } else {
+        Vec::new()
+    };
+
     let mut response = json!({
-        "GroupDefinitions": req.group_by.clone().unwrap_or_default(),
+        "GroupDefinitions": group_definitions,
         "DimensionValueAttributes": [],
         "ResultsByTime": results_by_time
     });
@@ -2247,10 +2542,10 @@ async fn handle_get_cost_and_usage(
         response["NextPageToken"] = Value::Null;
     }
 
-    if let Some(granularity) = req.granularity {
+    if let Some(granularity) = req.granularity.as_ref() {
         response["Granularity"] = json!(granularity);
     }
-    if let Some(metrics) = req.metrics {
+    if let Some(metrics) = req.metrics.clone() {
         response["RequestedMetrics"] = json!(metrics);
     }
 
@@ -2460,6 +2755,81 @@ async fn handle_get_dimension_values(
     }
     if req.filter.is_some() {
         response["FilterApplied"] = json!(true);
+    }
+
+    Ok(response)
+}
+
+async fn handle_get_tags(
+    pool: SqlitePool,
+    body: Bytes,
+) -> std::result::Result<Value, CostUsageError> {
+    let req: GetTagsRequest = serde_json::from_slice(&body)
+        .map_err(|e| CostUsageError::Validation(format!("Invalid JSON body: {}", e)))?;
+
+    let _start = parse_day_start_utc("TimePeriod.Start", &req.time_period.start)
+        .map_err(CostUsageError::Validation)?;
+    let _end = parse_day_start_utc("TimePeriod.End", &req.time_period.end)
+        .map_err(CostUsageError::Validation)?;
+    let criteria = parse_ce_filter(req.filter.as_ref())?;
+    let page_start = parse_usize_token(req.next_page_token.as_deref(), "NextPageToken")?;
+    let page_size = req.max_results.unwrap_or(100).clamp(1, 1000) as usize;
+
+    let rows = sqlx::query("SELECT id, resource_type, region, tags FROM resources ORDER BY id ASC")
+        .fetch_all(&pool)
+        .await
+        .map_err(|e| CostUsageError::Internal(e.into()))?;
+
+    let mut tag_values = rows
+        .into_iter()
+        .filter_map(|row| {
+            let cost_row = CostRow {
+                resource_id: row.get::<String, _>("id"),
+                resource_type: row.get::<String, _>("resource_type"),
+                region: row.get::<String, _>("region"),
+                amount: 0.0,
+                seconds_from_now: 0,
+                tags_json: row.try_get::<Option<String>, _>("tags").ok().flatten(),
+            };
+            if !cost_row_matches_filter(&cost_row, &criteria) {
+                return None;
+            }
+            let tags = parse_resource_tags(cost_row.tags_json.as_deref());
+            tags.get(&req.tag_key).cloned()
+        })
+        .collect::<Vec<_>>();
+
+    tag_values.sort();
+    tag_values.dedup();
+
+    if let Some(search) = req.search_string.as_ref().map(|s| s.to_lowercase()) {
+        tag_values.retain(|value| value.to_lowercase().contains(&search));
+    }
+
+    if page_start > tag_values.len() {
+        return Err(CostUsageError::Validation(
+            "NextPageToken points past available results.".to_string(),
+        ));
+    }
+
+    let total_size = tag_values.len();
+    let page_end = std::cmp::min(page_start + page_size, total_size);
+    let page_values = &tag_values[page_start..page_end];
+
+    let mut response = json!({
+        "Tags": page_values,
+        "ReturnSize": page_values.len(),
+        "TotalSize": total_size
+    });
+
+    if page_end < total_size {
+        response["NextPageToken"] = json!(page_end.to_string());
+    }
+    if req.filter.is_some() {
+        response["FilterApplied"] = json!(true);
+    }
+    if req.search_string.is_some() {
+        response["SearchStringApplied"] = json!(true);
     }
 
     Ok(response)
@@ -3857,6 +4227,8 @@ mod tests {
     #[tokio::test]
     async fn cost_explorer_group_by_service_returns_populated_groups() {
         let pool = test_pool().await;
+        let end = Utc::now().date_naive();
+        let start = end - chrono::Duration::days(1);
         sqlx::query(
             "INSERT INTO resources (id, resource_type, region, scenario, tags)
              VALUES ('i-ec2', 'ec2', 'us-east-1', 'Baseline', '{}')",
@@ -3882,8 +4254,8 @@ mod tests {
         let app = build_app(pool);
         let body = json!({
             "TimePeriod": {
-                "Start": "2026-03-10",
-                "End": "2026-03-11"
+                "Start": start.format("%Y-%m-%d").to_string(),
+                "End": end.format("%Y-%m-%d").to_string()
             },
             "Granularity": "DAILY",
             "Metrics": ["UnblendedCost"],
@@ -3914,6 +4286,115 @@ mod tests {
             groups[0]["Metrics"]["UnblendedCost"]["Unit"],
             Value::String("USD".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn cost_explorer_with_resources_defaults_to_resource_id_groups() {
+        let pool = test_pool().await;
+        let end = Utc::now().date_naive();
+        let start = end - chrono::Duration::days(1);
+        sqlx::query(
+            "INSERT INTO resources (id, resource_type, region, scenario, tags)
+             VALUES ('i-a', 'ec2', 'us-east-1', 'Baseline', '{\"Environment\":\"prod\"}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO resources (id, resource_type, region, scenario, tags)
+             VALUES ('i-b', 'ec2', 'us-east-1', 'Baseline', '{\"Environment\":\"dev\"}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO cost_records (resource_id, seconds_from_now, amount)
+             VALUES ('i-a', -86400, 12.5), ('i-b', -86400, 7.5)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let app = build_app(pool);
+        let body = json!({
+            "TimePeriod": {
+                "Start": start.format("%Y-%m-%d").to_string(),
+                "End": end.format("%Y-%m-%d").to_string()
+            },
+            "Granularity": "DAILY",
+            "Metrics": ["UnblendedCost"]
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-amz-json-1.1")
+                    .header(
+                        "x-amz-target",
+                        "AWSInsightsIndexService.GetCostAndUsageWithResources",
+                    )
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        let groups = body["ResultsByTime"][0]["Groups"].as_array().unwrap();
+        assert_eq!(body["GroupDefinitions"][0]["Key"], "RESOURCE_ID");
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0]["Keys"][0], "i-a");
+        assert_eq!(groups[1]["Keys"][0], "i-b");
+    }
+
+    #[tokio::test]
+    async fn cost_explorer_get_tags_returns_distinct_tag_values_with_pagination() {
+        let pool = test_pool().await;
+        let end = Utc::now().date_naive();
+        let start = end - chrono::Duration::days(10);
+        sqlx::query(
+            "INSERT INTO resources (id, resource_type, region, scenario, tags)
+             VALUES
+             ('i-a', 'ec2', 'us-east-1', 'Baseline', '{\"Environment\":\"prod\",\"Name\":\"api-a\"}'),
+             ('i-b', 'ec2', 'us-east-1', 'Baseline', '{\"Environment\":\"prod\",\"Name\":\"api-b\"}'),
+             ('i-c', 'ec2', 'us-east-1', 'Baseline', '{\"Environment\":\"dev\",\"Name\":\"api-c\"}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let app = build_app(pool);
+        let body = json!({
+            "TimePeriod": {
+                "Start": start.format("%Y-%m-%d").to_string(),
+                "End": end.format("%Y-%m-%d").to_string()
+            },
+            "TagKey": "Environment",
+            "MaxResults": 1
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-amz-json-1.1")
+                    .header("x-amz-target", "AWSCostExplorer.GetTags")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["ReturnSize"], 1);
+        assert_eq!(body["TotalSize"], 2);
+        assert_eq!(body["Tags"][0], "dev");
+        assert_eq!(body["NextPageToken"], "1");
     }
 
     #[tokio::test]

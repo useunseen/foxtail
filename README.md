@@ -116,8 +116,10 @@ The service accepts the Cost Explorer operations below. For compatibility with d
 | AWS CLI command | Purpose | Notes |
 | --- | --- | --- |
 | `ce get-cost-and-usage` | Cost totals and grouped cost breakdowns | Supports `--group-by` for seeded dimensions such as `SERVICE` |
+| `ce get-cost-and-usage-with-resources` | Resource-level cost breakdowns | Defaults to `RESOURCE_ID` grouping in this mock; the AWS CLI still requires `--filter` |
 | `ce get-cost-forecast` | Forecasted spend over a time period | Requires `--granularity` |
 | `ce get-dimension-values` | Discover valid dimension values | Useful for `SERVICE`, `RESOURCE_ID`, `REGION` |
+| `ce get-tags` | Discover distinct tag values | Backed by `resources.tags` |
 | `ce get-reservation-coverage` | Mock RI coverage view | Seeded synthetic output |
 | `ce get-reservation-utilization` | Mock RI utilization view | Seeded synthetic output |
 | `ce get-savings-plans-coverage` | Mock Savings Plans coverage view | Seeded synthetic output |
