@@ -7,7 +7,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{Row, SqlitePool};
@@ -134,6 +134,17 @@ struct GetCostForecastRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
+struct GetUsageForecastRequest {
+    time_period: TimePeriod,
+    metric: Option<String>,
+    granularity: Option<String>,
+    filter: Option<Value>,
+    billing_view_arn: Option<String>,
+    prediction_interval_level: Option<i32>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
 struct GetDimensionValuesRequest {
     time_period: TimePeriod,
     dimension: String,
@@ -170,6 +181,19 @@ struct GetResourcesRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
+struct GetTagKeysRequest {
+    pagination_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct GetTagValuesRequest {
+    key: String,
+    pagination_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
 struct TagFilterInput {
     key: String,
     values: Option<Vec<String>>,
@@ -184,6 +208,17 @@ struct GetProductsRequest {
     max_results: Option<u64>,
     next_token: Option<String>,
 }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ComputeOptimizerRequest {
+    next_token: Option<String>,
+    max_results: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct DescribeReportDefinitionsRequest {}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -1031,6 +1066,14 @@ fn canonical_pricing_operation(target: &str) -> Option<&str> {
     target.strip_prefix("AWSPriceListService.")
 }
 
+fn canonical_compute_optimizer_operation(target: &str) -> Option<&str> {
+    target.strip_prefix("ComputeOptimizerService.")
+}
+
+fn canonical_cur_operation(target: &str) -> Option<&str> {
+    target.strip_prefix("AWSOrigamiServiceGatewayService.")
+}
+
 fn mock_account_id() -> &'static str {
     "123456789012"
 }
@@ -1381,71 +1424,171 @@ async fn fetch_tagged_resources(
 }
 
 fn pricing_catalog() -> Vec<PricingProduct> {
-    let mut ec2 = BTreeMap::new();
-    ec2.insert("servicecode", "AmazonEC2".to_string());
-    ec2.insert("location", "US East (N. Virginia)".to_string());
-    ec2.insert("locationType", "AWS Region".to_string());
-    ec2.insert("instanceType", "m6i.large".to_string());
-    ec2.insert("operatingSystem", "Linux".to_string());
-    ec2.insert("tenancy", "Shared".to_string());
-    ec2.insert("capacitystatus", "Used".to_string());
-    ec2.insert("preInstalledSw", "NA".to_string());
-    ec2.insert("productFamily", "Compute Instance".to_string());
-
-    let mut rds = BTreeMap::new();
-    rds.insert("servicecode", "AmazonRDS".to_string());
-    rds.insert("location", "US East (N. Virginia)".to_string());
-    rds.insert("locationType", "AWS Region".to_string());
-    rds.insert("instanceType", "db.t3.medium".to_string());
-    rds.insert("databaseEngine", "PostgreSQL".to_string());
-    rds.insert("deploymentOption", "Single-AZ".to_string());
-    rds.insert("productFamily", "Database Instance".to_string());
-
-    let mut s3 = BTreeMap::new();
-    s3.insert("servicecode", "AmazonS3".to_string());
-    s3.insert("location", "US East (N. Virginia)".to_string());
-    s3.insert("locationType", "AWS Region".to_string());
-    s3.insert("storageClass", "General Purpose".to_string());
-    s3.insert("volumeType", "Standard".to_string());
-    s3.insert("productFamily", "Storage".to_string());
-
-    let mut elb = BTreeMap::new();
-    elb.insert("servicecode", "AWSELB".to_string());
-    elb.insert("location", "US East (N. Virginia)".to_string());
-    elb.insert("locationType", "AWS Region".to_string());
-    elb.insert("productFamily", "Load Balancer".to_string());
-    elb.insert("loadBalancerType", "Application".to_string());
+    let attributes = |pairs: &[(&'static str, &'static str)]| {
+        pairs
+            .iter()
+            .map(|(key, value)| (*key, (*value).to_string()))
+            .collect::<BTreeMap<&'static str, String>>()
+    };
 
     vec![
         PricingProduct {
             service_code: "AmazonEC2",
-            attributes: ec2,
+            attributes: attributes(&[
+                ("servicecode", "AmazonEC2"),
+                ("location", "US East (N. Virginia)"),
+                ("locationType", "AWS Region"),
+                ("instanceType", "m6i.large"),
+                ("operatingSystem", "Linux"),
+                ("tenancy", "Shared"),
+                ("capacitystatus", "Used"),
+                ("preInstalledSw", "NA"),
+                ("productFamily", "Compute Instance"),
+            ]),
             rate_code: "AmazonEC2.m6i.large.ondemand".to_string(),
             description: "m6i.large On Demand Linux instance usage".to_string(),
             unit: "Hrs",
             price_per_unit_usd: "0.0960".to_string(),
         },
         PricingProduct {
+            service_code: "AmazonEC2",
+            attributes: attributes(&[
+                ("servicecode", "AmazonEC2"),
+                ("location", "US East (N. Virginia)"),
+                ("locationType", "AWS Region"),
+                ("instanceType", "m6i.xlarge"),
+                ("operatingSystem", "Linux"),
+                ("tenancy", "Shared"),
+                ("capacitystatus", "Used"),
+                ("preInstalledSw", "NA"),
+                ("productFamily", "Compute Instance"),
+            ]),
+            rate_code: "AmazonEC2.m6i.xlarge.ondemand".to_string(),
+            description: "m6i.xlarge On Demand Linux instance usage".to_string(),
+            unit: "Hrs",
+            price_per_unit_usd: "0.1920".to_string(),
+        },
+        PricingProduct {
+            service_code: "AmazonEC2",
+            attributes: attributes(&[
+                ("servicecode", "AmazonEC2"),
+                ("location", "US East (N. Virginia)"),
+                ("locationType", "AWS Region"),
+                ("instanceType", "t3.medium"),
+                ("operatingSystem", "Linux"),
+                ("tenancy", "Shared"),
+                ("capacitystatus", "Used"),
+                ("preInstalledSw", "NA"),
+                ("productFamily", "Compute Instance"),
+            ]),
+            rate_code: "AmazonEC2.t3.medium.ondemand".to_string(),
+            description: "t3.medium On Demand Linux instance usage".to_string(),
+            unit: "Hrs",
+            price_per_unit_usd: "0.0416".to_string(),
+        },
+        PricingProduct {
+            service_code: "AmazonEC2",
+            attributes: attributes(&[
+                ("servicecode", "AmazonEC2"),
+                ("location", "US East (N. Virginia)"),
+                ("locationType", "AWS Region"),
+                ("volumeType", "gp3"),
+                ("storageMedia", "SSD-backed"),
+                ("maxVolumeSize", "16384"),
+                ("productFamily", "Storage"),
+            ]),
+            rate_code: "AmazonEC2.gp3.storage".to_string(),
+            description: "gp3 Provisioned SSD storage".to_string(),
+            unit: "GB-Mo",
+            price_per_unit_usd: "0.0800".to_string(),
+        },
+        PricingProduct {
             service_code: "AmazonRDS",
-            attributes: rds,
+            attributes: attributes(&[
+                ("servicecode", "AmazonRDS"),
+                ("location", "US East (N. Virginia)"),
+                ("locationType", "AWS Region"),
+                ("instanceType", "db.t3.medium"),
+                ("databaseEngine", "PostgreSQL"),
+                ("deploymentOption", "Single-AZ"),
+                ("productFamily", "Database Instance"),
+            ]),
             rate_code: "AmazonRDS.db.t3.medium.ondemand".to_string(),
             description: "db.t3.medium Single-AZ PostgreSQL instance usage".to_string(),
             unit: "Hrs",
             price_per_unit_usd: "0.0670".to_string(),
         },
         PricingProduct {
+            service_code: "AmazonRDS",
+            attributes: attributes(&[
+                ("servicecode", "AmazonRDS"),
+                ("location", "US East (N. Virginia)"),
+                ("locationType", "AWS Region"),
+                ("instanceType", "db.m6g.large"),
+                ("databaseEngine", "MySQL"),
+                ("deploymentOption", "Multi-AZ"),
+                ("productFamily", "Database Instance"),
+            ]),
+            rate_code: "AmazonRDS.db.m6g.large.ondemand".to_string(),
+            description: "db.m6g.large Multi-AZ MySQL instance usage".to_string(),
+            unit: "Hrs",
+            price_per_unit_usd: "0.3380".to_string(),
+        },
+        PricingProduct {
             service_code: "AmazonS3",
-            attributes: s3,
+            attributes: attributes(&[
+                ("servicecode", "AmazonS3"),
+                ("location", "US East (N. Virginia)"),
+                ("locationType", "AWS Region"),
+                ("storageClass", "General Purpose"),
+                ("volumeType", "Standard"),
+                ("productFamily", "Storage"),
+            ]),
             rate_code: "AmazonS3.standard.storage".to_string(),
             description: "Amazon S3 Standard storage usage".to_string(),
             unit: "GB-Mo",
             price_per_unit_usd: "0.0230".to_string(),
         },
         PricingProduct {
+            service_code: "AmazonS3",
+            attributes: attributes(&[
+                ("servicecode", "AmazonS3"),
+                ("location", "US East (N. Virginia)"),
+                ("locationType", "AWS Region"),
+                ("storageClass", "Infrequent Access"),
+                ("volumeType", "Standard-IA"),
+                ("productFamily", "Storage"),
+            ]),
+            rate_code: "AmazonS3.standard_ia.storage".to_string(),
+            description: "Amazon S3 Standard-Infrequent Access storage usage".to_string(),
+            unit: "GB-Mo",
+            price_per_unit_usd: "0.0125".to_string(),
+        },
+        PricingProduct {
             service_code: "AWSELB",
-            attributes: elb,
+            attributes: attributes(&[
+                ("servicecode", "AWSELB"),
+                ("location", "US East (N. Virginia)"),
+                ("locationType", "AWS Region"),
+                ("productFamily", "Load Balancer"),
+                ("loadBalancerType", "Application"),
+            ]),
             rate_code: "AWSELB.alb.usage".to_string(),
             description: "Application Load Balancer hourly usage".to_string(),
+            unit: "Hrs",
+            price_per_unit_usd: "0.0225".to_string(),
+        },
+        PricingProduct {
+            service_code: "AWSELB",
+            attributes: attributes(&[
+                ("servicecode", "AWSELB"),
+                ("location", "US East (N. Virginia)"),
+                ("locationType", "AWS Region"),
+                ("productFamily", "Load Balancer"),
+                ("loadBalancerType", "Network"),
+            ]),
+            rate_code: "AWSELB.nlb.usage".to_string(),
+            description: "Network Load Balancer hourly usage".to_string(),
             unit: "Hrs",
             price_per_unit_usd: "0.0225".to_string(),
         },
@@ -1502,6 +1645,29 @@ fn pricing_product_to_value(product: &PricingProduct) -> Value {
             }
         }
     })
+}
+
+fn mock_usage_rate_for_resource_type(resource_type: &str) -> f64 {
+    match resource_type {
+        "ec2" => 0.0960,
+        "rds" => 0.0670,
+        "elb" => 0.0225,
+        "s3" => 0.0230,
+        _ => 1.0,
+    }
+}
+
+fn resource_name_from_tags(tags_json: Option<&str>, fallback: &str) -> String {
+    parse_resource_tags(tags_json)
+        .get("Name")
+        .cloned()
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn clamp_page_size(requested: Option<u64>, default_size: usize, max_size: usize) -> usize {
+    requested
+        .unwrap_or(default_size as u64)
+        .clamp(1, max_size as u64) as usize
 }
 
 fn parse_usize_token(
@@ -1692,6 +1858,10 @@ async fn dispatch_aws_request(
         handle_resource_groups_tagging(target, pool, body, protocol).await
     } else if target.starts_with("AWSPriceListService.") {
         handle_pricing(target, body, protocol).await
+    } else if target.starts_with("ComputeOptimizerService.") {
+        handle_compute_optimizer(target, pool, body, protocol).await
+    } else if target.starts_with("AWSOrigamiServiceGatewayService.") {
+        handle_cur(target, body, protocol).await
     } else if target.starts_with("GraniteServiceVersion20100801.") {
         handle_cloudwatch_json(target, pool, body, protocol, injected_now).await
     } else if target.is_empty() && content_type.contains("application/x-www-form-urlencoded") {
@@ -1737,6 +1907,46 @@ async fn handle_resource_groups_tagging(
                 StatusCode::INTERNAL_SERVER_ERROR,
             ),
         },
+        Some("GetTagKeys") => match handle_get_tag_keys(pool, body).await {
+            Ok(res) => (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/x-amz-json-1.1")],
+                Json(res),
+            )
+                .into_response(),
+            Err(CostUsageError::Validation(message)) => error_response(
+                protocol,
+                "InvalidParameterException",
+                &message,
+                StatusCode::BAD_REQUEST,
+            ),
+            Err(CostUsageError::Internal(error)) => error_response(
+                protocol,
+                "InternalServiceException",
+                &error.to_string(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        },
+        Some("GetTagValues") => match handle_get_tag_values(pool, body).await {
+            Ok(res) => (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/x-amz-json-1.1")],
+                Json(res),
+            )
+                .into_response(),
+            Err(CostUsageError::Validation(message)) => error_response(
+                protocol,
+                "InvalidParameterException",
+                &message,
+                StatusCode::BAD_REQUEST,
+            ),
+            Err(CostUsageError::Internal(error)) => error_response(
+                protocol,
+                "InternalServiceException",
+                &error.to_string(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        },
         _ => error_response(
             protocol,
             "UnknownAction",
@@ -1758,6 +1968,97 @@ async fn handle_pricing(target: &str, body: Bytes, protocol: Protocol) -> axum::
             Err(CostUsageError::Validation(message)) => error_response(
                 protocol,
                 "InvalidParameterException",
+                &message,
+                StatusCode::BAD_REQUEST,
+            ),
+            Err(CostUsageError::Internal(error)) => error_response(
+                protocol,
+                "InternalErrorException",
+                &error.to_string(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        },
+        _ => error_response(
+            protocol,
+            "UnknownAction",
+            "The action is not supported",
+            StatusCode::BAD_REQUEST,
+        ),
+    }
+}
+
+async fn handle_compute_optimizer(
+    target: &str,
+    pool: SqlitePool,
+    body: Bytes,
+    protocol: Protocol,
+) -> axum::response::Response {
+    match canonical_compute_optimizer_operation(target) {
+        Some("GetEC2InstanceRecommendations") => {
+            match handle_get_ec2_instance_recommendations(pool, body).await {
+                Ok(res) => (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/x-amz-json-1.0")],
+                    Json(res),
+                )
+                    .into_response(),
+                Err(CostUsageError::Validation(message)) => error_response(
+                    protocol,
+                    "ValidationException",
+                    &message,
+                    StatusCode::BAD_REQUEST,
+                ),
+                Err(CostUsageError::Internal(error)) => error_response(
+                    protocol,
+                    "InternalServerException",
+                    &error.to_string(),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                ),
+            }
+        }
+        Some("GetEBSVolumeRecommendations") => {
+            match handle_get_ebs_volume_recommendations(pool, body).await {
+                Ok(res) => (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/x-amz-json-1.0")],
+                    Json(res),
+                )
+                    .into_response(),
+                Err(CostUsageError::Validation(message)) => error_response(
+                    protocol,
+                    "ValidationException",
+                    &message,
+                    StatusCode::BAD_REQUEST,
+                ),
+                Err(CostUsageError::Internal(error)) => error_response(
+                    protocol,
+                    "InternalServerException",
+                    &error.to_string(),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                ),
+            }
+        }
+        _ => error_response(
+            protocol,
+            "UnknownAction",
+            "The action is not supported",
+            StatusCode::BAD_REQUEST,
+        ),
+    }
+}
+
+async fn handle_cur(target: &str, body: Bytes, protocol: Protocol) -> axum::response::Response {
+    match canonical_cur_operation(target) {
+        Some("DescribeReportDefinitions") => match handle_describe_report_definitions(body).await {
+            Ok(res) => (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/x-amz-json-1.1")],
+                Json(res),
+            )
+                .into_response(),
+            Err(CostUsageError::Validation(message)) => error_response(
+                protocol,
+                "ValidationException",
                 &message,
                 StatusCode::BAD_REQUEST,
             ),
@@ -2206,6 +2507,7 @@ async fn build_dashboard_data(
         "GetCostAndUsage",
         "GetCostAndUsageWithResources",
         "GetCostForecast",
+        "GetUsageForecast",
         "GetDimensionValues",
         "GetTags",
         "GetReservationCoverage",
@@ -2228,10 +2530,50 @@ async fn build_dashboard_data(
         endpoint: None,
     });
     supported_apis.push(DashboardApiEntry {
+        service: "resource-groups-tagging-api".to_string(),
+        operation: "GetTagKeys".to_string(),
+        protocol: "json-1.1".to_string(),
+        target: Some("ResourceGroupsTaggingAPI_20170126.GetTagKeys".to_string()),
+        action: None,
+        endpoint: None,
+    });
+    supported_apis.push(DashboardApiEntry {
+        service: "resource-groups-tagging-api".to_string(),
+        operation: "GetTagValues".to_string(),
+        protocol: "json-1.1".to_string(),
+        target: Some("ResourceGroupsTaggingAPI_20170126.GetTagValues".to_string()),
+        action: None,
+        endpoint: None,
+    });
+    supported_apis.push(DashboardApiEntry {
         service: "pricing".to_string(),
         operation: "GetProducts".to_string(),
         protocol: "json-1.1".to_string(),
         target: Some("AWSPriceListService.GetProducts".to_string()),
+        action: None,
+        endpoint: None,
+    });
+    supported_apis.push(DashboardApiEntry {
+        service: "compute-optimizer".to_string(),
+        operation: "GetEC2InstanceRecommendations".to_string(),
+        protocol: "json-1.0".to_string(),
+        target: Some("ComputeOptimizerService.GetEC2InstanceRecommendations".to_string()),
+        action: None,
+        endpoint: None,
+    });
+    supported_apis.push(DashboardApiEntry {
+        service: "compute-optimizer".to_string(),
+        operation: "GetEBSVolumeRecommendations".to_string(),
+        protocol: "json-1.0".to_string(),
+        target: Some("ComputeOptimizerService.GetEBSVolumeRecommendations".to_string()),
+        action: None,
+        endpoint: None,
+    });
+    supported_apis.push(DashboardApiEntry {
+        service: "cur".to_string(),
+        operation: "DescribeReportDefinitions".to_string(),
+        protocol: "json-1.1".to_string(),
+        target: Some("AWSOrigamiServiceGatewayService.DescribeReportDefinitions".to_string()),
         action: None,
         endpoint: None,
     });
@@ -2521,6 +2863,26 @@ async fn handle_cost_explorer(
             }
         }
         Some("GetCostForecast") => match handle_get_cost_forecast(pool, body).await {
+            Ok(res) => (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/x-amz-json-1.1")],
+                Json(res),
+            )
+                .into_response(),
+            Err(CostUsageError::Validation(message)) => error_response(
+                protocol,
+                "ValidationException",
+                &message,
+                StatusCode::BAD_REQUEST,
+            ),
+            Err(CostUsageError::Internal(error)) => error_response(
+                protocol,
+                "InternalFailure",
+                &error.to_string(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        },
+        Some("GetUsageForecast") => match handle_get_usage_forecast(pool, body).await {
             Ok(res) => (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "application/x-amz-json-1.1")],
@@ -2984,6 +3346,137 @@ async fn handle_get_cost_forecast(
     Ok(response)
 }
 
+async fn handle_get_usage_forecast(
+    pool: SqlitePool,
+    body: Bytes,
+) -> std::result::Result<Value, CostUsageError> {
+    let req: GetUsageForecastRequest = serde_json::from_slice(&body)
+        .map_err(|e| CostUsageError::Validation(format!("Invalid JSON body: {}", e)))?;
+
+    let metric = req.metric.clone().ok_or_else(|| {
+        CostUsageError::Validation("Missing required field 'Metric'.".to_string())
+    })?;
+    let granularity = req.granularity.clone().ok_or_else(|| {
+        CostUsageError::Validation("Missing required field 'Granularity'.".to_string())
+    })?;
+
+    if !matches!(
+        metric.as_str(),
+        "USAGE_QUANTITY" | "NORMALIZED_USAGE_AMOUNT"
+    ) {
+        return Err(CostUsageError::Validation(format!(
+            "Unsupported Metric '{}'.",
+            metric
+        )));
+    }
+    if !matches!(granularity.as_str(), "DAILY" | "MONTHLY") {
+        return Err(CostUsageError::Validation(format!(
+            "Unsupported Granularity '{}'.",
+            granularity
+        )));
+    }
+
+    let now = Utc::now();
+    let start = parse_day_start_utc("TimePeriod.Start", &req.time_period.start)
+        .map_err(CostUsageError::Validation)?;
+    let end = parse_day_start_utc("TimePeriod.End", &req.time_period.end)
+        .map_err(CostUsageError::Validation)?;
+    let start_offset = (start - now).num_seconds();
+    let end_offset = (end - now).num_seconds();
+    let filter = parse_ce_filter(req.filter.as_ref())?;
+    let rows = fetch_cost_rows_for_window(&pool, start_offset, end_offset).await?;
+    let metric_multiplier = if metric == "NORMALIZED_USAGE_AMOUNT" {
+        1.25
+    } else {
+        1.0
+    };
+
+    let mut bucket_usage: BTreeMap<String, f64> = BTreeMap::new();
+    let mut bucket_end_dates: BTreeMap<String, String> = BTreeMap::new();
+    let mut cursor = start;
+    while cursor < end {
+        let bucket_start = if granularity == "MONTHLY" {
+            cursor.format("%Y-%m-01").to_string()
+        } else {
+            cursor.format("%Y-%m-%d").to_string()
+        };
+        let next_cursor = if granularity == "MONTHLY" {
+            let first_of_month = cursor.with_day(1).unwrap_or(cursor);
+            if first_of_month.month() == 12 {
+                first_of_month
+                    .with_year(first_of_month.year() + 1)
+                    .and_then(|d| d.with_month(1))
+                    .unwrap_or(first_of_month + chrono::Duration::days(31))
+            } else {
+                first_of_month
+                    .with_month(first_of_month.month() + 1)
+                    .unwrap_or(first_of_month + chrono::Duration::days(31))
+            }
+        } else {
+            cursor + chrono::Duration::days(1)
+        };
+        bucket_usage.entry(bucket_start.clone()).or_insert(0.0);
+        bucket_end_dates.insert(
+            bucket_start,
+            std::cmp::min(next_cursor, end)
+                .format("%Y-%m-%d")
+                .to_string(),
+        );
+        cursor = next_cursor;
+    }
+
+    for row in rows
+        .into_iter()
+        .filter(|row| cost_row_matches_filter(row, &filter))
+    {
+        let record_day = (now + chrono::Duration::seconds(row.seconds_from_now)).date_naive();
+        let bucket_key = if granularity == "MONTHLY" {
+            record_day.format("%Y-%m-01").to_string()
+        } else {
+            record_day.format("%Y-%m-%d").to_string()
+        };
+        let usage_amount = (row.amount / mock_usage_rate_for_resource_type(&row.resource_type))
+            * metric_multiplier;
+        *bucket_usage.entry(bucket_key).or_insert(0.0) += usage_amount;
+    }
+
+    let total_usage = bucket_usage.values().sum::<f64>();
+    let interval_level = req.prediction_interval_level.unwrap_or(80).clamp(50, 99);
+    let spread_ratio = (100 - interval_level) as f64 / 100.0 + 0.10;
+    let results_by_time = bucket_usage
+        .into_iter()
+        .map(|(bucket_start, amount)| {
+            let lower = (amount * (1.0 - spread_ratio)).max(0.0);
+            let upper = amount * (1.0 + spread_ratio);
+            json!({
+                "TimePeriod": {
+                    "Start": bucket_start,
+                    "End": bucket_end_dates.get(&bucket_start).cloned().unwrap_or_else(|| req.time_period.end.clone())
+                },
+                "MeanValue": format!("{:.4}", amount),
+                "PredictionIntervalLowerBound": format!("{:.4}", lower),
+                "PredictionIntervalUpperBound": format!("{:.4}", upper)
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut response = json!({
+        "Total": {
+            "Amount": format!("{:.4}", total_usage),
+            "Unit": if metric == "NORMALIZED_USAGE_AMOUNT" { "N/A" } else { "UsageQuantity" }
+        },
+        "ForecastResultsByTime": results_by_time
+    });
+    if req.filter.is_some() {
+        response["FilterApplied"] = json!(true);
+    }
+    if req.billing_view_arn.is_some() {
+        response["BillingViewArn"] = json!(req.billing_view_arn);
+    }
+
+    Ok(response)
+}
+
 async fn handle_get_dimension_values(
     pool: SqlitePool,
     body: Bytes,
@@ -3295,6 +3788,102 @@ async fn handle_get_resources(
     Ok(response)
 }
 
+async fn handle_get_tag_keys(
+    pool: SqlitePool,
+    body: Bytes,
+) -> std::result::Result<Value, CostUsageError> {
+    let req: GetTagKeysRequest = serde_json::from_slice(&body)
+        .map_err(|e| CostUsageError::Validation(format!("Invalid JSON body: {}", e)))?;
+
+    let page_start = parse_usize_token(req.pagination_token.as_deref(), "PaginationToken")?;
+    let rows = sqlx::query("SELECT tags FROM resources ORDER BY id ASC")
+        .fetch_all(&pool)
+        .await
+        .map_err(|e| CostUsageError::Internal(e.into()))?;
+
+    let mut keys = rows
+        .into_iter()
+        .flat_map(|row| {
+            parse_resource_tags(
+                row.try_get::<Option<String>, _>("tags")
+                    .ok()
+                    .flatten()
+                    .as_deref(),
+            )
+            .into_keys()
+            .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    keys.sort();
+    keys.dedup();
+
+    if page_start > keys.len() {
+        return Err(CostUsageError::Validation(
+            "PaginationToken points past available results.".to_string(),
+        ));
+    }
+
+    let page_size = 100usize;
+    let page_end = std::cmp::min(page_start + page_size, keys.len());
+    let mut response = json!({
+        "TagKeys": keys[page_start..page_end].to_vec()
+    });
+    if page_end < keys.len() {
+        response["PaginationToken"] = json!(page_end.to_string());
+    }
+
+    Ok(response)
+}
+
+async fn handle_get_tag_values(
+    pool: SqlitePool,
+    body: Bytes,
+) -> std::result::Result<Value, CostUsageError> {
+    let req: GetTagValuesRequest = serde_json::from_slice(&body)
+        .map_err(|e| CostUsageError::Validation(format!("Invalid JSON body: {}", e)))?;
+
+    let page_start = parse_usize_token(req.pagination_token.as_deref(), "PaginationToken")?;
+    let rows = sqlx::query("SELECT tags FROM resources ORDER BY id ASC")
+        .fetch_all(&pool)
+        .await
+        .map_err(|e| CostUsageError::Internal(e.into()))?;
+
+    let mut values = rows
+        .into_iter()
+        .filter_map(|row| {
+            parse_resource_tags(
+                row.try_get::<Option<String>, _>("tags")
+                    .ok()
+                    .flatten()
+                    .as_deref(),
+            )
+            .get(&req.key)
+            .cloned()
+        })
+        .collect::<Vec<_>>();
+
+    values.sort();
+    values.dedup();
+
+    if page_start > values.len() {
+        return Err(CostUsageError::Validation(
+            "PaginationToken points past available results.".to_string(),
+        ));
+    }
+
+    let page_size = 100usize;
+    let page_end = std::cmp::min(page_start + page_size, values.len());
+    let mut response = json!({
+        "TagValues": values[page_start..page_end].to_vec()
+    });
+    if page_end < values.len() {
+        response["PaginationToken"] = json!(page_end.to_string());
+    }
+
+    Ok(response)
+}
+
 async fn handle_get_products(body: Bytes) -> std::result::Result<Value, CostUsageError> {
     let req: GetProductsRequest = serde_json::from_slice(&body)
         .map_err(|e| CostUsageError::Validation(format!("Invalid JSON body: {}", e)))?;
@@ -3338,6 +3927,253 @@ async fn handle_get_products(body: Bytes) -> std::result::Result<Value, CostUsag
     }
 
     Ok(response)
+}
+
+async fn handle_get_ec2_instance_recommendations(
+    pool: SqlitePool,
+    body: Bytes,
+) -> std::result::Result<Value, CostUsageError> {
+    let req: ComputeOptimizerRequest = serde_json::from_slice(&body)
+        .map_err(|e| CostUsageError::Validation(format!("Invalid JSON body: {}", e)))?;
+
+    let page_start = parse_usize_token(req.next_token.as_deref(), "nextToken")?;
+    let page_size = clamp_page_size(req.max_results, 50, 100);
+    let rows = sqlx::query(
+        "SELECT r.id, r.region, r.tags, AVG(m.value) AS avg_cpu
+         FROM resources r
+         LEFT JOIN metrics m
+           ON m.resource_id = r.id
+          AND m.namespace = 'AWS/EC2'
+          AND m.metric_name = 'CPUUtilization'
+         WHERE r.resource_type = 'ec2'
+         GROUP BY r.id, r.region, r.tags
+         ORDER BY r.id ASC",
+    )
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| CostUsageError::Internal(e.into()))?;
+
+    if page_start > rows.len() {
+        return Err(CostUsageError::Validation(
+            "nextToken points past available results.".to_string(),
+        ));
+    }
+
+    let last_refresh = Utc::now().to_rfc3339();
+    let page_end = std::cmp::min(page_start + page_size, rows.len());
+    let recommendations = rows[page_start..page_end]
+        .iter()
+        .map(|row| {
+            let instance_id = row.get::<String, _>("id");
+            let region = row.get::<String, _>("region");
+            let tags_json = row.try_get::<Option<String>, _>("tags").ok().flatten();
+            let average_cpu = row
+                .try_get::<Option<f64>, _>("avg_cpu")
+                .ok()
+                .flatten()
+                .unwrap_or(0.0);
+            let (finding, target_instance_type, projected_cpu, monthly_savings_pct) =
+                if average_cpu < 15.0 {
+                    (
+                        "OVER_PROVISIONED",
+                        "t3.medium",
+                        (average_cpu * 1.8).min(85.0),
+                        28.0,
+                    )
+                } else if average_cpu > 75.0 {
+                    (
+                        "UNDER_PROVISIONED",
+                        "m6i.xlarge",
+                        (average_cpu * 0.7).max(45.0),
+                        0.0,
+                    )
+                } else {
+                    ("OPTIMIZED", "m6i.large", average_cpu, 0.0)
+                };
+            let estimated_monthly_savings = if monthly_savings_pct > 0.0 {
+                ((40.0 - average_cpu).max(5.0) * 3.2 * 100.0).round() / 100.0
+            } else {
+                0.0
+            };
+
+            json!({
+                "accountId": mock_account_id(),
+                "instanceArn": resource_arn("ec2", &region, &instance_id),
+                "instanceName": resource_name_from_tags(tags_json.as_deref(), &instance_id),
+                "currentInstanceType": "m6i.large",
+                "finding": finding,
+                "lookBackPeriodInDays": 14.0,
+                "lastRefreshTimestamp": last_refresh,
+                "utilizationMetrics": [{
+                    "name": "Cpu",
+                    "statistic": "Average",
+                    "value": average_cpu
+                }],
+                "recommendationOptions": [{
+                    "instanceType": target_instance_type,
+                    "projectedUtilizationMetrics": [{
+                        "name": "Cpu",
+                        "statistic": "Average",
+                        "value": projected_cpu
+                    }],
+                    "performanceRisk": if finding == "UNDER_PROVISIONED" { 3.0 } else { 1.0 },
+                    "rank": 1,
+                    "savingsOpportunity": {
+                        "estimatedMonthlySavings": {
+                            "currency": "USD",
+                            "value": estimated_monthly_savings
+                        },
+                        "savingsOpportunityPercentage": monthly_savings_pct
+                    }
+                }]
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut response = json!({
+        "instanceRecommendations": recommendations
+    });
+    if page_end < rows.len() {
+        response["nextToken"] = json!(page_end.to_string());
+    }
+
+    Ok(response)
+}
+
+async fn handle_get_ebs_volume_recommendations(
+    pool: SqlitePool,
+    body: Bytes,
+) -> std::result::Result<Value, CostUsageError> {
+    let req: ComputeOptimizerRequest = serde_json::from_slice(&body)
+        .map_err(|e| CostUsageError::Validation(format!("Invalid JSON body: {}", e)))?;
+
+    let page_start = parse_usize_token(req.next_token.as_deref(), "nextToken")?;
+    let page_size = clamp_page_size(req.max_results, 50, 100);
+    let rows = sqlx::query(
+        "SELECT r.id, r.region, r.tags,
+                AVG(CASE WHEN m.metric_name = 'DiskReadBytes' THEN m.value END) AS avg_read_bytes,
+                AVG(CASE WHEN m.metric_name = 'DiskWriteBytes' THEN m.value END) AS avg_write_bytes
+         FROM resources r
+         LEFT JOIN metrics m
+           ON m.resource_id = r.id
+          AND m.namespace = 'AWS/EC2'
+          AND m.metric_name IN ('DiskReadBytes', 'DiskWriteBytes')
+         WHERE r.resource_type = 'ec2'
+         GROUP BY r.id, r.region, r.tags
+         ORDER BY r.id ASC",
+    )
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| CostUsageError::Internal(e.into()))?;
+
+    if page_start > rows.len() {
+        return Err(CostUsageError::Validation(
+            "nextToken points past available results.".to_string(),
+        ));
+    }
+
+    let last_refresh = Utc::now().to_rfc3339();
+    let page_end = std::cmp::min(page_start + page_size, rows.len());
+    let recommendations = rows[page_start..page_end]
+        .iter()
+        .map(|row| {
+            let resource_id = row.get::<String, _>("id");
+            let region = row.get::<String, _>("region");
+            let tags_json = row.try_get::<Option<String>, _>("tags").ok().flatten();
+            let avg_read = row
+                .try_get::<Option<f64>, _>("avg_read_bytes")
+                .ok()
+                .flatten()
+                .unwrap_or(0.0);
+            let avg_write = row
+                .try_get::<Option<f64>, _>("avg_write_bytes")
+                .ok()
+                .flatten()
+                .unwrap_or(0.0);
+            let throughput = avg_read + avg_write;
+            let (finding, target_size_gb, savings_pct) = if throughput < 10_000_000.0 {
+                ("OVER_PROVISIONED", 80, 20.0)
+            } else if throughput > 120_000_000.0 {
+                ("UNDER_PROVISIONED", 200, 0.0)
+            } else {
+                ("OPTIMIZED", 100, 0.0)
+            };
+            let estimated_monthly_savings = if savings_pct > 0.0 { 6.4 } else { 0.0 };
+            let volume_id = format!("vol-{}", resource_id.trim_start_matches("i-"));
+
+            json!({
+                "accountId": mock_account_id(),
+                "volumeArn": format!("arn:aws:ec2:{region}:{}:volume/{volume_id}", mock_account_id()),
+                "volumeName": format!("{}-data", resource_name_from_tags(tags_json.as_deref(), &resource_id)),
+                "currentConfiguration": {
+                    "volumeType": "gp3",
+                    "volumeSize": 100,
+                    "volumeBaselineIOPS": 3000,
+                    "volumeBaselineThroughput": 125
+                },
+                "finding": finding,
+                "lastRefreshTimestamp": last_refresh,
+                "utilizationMetrics": [{
+                    "name": "VolumeReadWriteBytesPerSecond",
+                    "statistic": "Average",
+                    "value": throughput
+                }],
+                "volumeRecommendationOptions": [{
+                    "configuration": {
+                        "volumeType": "gp3",
+                        "volumeSize": target_size_gb,
+                        "volumeBaselineIOPS": 3000,
+                        "volumeBaselineThroughput": if target_size_gb >= 200 { 250 } else { 125 }
+                    },
+                    "performanceRisk": if finding == "UNDER_PROVISIONED" { 3.0 } else { 1.0 },
+                    "rank": 1,
+                    "savingsOpportunity": {
+                        "estimatedMonthlySavings": {
+                            "currency": "USD",
+                            "value": estimated_monthly_savings
+                        },
+                        "savingsOpportunityPercentage": savings_pct
+                    }
+                }]
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut response = json!({
+        "volumeRecommendations": recommendations
+    });
+    if page_end < rows.len() {
+        response["nextToken"] = json!(page_end.to_string());
+    }
+
+    Ok(response)
+}
+
+async fn handle_describe_report_definitions(
+    body: Bytes,
+) -> std::result::Result<Value, CostUsageError> {
+    let _req: DescribeReportDefinitionsRequest = serde_json::from_slice(&body)
+        .map_err(|e| CostUsageError::Validation(format!("Invalid JSON body: {}", e)))?;
+
+    Ok(json!({
+        "ReportDefinitions": [{
+            "ReportName": "foxtail-cur",
+            "TimeUnit": "DAILY",
+            "Format": "textORcsv",
+            "Compression": "GZIP",
+            "AdditionalSchemaElements": ["RESOURCES"],
+            "S3Bucket": "mock-cur-bucket",
+            "S3Prefix": "cur/foxtail",
+            "S3Region": "us-east-1",
+            "AdditionalArtifacts": ["ATHENA"],
+            "RefreshClosedReports": true,
+            "ReportVersioning": "CREATE_NEW_REPORT",
+            "ReportStatus": {
+                "lastDelivery": "2026-03-12T00:00:00Z",
+                "lastStatus": "SUCCESS"
+            }
+        }]
+    }))
 }
 
 async fn handle_get_reservation_coverage(
@@ -5042,6 +5878,325 @@ mod tests {
         assert_eq!(price_list.len(), 1);
         assert!(price_list[0].as_str().unwrap().contains("AmazonEC2"));
         assert!(price_list[0].as_str().unwrap().contains("m6i.large"));
+    }
+
+    #[tokio::test]
+    async fn pricing_get_products_supports_storage_filters_and_pagination() {
+        let pool = test_pool().await;
+        let app = build_app(pool.clone());
+
+        let first_page_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-amz-json-1.1")
+                    .header("x-amz-target", "AWSPriceListService.GetProducts")
+                    .body(Body::from(
+                        json!({
+                            "ServiceCode": "AmazonEC2",
+                            "FormatVersion": "aws_v1",
+                            "MaxResults": 1
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(first_page_response.status(), StatusCode::OK);
+        let first_page = response_json(first_page_response).await;
+        assert_eq!(first_page["PriceList"].as_array().unwrap().len(), 1);
+        assert_eq!(first_page["NextToken"], "1");
+
+        let storage_filter_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-amz-json-1.1")
+                    .header("x-amz-target", "AWSPriceListService.GetProducts")
+                    .body(Body::from(
+                        json!({
+                            "ServiceCode": "AmazonEC2",
+                            "FormatVersion": "aws_v1",
+                            "Filters": [{
+                                "Type": "TERM_MATCH",
+                                "Field": "volumeType",
+                                "Value": "gp3"
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(storage_filter_response.status(), StatusCode::OK);
+        let storage_page = response_json(storage_filter_response).await;
+        let price_list = storage_page["PriceList"].as_array().unwrap();
+        assert_eq!(price_list.len(), 1);
+        assert!(price_list[0].as_str().unwrap().contains("gp3"));
+    }
+
+    #[tokio::test]
+    async fn tagging_get_tag_keys_returns_distinct_values() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO resources (id, resource_type, region, scenario, tags)
+             VALUES
+             ('i-a', 'ec2', 'us-east-1', 'Baseline', '{\"Environment\":\"prod\",\"Name\":\"api-a\"}'),
+             ('i-b', 'ec2', 'us-east-1', 'Baseline', '{\"Environment\":\"dev\",\"Owner\":\"platform\"}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let app = build_app(pool);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-amz-json-1.1")
+                    .header(
+                        "x-amz-target",
+                        "ResourceGroupsTaggingAPI_20170126.GetTagKeys",
+                    )
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["TagKeys"], json!(["Environment", "Name", "Owner"]));
+    }
+
+    #[tokio::test]
+    async fn tagging_get_tag_values_returns_distinct_values_for_key() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO resources (id, resource_type, region, scenario, tags)
+             VALUES
+             ('i-a', 'ec2', 'us-east-1', 'Baseline', '{\"Environment\":\"prod\",\"Name\":\"api-a\"}'),
+             ('i-b', 'ec2', 'us-east-1', 'Baseline', '{\"Environment\":\"dev\",\"Name\":\"api-b\"}'),
+             ('i-c', 'ec2', 'us-east-1', 'Baseline', '{\"Environment\":\"prod\",\"Name\":\"api-c\"}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let app = build_app(pool);
+        let body = json!({ "Key": "Environment" });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-amz-json-1.1")
+                    .header(
+                        "x-amz-target",
+                        "ResourceGroupsTaggingAPI_20170126.GetTagValues",
+                    )
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["TagValues"], json!(["dev", "prod"]));
+    }
+
+    #[tokio::test]
+    async fn compute_optimizer_ec2_recommendations_reflect_average_cpu() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO resources (id, resource_type, region, scenario, tags)
+             VALUES
+             ('i-low', 'ec2', 'us-east-1', 'Baseline', '{\"Name\":\"idle-node\"}'),
+             ('i-high', 'ec2', 'us-east-1', 'Baseline', '{\"Name\":\"busy-node\"}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (resource_id, value) in [("i-low", 8.0), ("i-low", 12.0), ("i-high", 82.0)] {
+            sqlx::query(
+                "INSERT INTO metrics (resource_id, namespace, metric_name, seconds_from_now, value)
+                 VALUES (?, 'AWS/EC2', 'CPUUtilization', -3600, ?)",
+            )
+            .bind(resource_id)
+            .bind(value)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let app = build_app(pool);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-amz-json-1.0")
+                    .header(
+                        "x-amz-target",
+                        "ComputeOptimizerService.GetEC2InstanceRecommendations",
+                    )
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        let recs = body["instanceRecommendations"].as_array().unwrap();
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[0]["instanceName"], "busy-node");
+        assert_eq!(recs[0]["finding"], "UNDER_PROVISIONED");
+        assert_eq!(recs[1]["instanceName"], "idle-node");
+        assert_eq!(recs[1]["finding"], "OVER_PROVISIONED");
+    }
+
+    #[tokio::test]
+    async fn compute_optimizer_ebs_recommendations_reflect_disk_activity() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO resources (id, resource_type, region, scenario, tags)
+             VALUES ('i-a', 'ec2', 'us-east-1', 'Baseline', '{\"Name\":\"api-a\"}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (metric_name, value) in [
+            ("DiskReadBytes", 2_000_000.0),
+            ("DiskWriteBytes", 3_000_000.0),
+        ] {
+            sqlx::query(
+                "INSERT INTO metrics (resource_id, namespace, metric_name, seconds_from_now, value)
+                 VALUES ('i-a', 'AWS/EC2', ?, -3600, ?)",
+            )
+            .bind(metric_name)
+            .bind(value)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let app = build_app(pool);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-amz-json-1.0")
+                    .header(
+                        "x-amz-target",
+                        "ComputeOptimizerService.GetEBSVolumeRecommendations",
+                    )
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        let recs = body["volumeRecommendations"].as_array().unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0]["finding"], "OVER_PROVISIONED");
+        assert!(
+            recs[0]["volumeArn"]
+                .as_str()
+                .unwrap()
+                .contains("volume/vol-a")
+        );
+    }
+
+    #[tokio::test]
+    async fn cost_explorer_usage_forecast_returns_usage_quantity_series() {
+        let pool = test_pool().await;
+        let end = Utc::now().date_naive();
+        let start = end - chrono::Duration::days(2);
+        sqlx::query(
+            "INSERT INTO resources (id, resource_type, region, scenario, tags)
+             VALUES ('i-a', 'ec2', 'us-east-1', 'Baseline', '{\"Environment\":\"prod\"}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO cost_records (resource_id, seconds_from_now, amount)
+             VALUES ('i-a', -172800, 9.60), ('i-a', -86400, 19.20)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let app = build_app(pool);
+        let body = json!({
+            "TimePeriod": {
+                "Start": start.format("%Y-%m-%d").to_string(),
+                "End": end.format("%Y-%m-%d").to_string()
+            },
+            "Metric": "USAGE_QUANTITY",
+            "Granularity": "DAILY"
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-amz-json-1.1")
+                    .header("x-amz-target", "AWSInsightsIndexService.GetUsageForecast")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["Total"]["Unit"], "UsageQuantity");
+        assert_eq!(body["ForecastResultsByTime"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn cur_describe_report_definitions_returns_mock_report() {
+        let pool = test_pool().await;
+        let app = build_app(pool);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-amz-json-1.1")
+                    .header(
+                        "x-amz-target",
+                        "AWSOrigamiServiceGatewayService.DescribeReportDefinitions",
+                    )
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["ReportDefinitions"][0]["ReportName"], "foxtail-cur");
+        assert_eq!(
+            body["ReportDefinitions"][0]["ReportStatus"]["lastStatus"],
+            "SUCCESS"
+        );
     }
 
     #[tokio::test]

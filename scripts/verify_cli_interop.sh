@@ -128,11 +128,42 @@ TAGGED_RESOURCES="$(aws_json resourcegroupstaggingapi get-resources \
   --resources-per-page 5)"
 log_step "Verified Resource Groups Tagging API: get-resources"
 
+TAG_KEYS="$(aws_json resourcegroupstaggingapi get-tag-keys)"
+log_step "Verified Resource Groups Tagging API: get-tag-keys"
+
+TAG_VALUES="$(aws_json resourcegroupstaggingapi get-tag-values \
+  --key Name)"
+log_step "Verified Resource Groups Tagging API: get-tag-values"
+
 PRICING_PRODUCTS="$(aws_json pricing get-products \
   --service-code AmazonEC2 \
   --format-version aws_v1 \
   --filters Type=TERM_MATCH,Field=instanceType,Value=m6i.large)"
 log_step "Verified Pricing: get-products"
+
+PRICING_STORAGE_PRODUCTS="$(aws_json pricing get-products \
+  --service-code AmazonEC2 \
+  --format-version aws_v1 \
+  --filters Type=TERM_MATCH,Field=volumeType,Value=gp3)"
+log_step "Verified Pricing: gp3 storage product lookup"
+
+PRICING_PAGED_PRODUCTS="$(aws_json pricing get-products \
+  --service-code AmazonEC2 \
+  --format-version aws_v1 \
+  --max-results 1)"
+log_step "Verified Pricing: pagination"
+
+EC2_RECOMMENDATIONS="$(aws_json compute-optimizer get-ec2-instance-recommendations)"
+log_step "Verified Compute Optimizer: get-ec2-instance-recommendations"
+
+EBS_RECOMMENDATIONS="$(aws_json compute-optimizer get-ebs-volume-recommendations)"
+log_step "Verified Compute Optimizer: get-ebs-volume-recommendations"
+
+USAGE_FORECAST="$(aws_json ce get-usage-forecast \
+  --time-period "Start=$CE_START_DAY,End=$CE_END_DAY" \
+  --metric USAGE_QUANTITY \
+  --granularity DAILY)"
+log_step "Verified Cost Explorer: get-usage-forecast"
 
 log_step "Verified Cost Explorer: get-cost-forecast"
 aws_json ce get-cost-forecast \
@@ -149,6 +180,9 @@ aws_json ce get-anomaly-monitors >/dev/null
 log_step "Verified Cost Explorer: get-anomaly-subscriptions"
 aws_json ce get-anomaly-subscriptions >/dev/null
 
+CUR_REPORT_DEFINITIONS="$(aws_json cur describe-report-definitions)"
+log_step "Verified CUR: describe-report-definitions"
+
 EC2_METRICS="$(aws_json cloudwatch list-metrics \
   --namespace AWS/EC2 \
   --metric-name CPUUtilization)"
@@ -161,7 +195,15 @@ INSTANCE_ID="$(
   RESOURCE_COSTS="$RESOURCE_COSTS" \
   RESOURCE_TAGS="$RESOURCE_TAGS" \
   TAGGED_RESOURCES="$TAGGED_RESOURCES" \
+  TAG_KEYS="$TAG_KEYS" \
+  TAG_VALUES="$TAG_VALUES" \
   PRICING_PRODUCTS="$PRICING_PRODUCTS" \
+  PRICING_STORAGE_PRODUCTS="$PRICING_STORAGE_PRODUCTS" \
+  PRICING_PAGED_PRODUCTS="$PRICING_PAGED_PRODUCTS" \
+  USAGE_FORECAST="$USAGE_FORECAST" \
+  EC2_RECOMMENDATIONS="$EC2_RECOMMENDATIONS" \
+  EBS_RECOMMENDATIONS="$EBS_RECOMMENDATIONS" \
+  CUR_REPORT_DEFINITIONS="$CUR_REPORT_DEFINITIONS" \
   EC2_METRICS="$EC2_METRICS" \
   python3 - <<'PY'
 import json
@@ -190,9 +232,41 @@ tagged_resources = json.loads(os.environ["TAGGED_RESOURCES"])
 if not tagged_resources.get("ResourceTagMappingList"):
     raise SystemExit("tagged resource inventory is empty")
 
+tag_keys = json.loads(os.environ["TAG_KEYS"])
+if not tag_keys.get("TagKeys"):
+    raise SystemExit("tag key discovery returned no tag keys")
+
+tag_values = json.loads(os.environ["TAG_VALUES"])
+if not tag_values.get("TagValues"):
+    raise SystemExit("tag value discovery returned no tag values")
+
 pricing_products = json.loads(os.environ["PRICING_PRODUCTS"])
 if not pricing_products.get("PriceList"):
     raise SystemExit("pricing product list is empty")
+
+pricing_storage_products = json.loads(os.environ["PRICING_STORAGE_PRODUCTS"])
+if not pricing_storage_products.get("PriceList"):
+    raise SystemExit("pricing storage product list is empty")
+
+pricing_paged_products = json.loads(os.environ["PRICING_PAGED_PRODUCTS"])
+if not pricing_paged_products.get("NextToken"):
+    raise SystemExit("pricing pagination did not return NextToken")
+
+usage_forecast = json.loads(os.environ["USAGE_FORECAST"])
+if not usage_forecast.get("ForecastResultsByTime"):
+    raise SystemExit("usage forecast results are empty")
+
+ec2_recommendations = json.loads(os.environ["EC2_RECOMMENDATIONS"])
+if not ec2_recommendations.get("instanceRecommendations"):
+    raise SystemExit("compute optimizer EC2 recommendations are empty")
+
+ebs_recommendations = json.loads(os.environ["EBS_RECOMMENDATIONS"])
+if not ebs_recommendations.get("volumeRecommendations"):
+    raise SystemExit("compute optimizer EBS recommendations are empty")
+
+cur_reports = json.loads(os.environ["CUR_REPORT_DEFINITIONS"])
+if not cur_reports.get("ReportDefinitions"):
+    raise SystemExit("CUR report definitions are empty")
 
 metrics = json.loads(os.environ["EC2_METRICS"]).get("Metrics", [])
 for metric in metrics:

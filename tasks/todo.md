@@ -145,3 +145,70 @@
   - `cargo test`
   - `cargo clippy --all-targets --all-features`
   - `bash scripts/verify_cli_interop.sh`
+
+## Next FinOps Discovery API Work
+
+- [x] Add `resourcegroupstaggingapi get-tag-keys` and `get-tag-values` so CLI callers can discover the current tag surface without helper endpoints.
+- [x] Add `compute-optimizer get-ec2-instance-recommendations` and `get-ebs-volume-recommendations` backed by seeded utilization data.
+- [x] Extend route coverage, dashboard capability metadata, README docs, and `scripts/verify_cli_interop.sh` for the new APIs.
+- [x] Re-run formatting, tests, clippy, and the CLI smoke suite after the new handlers land.
+
+## FinOps Discovery API Results
+
+- Added `ResourceGroupsTaggingAPI_20170126.GetTagKeys` and `GetTagValues`, backed by distinct keys and values from `resources.tags`.
+- Added `ComputeOptimizerService.GetEC2InstanceRecommendations` and `GetEBSVolumeRecommendations`, derived from seeded EC2 CPU and disk byte metrics so the outputs change with the active scenario data.
+- Extended dashboard capability metadata, route coverage, README docs, and `scripts/verify_cli_interop.sh` for the new discovery and recommendation APIs.
+- Verification completed successfully:
+  - `cargo fmt`
+  - `cargo test`
+  - `cargo clippy --all-targets --all-features`
+  - `bash scripts/verify_cli_interop.sh`
+
+## Next Forecast And CUR API Work
+
+- [x] Add `ce get-usage-forecast` so AWS CLI callers can model usage trend workflows alongside spend forecasts.
+- [x] Add `cur describe-report-definitions` for mock CUR discovery from the public AWS CLI surface.
+- [x] Extend route coverage, README docs, dashboard capability metadata, and `scripts/verify_cli_interop.sh` for both APIs.
+- [x] Re-run formatting, tests, clippy, and the CLI smoke suite after the new handlers land.
+
+## Forecast And CUR API Results
+
+- Added `AWSInsightsIndexService.GetUsageForecast`, with `USAGE_QUANTITY` and `NORMALIZED_USAGE_AMOUNT` derived from seeded cost records using the mock rate catalog as a usage proxy.
+- Added `AWSOrigamiServiceGatewayService.DescribeReportDefinitions`, returning a stable mock CUR definition so AWS CLI-driven CUR discovery works against the public surface.
+- Extended route coverage, dashboard capability metadata, README docs, and `scripts/verify_cli_interop.sh` for both APIs.
+- Verification completed successfully:
+  - `cargo fmt`
+  - `cargo test`
+  - `cargo clippy --all-targets --all-features`
+  - `bash scripts/verify_cli_interop.sh`
+
+## Next Pricing Depth Work
+
+- [x] Expand `pricing get-products` with enough SKU variety to support realistic EC2, EBS, RDS, S3, and ELB lookups.
+- [x] Add focused tests for richer pricing filters and pagination over the expanded catalog.
+- [x] Extend README docs and `scripts/verify_cli_interop.sh` so the new pricing coverage is exercised from the AWS CLI.
+- [x] Re-run formatting, tests, clippy, and the CLI smoke suite after the catalog expansion lands.
+
+## Pricing Depth Results
+
+- Expanded the mock pricing catalog with multiple EC2 instance sizes, an EC2 gp3 storage SKU, additional RDS and S3 products, and both ALB and NLB hourly entries.
+- Verified that `pricing get-products` now supports realistic filter paths such as `instanceType=m6i.large` and `volumeType=gp3`, and that AmazonEC2 pagination returns `NextToken` when truncated.
+- Extended route coverage, README docs, and `scripts/verify_cli_interop.sh` for the richer pricing surface.
+- Verification completed successfully:
+  - `cargo fmt`
+  - `cargo test`
+  - `cargo clippy --all-targets --all-features`
+  - `bash scripts/verify_cli_interop.sh`
+
+## Foxtail Skill Work
+
+- [x] Create a repo-local skill that knows how to build, seed, run, and analyze this service through both local controls and public AWS CLI commands.
+- [x] Add a supporting playbook for existing scenarios, scenario switching, and authoring a new scenario in code.
+- [x] Review the skill content against the current README, CLI surface, and scenario implementation so it does not drift from the service.
+
+## Foxtail Skill Results
+
+- Added the repo-local skill at `.codex/skills/foxtail-finops-operator/` so future agent runs can discover and use this service intentionally instead of reconstructing the workflow from scratch.
+- Added a compact skill entrypoint plus a deeper playbook covering bootstrap, scenario reseeding, in-place scenario mutation, public AWS CLI FinOps workflows, and new scenario authoring.
+- Reviewed the skill content against the current `Makefile`, `src/cli.rs`, `src/generator.rs`, `src/serve.rs`, and `README.md`.
+- No runtime verification commands were needed because this step added operator guidance, not service behavior.
