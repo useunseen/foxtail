@@ -212,3 +212,48 @@
 - Added a compact skill entrypoint plus a deeper playbook covering bootstrap, scenario reseeding, in-place scenario mutation, public AWS CLI FinOps workflows, and new scenario authoring.
 - Reviewed the skill content against the current `Makefile`, `src/cli.rs`, `src/generator.rs`, `src/serve.rs`, and `README.md`.
 - No runtime verification commands were needed because this step added operator guidance, not service behavior.
+
+## Foxtail Wrapper Work
+
+- [x] Add a standalone `foxtail` binary that routes supported FinOps commands to the Foxtail endpoint and delegates everything else to `awslocal`.
+- [x] Add routing and subprocess tests that prove backend selection, endpoint injection, and exit-code passthrough.
+- [x] Add a repeatable wrapper verification script and Make target.
+- [x] Update README command-surface docs for the new wrapper.
+- [x] Run `cargo fmt`, `cargo test`, `cargo clippy --all-targets --all-features`, and the wrapper verification script, then capture results here.
+
+## Foxtail Wrapper Results
+
+- Added a new standalone binary at `src/bin/foxtail.rs`, backed by reusable routing logic in `src/wrapper.rs`.
+- The wrapper now sends the repo’s supported FinOps commands to Foxtail through `aws --endpoint-url http://127.0.0.1:8080` and delegates everything else to `awslocal`.
+- Added unit coverage for wrapper flag parsing, AWS global-flag skipping, explicit endpoint handling, and the routing matrix.
+- Added subprocess-backed integration tests in `tests/foxtail_wrapper.rs` to verify backend selection and exit-code passthrough with fake executables.
+- Added `scripts/verify_wrapper_routing.sh` and `make verify-wrapper-routing` for repeatable routing verification without requiring live AWS services.
+- Updated `README.md` with the new wrapper command surface, wrapper-specific flags, and the routed command inventory.
+- Verification completed successfully:
+  - `cargo fmt --all`
+  - `cargo test`
+  - `cargo clippy --all-targets --all-features`
+  - `bash scripts/verify_wrapper_routing.sh`
+
+## AWS CLI Network Metric Query Work
+
+- [x] Reproduce the reported all-zero network in/out behavior against the public CloudWatch AWS CLI path.
+- [x] Replace single-query `MetricDataQueries.member.1` parsing on the Query/XML path with multi-query normalization.
+- [x] Add focused regression coverage for `NetworkIn` and `NetworkOut` through Query/XML `GetMetricData`.
+- [x] Extend `scripts/verify_cli_interop.sh` with an explicit network ingress/egress smoke check.
+- [x] Run `cargo fmt`, `cargo test`, `cargo clippy --all-targets --all-features`, and `bash scripts/verify_cli_interop.sh`, then capture results here.
+
+## AWS CLI Network Metric Query Results
+
+- Confirmed the public CloudWatch Query/XML `GetMetricData` path only parsed `MetricDataQueries.member.1.*`, which explained why multi-series network checks could collapse to incomplete or misleading output.
+- Replaced the fixed single-query XML parsing path with indexed `MetricDataQueries.member.N` normalization and reused the existing metric-data aggregation path.
+- Added route coverage for a two-query XML request that asks for EC2 `NetworkIn` and `NetworkOut` together and verifies both ids and non-zero datapoints.
+- Updated `scripts/verify_cli_interop.sh` so it now:
+  - asserts `cloudwatch get-metric-statistics` returns non-zero `NetworkIn` datapoints
+  - asserts `cloudwatch get-metric-data` returns both `NetworkIn` and `NetworkOut` with aligned, unique, non-zero datapoints
+- Updated `README.md` to document 50-query support on both the JSON and AWS CLI Query/XML `GetMetricData` paths.
+- Verification completed successfully:
+  - `cargo fmt --all`
+  - `cargo test`
+  - `cargo clippy --all-targets --all-features`
+  - `bash scripts/verify_cli_interop.sh`

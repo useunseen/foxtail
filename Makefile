@@ -3,7 +3,7 @@
 BIN := target/debug/aws-mock-data-service
 DB_PATH := mock_data.db
 
-.PHONY: build build-release run gen gen-baseline gen-spike gen-idle-heavy serve setup setup-mock verify-cli-interoperability help
+.PHONY: build build-release run gen gen-baseline gen-spike gen-idle-heavy serve setup setup-mock verify-cli-interoperability verify-wrapper-routing help
 
 help:
 	@echo "AWS Mock Data Service"
@@ -16,6 +16,7 @@ help:
 	@echo "  make serve  - Start the API server"
 	@echo "  make setup  - Build and generate data"
 	@echo "  make verify-cli-interoperability - Run AWS CLI smoke checks against a local server"
+	@echo "  make verify-wrapper-routing - Run wrapper routing checks against stub aws/awslocal binaries"
 
 build:
 	cargo build
@@ -45,3 +46,6 @@ setup-mock: setup
 
 verify-cli-interoperability:
 	bash scripts/verify_cli_interop.sh
+
+verify-wrapper-routing:
+	bash scripts/verify_wrapper_routing.sh
