@@ -279,25 +279,54 @@ raise SystemExit("no EC2 InstanceId discovered via list-metrics")
 PY
 )"
 
-log_step "Verified CloudWatch: get-metric-statistics"
-aws_json cloudwatch get-metric-statistics \
+NETWORK_STATS_OUTPUT="$(aws_json cloudwatch get-metric-statistics \
   --namespace AWS/EC2 \
-  --metric-name CPUUtilization \
+  --metric-name NetworkIn \
   --statistics Average \
   --period 3600 \
   --start-time "$CW_START_TIME" \
   --end-time "$CW_END_TIME" \
-  --dimensions Name=InstanceId,Value="$INSTANCE_ID" >/dev/null
+  --dimensions Name=InstanceId,Value="$INSTANCE_ID")"
+log_step "Verified CloudWatch: get-metric-statistics"
+
+NETWORK_STATS_OUTPUT="$NETWORK_STATS_OUTPUT" python3 - <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ["NETWORK_STATS_OUTPUT"])
+datapoints = payload.get("Datapoints", [])
+if not datapoints:
+    raise SystemExit("NetworkIn get-metric-statistics returned no datapoints")
+if not any(point.get("Average", 0) > 0 for point in datapoints):
+    raise SystemExit("NetworkIn get-metric-statistics returned only zero datapoints")
+PY
 
 QUERY_FILE="$TMP_DIR/metric_queries.json"
 cat >"$QUERY_FILE" <<EOF
 [
   {
-    "Id": "cpu",
+    "Id": "netin",
     "MetricStat": {
       "Metric": {
         "Namespace": "AWS/EC2",
-        "MetricName": "CPUUtilization",
+        "MetricName": "NetworkIn",
+        "Dimensions": [
+          {
+            "Name": "InstanceId",
+            "Value": "$INSTANCE_ID"
+          }
+        ]
+      },
+      "Period": 3600,
+      "Stat": "Average"
+    }
+  },
+  {
+    "Id": "netout",
+    "MetricStat": {
+      "Metric": {
+        "Namespace": "AWS/EC2",
+        "MetricName": "NetworkOut",
         "Dimensions": [
           {
             "Name": "InstanceId",
@@ -324,20 +353,24 @@ import os
 
 payload = json.loads(os.environ["METRIC_DATA_OUTPUT"])
 results = payload.get("MetricDataResults", [])
-if len(results) != 1:
-    raise SystemExit("expected exactly one MetricDataResult")
+if len(results) != 2:
+    raise SystemExit("expected exactly two MetricDataResults")
 
-result = results[0]
-if result.get("Id") != "cpu":
-    raise SystemExit("MetricDataResult Id did not preserve caller query id")
+results_by_id = {result.get("Id"): result for result in results}
+for query_id in ("netin", "netout"):
+    result = results_by_id.get(query_id)
+    if result is None:
+        raise SystemExit(f"missing MetricDataResult for {query_id}")
 
-timestamps = result.get("Timestamps", [])
-values = result.get("Values", [])
-if len(timestamps) != len(values):
-    raise SystemExit("timestamps and values are not aligned")
-if len(timestamps) != len(set(timestamps)):
-    raise SystemExit("duplicate timestamps found in MetricDataResult")
+    timestamps = result.get("Timestamps", [])
+    values = result.get("Values", [])
+    if len(timestamps) != len(values):
+        raise SystemExit(f"timestamps and values are not aligned for {query_id}")
+    if len(timestamps) != len(set(timestamps)):
+        raise SystemExit(f"duplicate timestamps found in MetricDataResult for {query_id}")
+    if timestamps and not any(value > 0 for value in values):
+        raise SystemExit(f"{query_id} returned only zero datapoints")
 PY
 
-log_step "Verified get-metric-data result shape: preserved query id, aligned arrays, unique timestamps"
+log_step "Verified get-metric-data result shape: preserved query ids, aligned arrays, unique timestamps, non-zero network datapoints"
 echo "CLI interoperability verification passed on $ENDPOINT"

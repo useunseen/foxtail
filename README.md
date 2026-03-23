@@ -4,11 +4,12 @@ Local Rust service that generates and serves AWS-like Cost Explorer and CloudWat
 
 ## Command Surface
 
-This repo exposes three different command surfaces:
+This repo exposes four different command surfaces:
 
 1. Local developer commands via `make`
 2. Binary subcommands via `target/debug/aws-mock-data-service`
-3. Public AWS-compatible API calls via `aws --endpoint-url ...`
+3. Standalone wrapper commands via `target/debug/foxtail`
+4. Public AWS-compatible API calls via `aws --endpoint-url ...`
 
 The `/_mock/*` routes are local helper endpoints. They are not public AWS APIs.
 
@@ -54,6 +55,7 @@ export AWS_PAGER=""
 | `make setup` | Build and seed baseline data |
 | `make setup-mock` | Compatibility alias for `make setup` |
 | `make verify-cli-interoperability` | Run the AWS CLI smoke suite against a temporary local server |
+| `make verify-wrapper-routing` | Run routing checks for the `foxtail` wrapper against stub `aws` and `awslocal` binaries |
 
 ### Binary Commands
 
@@ -98,6 +100,60 @@ Supported flags:
 
 - `--address <ip-or-host>`: bind address, default `127.0.0.1`
 - `--port <port>`: bind port, default `8080`
+
+### Wrapper Command
+
+`target/debug/foxtail` is a standalone local wrapper for mixed LocalStack and Foxtail workflows.
+
+- It delegates to `awslocal` by default.
+- It routes the supported FinOps command set in this repo to Foxtail by invoking `aws --endpoint-url http://127.0.0.1:8080 ...`.
+
+Examples:
+
+```bash
+target/debug/foxtail s3 ls
+```
+
+```bash
+target/debug/foxtail ce get-cost-and-usage \
+  --time-period Start=2026-03-01,End=2026-03-11 \
+  --granularity DAILY \
+  --metrics UnblendedCost
+```
+
+Wrapper-specific flags:
+
+- `--debug-routing`: print the selected backend and effective command
+- `--foxtail-endpoint <url>`: override the routed Foxtail endpoint
+- `--aws-bin <path>`: override the `aws` executable used for routed commands
+- `--awslocal-bin <path>`: override the `awslocal` executable used for passthrough commands
+
+Supported Foxtail-routed commands:
+
+- `ce get-cost-and-usage`
+- `ce get-cost-and-usage-with-resources`
+- `ce get-cost-forecast`
+- `ce get-usage-forecast`
+- `ce get-dimension-values`
+- `ce get-tags`
+- `ce get-reservation-coverage`
+- `ce get-reservation-utilization`
+- `ce get-savings-plans-coverage`
+- `ce get-savings-plans-utilization`
+- `ce get-rightsizing-recommendation`
+- `ce get-anomalies`
+- `ce get-anomaly-monitors`
+- `ce get-anomaly-subscriptions`
+- `resourcegroupstaggingapi get-resources`
+- `resourcegroupstaggingapi get-tag-keys`
+- `resourcegroupstaggingapi get-tag-values`
+- `pricing get-products`
+- `compute-optimizer get-ec2-instance-recommendations`
+- `compute-optimizer get-ebs-volume-recommendations`
+- `cur describe-report-definitions`
+- `cloudwatch list-metrics`
+- `cloudwatch get-metric-statistics`
+- `cloudwatch get-metric-data`
 
 ## Public AWS-Compatible Commands
 
@@ -233,7 +289,7 @@ CloudWatch support is split by protocol:
 | --- | --- | --- | --- |
 | `cloudwatch list-metrics` | Discover available metric definitions | Query/XML | Use this first when the scenario changes |
 | `cloudwatch get-metric-statistics` | Return a single aggregated time series | Query/XML | Best simple path for one resource/metric pair |
-| `cloudwatch get-metric-data` | Return one or more aggregated time series | Query/XML or JSON | AWS CLI path currently supports one `MetricDataQueries.member.1` query; JSON path supports up to 50 queries |
+| `cloudwatch get-metric-data` | Return one or more aggregated time series | Query/XML or JSON | Supports up to 50 queries on both the AWS CLI Query/XML path and the JSON target path |
 
 #### `cloudwatch list-metrics`
 
@@ -304,8 +360,7 @@ Current `get-metric-data` behavior:
 - Supports `Average`, `Sum`, `Minimum`, and `Maximum`
 - Keeps timestamp and value arrays aligned
 - Paginates deterministically
-- Supports up to 50 queries on the JSON target path
-- Supports one query on the current AWS CLI Query/XML path
+- Supports up to 50 queries on both the JSON target path and the AWS CLI Query/XML path
 
 ## Local Helper Endpoints
 
