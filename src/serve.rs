@@ -70,6 +70,8 @@ struct CloudWatchQuery {
     start_time: Option<String>,
     end_time: Option<String>,
     period: Option<i32>,
+    #[serde(rename = "MaxDatapoints")]
+    max_datapoints: Option<u64>,
     #[serde(rename = "NextToken")]
     next_token: Option<String>,
     #[serde(rename = "RecentlyActive")]
@@ -400,6 +402,11 @@ struct MetricDataSeries {
     label: String,
     timestamps: Vec<String>,
     values: Vec<f64>,
+}
+
+struct PaginatedMetricDataSeries {
+    results: Vec<MetricDataSeries>,
+    next_token: Option<String>,
 }
 
 #[derive(Default)]
@@ -1063,6 +1070,53 @@ async fn build_metric_data_series_list(
     }
 
     Ok(series_list)
+}
+
+fn paginate_metric_data_series(
+    series_list: Vec<MetricDataSeries>,
+    page_start: usize,
+    max_datapoints: usize,
+) -> std::result::Result<PaginatedMetricDataSeries, MetricDataError> {
+    let mut max_series_len = 0usize;
+    for series in &series_list {
+        max_series_len = max_series_len.max(series.timestamps.len());
+    }
+
+    if page_start > max_series_len {
+        return Err(MetricDataError::InvalidNextToken(
+            "NextToken points past available results.".to_string(),
+        ));
+    }
+
+    let page_end = page_start.saturating_add(max_datapoints);
+    let has_more = page_end < max_series_len;
+
+    let results = series_list
+        .into_iter()
+        .map(|series| {
+            let series_end = std::cmp::min(page_end, series.timestamps.len());
+            let (timestamps, values) = if page_start >= series.timestamps.len() {
+                (Vec::new(), Vec::new())
+            } else {
+                (
+                    series.timestamps[page_start..series_end].to_vec(),
+                    series.values[page_start..series_end].to_vec(),
+                )
+            };
+
+            MetricDataSeries {
+                id: series.id,
+                label: series.label,
+                timestamps,
+                values,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    Ok(PaginatedMetricDataSeries {
+        results,
+        next_token: has_more.then(|| page_end.to_string()),
+    })
 }
 
 async fn build_metric_data_series(
@@ -4972,6 +5026,18 @@ async fn handle_get_metric_data_xml(
         .map_err(MetricDataError::Validation)?;
     let end_time = parse_rfc3339_required("EndTime", query.end_time.as_deref())
         .map_err(MetricDataError::Validation)?;
+    let max_datapoints = query.max_datapoints.unwrap_or(1000) as usize;
+    if max_datapoints == 0 {
+        return Err(MetricDataError::Validation(
+            "MaxDatapoints must be greater than 0.".to_string(),
+        ));
+    }
+    let page_start = match query.next_token.as_deref() {
+        Some(raw) if !raw.trim().is_empty() => raw.parse::<usize>().map_err(|_| {
+            MetricDataError::InvalidNextToken("Invalid NextToken value.".to_string())
+        })?,
+        _ => 0,
+    };
     let metric_data_queries = parse_metric_data_queries_from_form(body)?;
     let series_list = build_metric_data_series_list(
         &pool,
@@ -4981,12 +5047,14 @@ async fn handle_get_metric_data_xml(
         injected_now,
     )
     .await?;
+    let paginated = paginate_metric_data_series(series_list, page_start, max_datapoints)?;
 
     let response = cw::GetMetricDataResponse {
         xmlns: "http://monitoring.amazonaws.com/doc/2010-08-01/".to_string(),
         result: cw::GetMetricDataResult {
             results: cw::MetricDataResults {
-                members: series_list
+                members: paginated
+                    .results
                     .into_iter()
                     .map(|series| cw::MetricDataResult {
                         id: series.id,
@@ -5000,6 +5068,7 @@ async fn handle_get_metric_data_xml(
                     })
                     .collect(),
             },
+            next_token: paginated.next_token,
         },
         metadata: cw::ResponseMetadata {
             request_id: "mock-id".to_string(),
@@ -5155,39 +5224,18 @@ async fn handle_get_metric_data(
         injected_now,
     )
     .await?;
-    let mut max_series_len = 0usize;
-    for series in &series_list {
-        max_series_len = max_series_len.max(series.timestamps.len());
-    }
+    let paginated = paginate_metric_data_series(series_list, page_start, max_datapoints)?;
 
-    if page_start > max_series_len {
-        return Err(MetricDataError::InvalidNextToken(
-            "NextToken points past available results.".to_string(),
-        ));
-    }
-
-    let page_end = page_start.saturating_add(max_datapoints);
-    let has_more = page_end < max_series_len;
-
-    let results = series_list
+    let results = paginated
+        .results
         .into_iter()
         .map(|series| {
-            let series_end = std::cmp::min(page_end, series.timestamps.len());
-            let (timestamps, values) = if page_start >= series.timestamps.len() {
-                (Vec::new(), Vec::new())
-            } else {
-                (
-                    series.timestamps[page_start..series_end].to_vec(),
-                    series.values[page_start..series_end].to_vec(),
-                )
-            };
-
             json!({
                 "Id": series.id,
                 "Label": series.label,
                 "StatusCode": "Complete",
-                "Values": values,
-                "Timestamps": timestamps
+                "Values": series.values,
+                "Timestamps": series.timestamps
             })
         })
         .collect::<Vec<_>>();
@@ -5197,8 +5245,8 @@ async fn handle_get_metric_data(
     });
     // Keep field present for coverage/contract shape expectations.
     response["Messages"] = json!([]);
-    if has_more {
-        response["NextToken"] = json!((page_start + max_datapoints).to_string());
+    if let Some(next_token) = paginated.next_token {
+        response["NextToken"] = json!(next_token);
     }
 
     Ok(response)
@@ -6457,6 +6505,76 @@ mod tests {
         assert!(xml.contains("11000000"));
         assert_eq!(xml.matches("2026-03-11T10:00:00+00:00").count(), 2);
         assert_eq!(xml.matches("2026-03-11T11:00:00+00:00").count(), 2);
+    }
+
+    #[tokio::test]
+    async fn cloudwatch_query_xml_metric_data_emits_next_token_when_paginated() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO resources (id, resource_type, region, scenario, tags)
+             VALUES ('i-test', 'ec2', 'us-east-1', 'Baseline', '{}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for (offset, value) in [(-7200, 10.0), (-3600, 20.0)] {
+            sqlx::query(
+                "INSERT INTO metrics (resource_id, namespace, metric_name, seconds_from_now, value)
+                 VALUES ('i-test', 'AWS/EC2', 'CPUUtilization', ?, ?)",
+            )
+            .bind(offset)
+            .bind(value)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let app = build_app(pool);
+        let first_page = "Action=GetMetricData&Version=2010-08-01&MetricDataQueries.member.1.Id=cpu&MetricDataQueries.member.1.MetricStat.Metric.Namespace=AWS%2FEC2&MetricDataQueries.member.1.MetricStat.Metric.MetricName=CPUUtilization&MetricDataQueries.member.1.MetricStat.Metric.Dimensions.member.1.Name=InstanceId&MetricDataQueries.member.1.MetricStat.Metric.Dimensions.member.1.Value=i-test&MetricDataQueries.member.1.MetricStat.Period=3600&MetricDataQueries.member.1.MetricStat.Stat=Average&MaxDatapoints=1&StartTime=2026-03-11T10%3A00%3A00Z&EndTime=2026-03-11T12%3A00%3A00Z";
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header("x-mock-now", "2026-03-11T12:00:00Z")
+                    .body(Body::from(first_page))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let xml = String::from_utf8(body.to_vec()).unwrap();
+        assert!(xml.contains("<NextToken>1</NextToken>"));
+        assert_eq!(xml.matches("<member>").count(), 3);
+        assert_eq!(xml.matches("2026-03-11T10:00:00+00:00").count(), 1);
+
+        let second_page = "Action=GetMetricData&Version=2010-08-01&MetricDataQueries.member.1.Id=cpu&MetricDataQueries.member.1.MetricStat.Metric.Namespace=AWS%2FEC2&MetricDataQueries.member.1.MetricStat.Metric.MetricName=CPUUtilization&MetricDataQueries.member.1.MetricStat.Metric.Dimensions.member.1.Name=InstanceId&MetricDataQueries.member.1.MetricStat.Metric.Dimensions.member.1.Value=i-test&MetricDataQueries.member.1.MetricStat.Period=3600&MetricDataQueries.member.1.MetricStat.Stat=Average&MaxDatapoints=1&NextToken=1&StartTime=2026-03-11T10%3A00%3A00Z&EndTime=2026-03-11T12%3A00%3A00Z";
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header("x-mock-now", "2026-03-11T12:00:00Z")
+                    .body(Body::from(second_page))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let xml = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!xml.contains("<NextToken>"));
+        assert_eq!(xml.matches("2026-03-11T11:00:00+00:00").count(), 1);
+        assert!(!xml.contains("2026-03-11T10:00:00+00:00"));
     }
 
     #[tokio::test]

@@ -69,6 +69,8 @@ pub struct GetMetricDataResponse {
 pub struct GetMetricDataResult {
     #[serde(rename = "MetricDataResults")]
     pub results: MetricDataResults,
+    #[serde(rename = "NextToken", skip_serializing_if = "Option::is_none")]
+    pub next_token: Option<String>,
 }
 
 #[derive(Serialize)]
