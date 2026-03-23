@@ -213,6 +213,7 @@
 - Reviewed the skill content against the current `Makefile`, `src/cli.rs`, `src/generator.rs`, `src/serve.rs`, and `README.md`.
 - No runtime verification commands were needed because this step added operator guidance, not service behavior.
 
+
 ## Foxtail Wrapper Work
 
 - [x] Add a standalone `foxtail` binary that routes supported FinOps commands to the Foxtail endpoint and delegates everything else to `awslocal`.
@@ -224,7 +225,7 @@
 ## Foxtail Wrapper Results
 
 - Added a new standalone binary at `src/bin/foxtail.rs`, backed by reusable routing logic in `src/wrapper.rs`.
-- The wrapper now sends the repo’s supported FinOps commands to Foxtail through `aws --endpoint-url http://127.0.0.1:8080` and delegates everything else to `awslocal`.
+- The wrapper now sends the repo's supported FinOps commands to Foxtail through `aws --endpoint-url http://127.0.0.1:8080` and delegates everything else to `awslocal`.
 - Added unit coverage for wrapper flag parsing, AWS global-flag skipping, explicit endpoint handling, and the routing matrix.
 - Added subprocess-backed integration tests in `tests/foxtail_wrapper.rs` to verify backend selection and exit-code passthrough with fake executables.
 - Added `scripts/verify_wrapper_routing.sh` and `make verify-wrapper-routing` for repeatable routing verification without requiring live AWS services.
@@ -257,3 +258,35 @@
   - `cargo test`
   - `cargo clippy --all-targets --all-features`
   - `bash scripts/verify_cli_interop.sh`
+
+## Pricing GetProducts Bug Investigation
+
+- [x] Reproduce the reported `foxtail pricing get-products` failure against the local service using the AWS CLI path.
+- [x] Isolate the request shape or handler branch that causes the failure.
+- [x] Apply the minimal fix and add regression coverage if behavior is wrong in the service.
+- [x] Re-run focused verification and record the result in this file.
+
+## Pricing GetProducts Investigation Review
+
+- Reproduced the documented pricing smoke command through both:
+  - `aws --endpoint-url http://127.0.0.1:8080 pricing get-products --service-code AmazonEC2 --format-version aws_v1 --filters Type=TERM_MATCH,Field=instanceType,Value=m6i.large`
+  - `foxtail pricing get-products --service-code AmazonEC2 --format-version aws_v1 --filters Type=TERM_MATCH,Field=instanceType,Value=m6i.large`
+- Both commands succeeded on 2026-03-23 against the local service at `127.0.0.1:8080`.
+- `GET /_mock/status` also returned `status: online`, so the currently running service is healthy.
+- No repo-local server defect is confirmed yet. The remaining likely causes are:
+  - a different CLI invocation than the documented smoke path
+  - the Foxtail service not running when the command was issued
+  - a wrapper/environment issue outside this repo checkout
+
+## Pricing FormatVersion Follow-Up
+
+- Updated `GetProducts` so omitted `FormatVersion` now defaults to the only supported schema, `aws_v1`.
+- Kept the explicit rejection for any non-`aws_v1` format value.
+- Added regression coverage for:
+  - omitted `FormatVersion`
+  - explicit invalid `FormatVersion`
+- Verification completed:
+  - `cargo fmt`
+  - `cargo test pricing_get_products`
+  - manual AWS CLI check against a fresh server on `127.0.0.1:18080` without `--format-version`
+- Note: the long-running service on `127.0.0.1:8080` was still serving the old binary during verification, so end-to-end validation used a fresh instance on `127.0.0.1:18080`.

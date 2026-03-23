@@ -4105,7 +4105,11 @@ async fn handle_get_products(body: Bytes) -> std::result::Result<Value, CostUsag
     let req: GetProductsRequest = serde_json::from_slice(&body)
         .map_err(|e| CostUsageError::Validation(format!("Invalid JSON body: {}", e)))?;
 
-    if req.format_version.as_deref() != Some("aws_v1") {
+    if req
+        .format_version
+        .as_deref()
+        .is_some_and(|format_version| format_version != "aws_v1")
+    {
         return Err(CostUsageError::Validation(
             "FormatVersion must be 'aws_v1'.".to_string(),
         ));
@@ -6031,6 +6035,66 @@ mod tests {
         assert_eq!(price_list.len(), 1);
         assert!(price_list[0].as_str().unwrap().contains("AmazonEC2"));
         assert!(price_list[0].as_str().unwrap().contains("m6i.large"));
+    }
+
+    #[tokio::test]
+    async fn pricing_get_products_defaults_missing_format_version_to_aws_v1() {
+        let pool = test_pool().await;
+        let app = build_app(pool);
+        let body = json!({
+            "ServiceCode": "AmazonEC2",
+            "Filters": [{
+                "Type": "TERM_MATCH",
+                "Field": "instanceType",
+                "Value": "m6i.large"
+            }]
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-amz-json-1.1")
+                    .header("x-amz-target", "AWSPriceListService.GetProducts")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["FormatVersion"], "aws_v1");
+        assert_eq!(body["PriceList"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pricing_get_products_rejects_unknown_format_version() {
+        let pool = test_pool().await;
+        let app = build_app(pool);
+        let body = json!({
+            "ServiceCode": "AmazonEC2",
+            "FormatVersion": "aws_v2"
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-amz-json-1.1")
+                    .header("x-amz-target", "AWSPriceListService.GetProducts")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert_eq!(body["__type"], "InvalidParameterException");
+        assert_eq!(body["Message"], "FormatVersion must be 'aws_v1'.");
     }
 
     #[tokio::test]
