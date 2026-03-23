@@ -8,6 +8,21 @@
 - [x] Add focused Rust tests for CloudWatch pagination, dashboard/status routes, and scorecard behavior.
 - [x] Run `cargo fmt`, `cargo test`, and `cargo clippy --all-targets --all-features`, then capture results here.
 
+## Blog Post Draft Work
+
+- [x] Ground the post in the current README, CLI interoperability docs, and wrapper workflow already described in the repo.
+- [x] Write a narrative blog draft covering why Foxtail exists, how the LocalStack-plus-Foxtail workflow works, and when to use it.
+- [x] Save the draft under `docs/` so it can be edited or published from the repo.
+
+## Blog Post Draft Results
+
+- Added a publishable first-pass article at `docs/posts/2026-03-23-why-i-built-foxtail-for-agentic-finops.md`.
+- Framed the post around the problem with static mocked metrics and the decision to keep FinOps agents on AWS CLI-compatible workflows from the start.
+- Covered the two-part architecture explicitly:
+  - the AWS-compatible FinOps mock service
+  - the `foxtail` routing wrapper that sends FinOps commands to the mock service and everything else to LocalStack or AWS
+- Included practical examples, scenario-driven usage, and clear guidance on when Foxtail is the right tool versus when real AWS validation is still required.
+
 ## Review
 
 - User clarified on 2026-03-11 that admin and dashboard auth is intentionally out of scope because this is a local mock service.
