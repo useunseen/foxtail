@@ -1,17 +1,21 @@
-# AWS Mock Data Service
+# Foxtail
 
-Local Rust service that generates and serves AWS-like Cost Explorer and CloudWatch data from SQLite.
+Foxtail is a local Rust service that serves AWS-like FinOps data from SQLite.
 
-## Command Surface
+It is meant for local development, demos, testing, and agent workflows where you want AWS CLI-compatible responses without calling real AWS. It seeds synthetic cost, usage, inventory, pricing, and CloudWatch metric data, then serves that data on `http://127.0.0.1:8080`.
 
-This repo exposes four different command surfaces:
+## What It Provides
 
-1. Local developer commands via `make`
-2. Binary subcommands via `target/debug/aws-mock-data-service`
-3. Standalone wrapper commands via `target/debug/foxtail`
-4. Public AWS-compatible API calls via `aws --endpoint-url ...`
+Foxtail exposes a public AWS-compatible surface for these service areas:
 
-The `/_mock/*` routes are local helper endpoints. They are not public AWS APIs.
+- `ce` for Cost Explorer-style cost, usage, forecast, anomaly, savings, reservation, and rightsizing flows
+- `cloudwatch` for metric discovery and metric queries
+- `resourcegroupstaggingapi` for tagged resource inventory and tag discovery
+- `pricing` for a small mock price catalog
+- `compute-optimizer` for synthetic EC2 and EBS recommendations
+- `cur` for mock Cost and Usage Report definition discovery
+
+It also exposes local helper routes under `/_mock/*` for scenario control, status, and dashboard/debugging data. Those routes are not public AWS APIs.
 
 ## Quick Start
 
@@ -21,15 +25,13 @@ Build the binary and seed baseline data:
 make setup
 ```
 
-Run the service:
+Start the service:
 
 ```bash
 make serve
 ```
 
-The default bind address is `127.0.0.1:8080`.
-
-For AWS CLI calls, set dummy local credentials once:
+Set local AWS CLI credentials once:
 
 ```bash
 export AWS_ACCESS_KEY_ID=test
@@ -38,81 +40,60 @@ export AWS_DEFAULT_REGION=us-east-1
 export AWS_PAGER=""
 ```
 
-## Local Developer Commands
-
-### Make Targets
-
-| Command | Purpose |
-| --- | --- |
-| `make help` | Print available local commands |
-| `make build` | Build the debug binary |
-| `make build-release` | Build the release binary |
-| `make gen` | Discover resources and regenerate `mock_data.db` |
-| `make gen-baseline` | Regenerate data with the baseline scenario |
-| `make gen-spike` | Regenerate data with the spike scenario |
-| `make gen-idle-heavy` | Regenerate data with the idle-heavy scenario |
-| `make serve` | Start the API server on `127.0.0.1:8080` |
-| `make setup` | Build and seed baseline data |
-| `make setup-mock` | Compatibility alias for `make setup` |
-| `make verify-cli-interoperability` | Run the AWS CLI smoke suite against a temporary local server |
-| `make verify-wrapper-routing` | Run routing checks for the `foxtail` wrapper against stub `aws` and `awslocal` binaries |
-
-### Binary Commands
-
-The binary has one global option:
+Then call Foxtail through the AWS CLI:
 
 ```bash
-target/debug/aws-mock-data-service --database-url sqlite:mock_data.db ...
+aws --endpoint-url http://127.0.0.1:8080 ce get-cost-and-usage \
+  --time-period Start=2026-03-01,End=2026-03-11 \
+  --granularity DAILY \
+  --metrics UnblendedCost
 ```
 
-Supported subcommands:
+## Main Ways To Use It
 
-#### `gen`
+### 1. AWS CLI Against Foxtail
 
-Generate or refresh seeded data.
+This is the main service interface:
 
 ```bash
-target/debug/aws-mock-data-service gen \
-  --endpoint-url http://localhost:4566 \
-  --region us-east-1 \
-  --scenario baseline \
-  --prune \
-  --json
+aws --endpoint-url http://127.0.0.1:8080 ...
 ```
 
-Supported flags:
-
-- `--endpoint-url <url>`: source endpoint for discovery, default `http://localhost:4566`
-- `--region <region>`: AWS region, default `us-east-1`
-- `--scenario <baseline|spike|idle-heavy>`: traffic/cost scenario, default `baseline`
-- `--prune`: remove discovered resources that no longer exist
-- `--json`: print a JSON summary of discovered resources
-
-#### `serve`
-
-Start the local API server.
+Common examples:
 
 ```bash
-target/debug/aws-mock-data-service serve --address 127.0.0.1 --port 8080
+aws --endpoint-url http://127.0.0.1:8080 ce get-cost-and-usage \
+  --time-period Start=2026-03-01,End=2026-03-11 \
+  --granularity DAILY \
+  --metrics UnblendedCost \
+  --group-by Type=DIMENSION,Key=SERVICE
 ```
 
-Supported flags:
+```bash
+aws --endpoint-url http://127.0.0.1:8080 cloudwatch list-metrics \
+  --namespace AWS/EC2 \
+  --metric-name CPUUtilization
+```
 
-- `--address <ip-or-host>`: bind address, default `127.0.0.1`
-- `--port <port>`: bind port, default `8080`
+```bash
+aws --endpoint-url http://127.0.0.1:8080 cloudwatch get-metric-statistics \
+  --namespace AWS/EC2 \
+  --metric-name CPUUtilization \
+  --statistics Average \
+  --period 3600 \
+  --start-time 2026-03-11T00:00:00Z \
+  --end-time 2026-03-11T12:00:00Z \
+  --dimensions Name=InstanceId,Value=i-20652c71bedc57ced
+```
 
-### Wrapper Command
+### 2. `foxtail` Wrapper Command
 
-`target/debug/foxtail` is a standalone local wrapper for mixed LocalStack and Foxtail workflows.
+Foxtail also includes a standalone wrapper at `target/debug/foxtail`.
 
-- It delegates to `awslocal` by default.
-- It routes the supported FinOps command set in this repo to Foxtail by invoking `aws --endpoint-url http://127.0.0.1:8080 ...`.
+- Supported FinOps commands are routed to Foxtail through `aws --endpoint-url http://127.0.0.1:8080`
+- Everything else is delegated to `awslocal`
 
 Examples:
-
-```bash
-target/debug/foxtail s3 ls
-```
 
 ```bash
 target/debug/foxtail ce get-cost-and-usage \
@@ -121,14 +102,37 @@ target/debug/foxtail ce get-cost-and-usage \
   --metrics UnblendedCost
 ```
 
-Wrapper-specific flags:
+```bash
+target/debug/foxtail s3 ls
+```
 
-- `--debug-routing`: print the selected backend and effective command
-- `--foxtail-endpoint <url>`: override the routed Foxtail endpoint
-- `--aws-bin <path>`: override the `aws` executable used for routed commands
-- `--awslocal-bin <path>`: override the `awslocal` executable used for passthrough commands
+Useful wrapper flags:
 
-Supported Foxtail-routed commands:
+- `--debug-routing`
+- `--foxtail-endpoint <url>`
+- `--aws-bin <path>`
+- `--awslocal-bin <path>`
+
+### 3. Local Helper Routes
+
+These are for local debugging and control, not AWS parity:
+
+- `GET /_mock/status`
+- `POST /_mock/scenario`
+- `GET /_mock/dashboard/data`
+- `GET /_mock/dashboard/resources`
+- `GET /_mock/dashboard/trends/cloudwatch`
+- `GET /_mock/dashboard/trends/cost`
+
+Example:
+
+```bash
+curl http://127.0.0.1:8080/_mock/status
+```
+
+## Supported AWS-Compatible Commands
+
+### Cost Explorer
 
 - `ce get-cost-and-usage`
 - `ce get-cost-and-usage-with-resources`
@@ -144,295 +148,89 @@ Supported Foxtail-routed commands:
 - `ce get-anomalies`
 - `ce get-anomaly-monitors`
 - `ce get-anomaly-subscriptions`
-- `resourcegroupstaggingapi get-resources`
-- `resourcegroupstaggingapi get-tag-keys`
-- `resourcegroupstaggingapi get-tag-values`
-- `pricing get-products`
-- `compute-optimizer get-ec2-instance-recommendations`
-- `compute-optimizer get-ebs-volume-recommendations`
-- `cur describe-report-definitions`
+
+Notes:
+
+- Cost Explorer targets accept both `AWSCostExplorer.*` and `AWSInsightsIndexService.*`
+- `get-cost-and-usage-with-resources` defaults to resource grouping in this mock
+- reservation, savings plan, anomaly, and rightsizing operations return synthetic mock outputs
+
+### CloudWatch
+
 - `cloudwatch list-metrics`
 - `cloudwatch get-metric-statistics`
 - `cloudwatch get-metric-data`
 
-## Public AWS-Compatible Commands
+Notes:
 
-All public AWS-compatible calls are served from `POST /`.
-
-Use the local endpoint like this:
-
-```bash
-aws --endpoint-url http://127.0.0.1:8080 ...
-```
-
-### Cost Explorer
-
-The service accepts the Cost Explorer operations below. For compatibility with different clients, both `AWSCostExplorer.*` and `AWSInsightsIndexService.*` targets are supported internally.
-
-| AWS CLI command | Purpose | Notes |
-| --- | --- | --- |
-| `ce get-cost-and-usage` | Cost totals and grouped cost breakdowns | Supports `--group-by` for seeded dimensions such as `SERVICE` |
-| `ce get-cost-and-usage-with-resources` | Resource-level cost breakdowns | Defaults to `RESOURCE_ID` grouping in this mock; the AWS CLI still requires `--filter` |
-| `ce get-cost-forecast` | Forecasted spend over a time period | Requires `--granularity` |
-| `ce get-usage-forecast` | Forecasted usage quantity over a time period | Supports `USAGE_QUANTITY` and `NORMALIZED_USAGE_AMOUNT` |
-| `ce get-dimension-values` | Discover valid dimension values | Useful for `SERVICE`, `RESOURCE_ID`, `REGION` |
-| `ce get-tags` | Discover distinct tag values | Backed by `resources.tags` |
-| `ce get-reservation-coverage` | Mock RI coverage view | Seeded synthetic output |
-| `ce get-reservation-utilization` | Mock RI utilization view | Seeded synthetic output |
-| `ce get-savings-plans-coverage` | Mock Savings Plans coverage view | Seeded synthetic output |
-| `ce get-savings-plans-utilization` | Mock Savings Plans utilization view | Seeded synthetic output |
-| `ce get-rightsizing-recommendation` | Mock rightsizing recommendation output | Seeded synthetic output |
-| `ce get-anomalies` | Mock anomaly detection output | Seeded synthetic output |
-| `ce get-anomaly-monitors` | Mock anomaly monitor list | Seeded synthetic output |
-| `ce get-anomaly-subscriptions` | Mock anomaly subscription list | Seeded synthetic output |
-
-Example:
-
-```bash
-aws --endpoint-url http://127.0.0.1:8080 ce get-cost-and-usage \
-  --time-period Start=2026-03-01,End=2026-03-11 \
-  --granularity DAILY \
-  --metrics UnblendedCost \
-  --group-by Type=DIMENSION,Key=SERVICE
-```
-
-```bash
-aws --endpoint-url http://127.0.0.1:8080 ce get-usage-forecast \
-  --time-period Start=2026-03-01,End=2026-03-11 \
-  --metric USAGE_QUANTITY \
-  --granularity DAILY
-```
+- AWS CLI `cloudwatch ...` uses the Query/XML path
+- direct `x-amz-target: GraniteServiceVersion20100801.GetMetricData` uses the JSON path
+- `get-metric-data` supports up to 50 queries on both paths
+- `get-metric-data` preserves query ids, aligns timestamps and values, and paginates deterministically
+- supported stats are `Average`, `Sum`, `Minimum`, and `Maximum`
 
 ### Resource Groups Tagging API
-
-Supported:
 
 - `resourcegroupstaggingapi get-resources`
 - `resourcegroupstaggingapi get-tag-keys`
 - `resourcegroupstaggingapi get-tag-values`
 
-Example:
-
-```bash
-aws --endpoint-url http://127.0.0.1:8080 resourcegroupstaggingapi get-resources \
-  --resources-per-page 5
-```
-
-```bash
-aws --endpoint-url http://127.0.0.1:8080 resourcegroupstaggingapi get-tag-keys
-```
-
-```bash
-aws --endpoint-url http://127.0.0.1:8080 resourcegroupstaggingapi get-tag-values \
-  --key Name
-```
-
 ### Pricing
-
-Supported:
 
 - `pricing get-products`
 
-The mock catalog now includes multiple EC2 instance sizes, one EC2 gp3 storage SKU, two RDS SKUs, two S3 storage tiers, and both ALB and NLB hourly products. `TERM_MATCH` filters work against fields such as `instanceType`, `volumeType`, `databaseEngine`, `storageClass`, `loadBalancerType`, and `location`.
+Notes:
 
-Example:
-
-```bash
-aws --endpoint-url http://127.0.0.1:8080 pricing get-products \
-  --service-code AmazonEC2 \
-  --format-version aws_v1 \
-  --filters Type=TERM_MATCH,Field=instanceType,Value=m6i.large
-```
-
-```bash
-aws --endpoint-url http://127.0.0.1:8080 pricing get-products \
-  --service-code AmazonEC2 \
-  --format-version aws_v1 \
-  --filters Type=TERM_MATCH,Field=volumeType,Value=gp3
-```
+- the mock catalog includes EC2, RDS, S3, and ELB examples
+- `TERM_MATCH` filters work for common fields such as `instanceType`, `volumeType`, `databaseEngine`, `storageClass`, `loadBalancerType`, and `location`
 
 ### Compute Optimizer
-
-Supported:
 
 - `compute-optimizer get-ec2-instance-recommendations`
 - `compute-optimizer get-ebs-volume-recommendations`
 
-These are mock recommendation surfaces derived from the seeded EC2 utilization and disk activity metrics.
+These recommendations are derived from the seeded EC2 CPU and disk activity metrics.
 
-```bash
-aws --endpoint-url http://127.0.0.1:8080 compute-optimizer get-ec2-instance-recommendations
-```
-
-```bash
-aws --endpoint-url http://127.0.0.1:8080 compute-optimizer get-ebs-volume-recommendations
-```
-
-### Cost And Usage Reports
-
-Supported:
+### Cost and Usage Reports
 
 - `cur describe-report-definitions`
 
-```bash
-aws --endpoint-url http://127.0.0.1:8080 cur describe-report-definitions
-```
+## Data Model and Scenarios
 
-### CloudWatch
+Foxtail generates synthetic data for a few practical scenarios:
 
-CloudWatch support is split by protocol:
+- `baseline`
+- `spike`
+- `idle-heavy`
 
-- `aws cloudwatch ...` uses the Query/XML path
-- direct `x-amz-target: GraniteServiceVersion20100801.GetMetricData` uses the JSON path
-
-| AWS CLI command | Purpose | Protocol | Notes |
-| --- | --- | --- | --- |
-| `cloudwatch list-metrics` | Discover available metric definitions | Query/XML | Use this first when the scenario changes |
-| `cloudwatch get-metric-statistics` | Return a single aggregated time series | Query/XML | Best simple path for one resource/metric pair |
-| `cloudwatch get-metric-data` | Return one or more aggregated time series | Query/XML or JSON | Supports up to 50 queries on both the AWS CLI Query/XML path and the JSON target path |
-
-#### `cloudwatch list-metrics`
-
-Use this to discover which metrics exist for the current seeded scenario. It does not return datapoints.
+You can regenerate the database for a specific scenario:
 
 ```bash
-aws --endpoint-url http://127.0.0.1:8080 cloudwatch list-metrics \
-  --namespace AWS/EC2 \
-  --metric-name CPUUtilization
+make gen-baseline
+make gen-spike
+make gen-idle-heavy
 ```
 
-#### `cloudwatch get-metric-statistics`
-
-Use this for one metric and one resource when you want a straightforward aggregated time series.
+Or mutate the current seeded dataset in place:
 
 ```bash
-aws --endpoint-url http://127.0.0.1:8080 cloudwatch get-metric-statistics \
-  --namespace AWS/EC2 \
-  --metric-name CPUUtilization \
-  --statistics Average \
-  --period 3600 \
-  --start-time 2026-03-11T00:00:00Z \
-  --end-time 2026-03-11T12:00:00Z \
-  --dimensions Name=InstanceId,Value=i-20652c71bedc57ced
+curl -sS -X POST http://127.0.0.1:8080/_mock/scenario \
+  -H 'content-type: application/json' \
+  -d '{"scenario":"Spike"}'
 ```
 
-#### `cloudwatch get-metric-data`
+If `AWS_MOCK_ADMIN_TOKEN` is set, callers must also send `x-mock-admin-token`.
 
-Use this when you want one or more query-defined metric series in one response. The CLI query JSON is a request payload, not a cached metrics dump.
+## Suggested Usage Flow
 
-Example request file:
-
-```json
-[
-  {
-    "Id": "cpu",
-    "MetricStat": {
-      "Metric": {
-        "Namespace": "AWS/EC2",
-        "MetricName": "CPUUtilization",
-        "Dimensions": [
-          {
-            "Name": "InstanceId",
-            "Value": "i-20652c71bedc57ced"
-          }
-        ]
-      },
-      "Period": 3600,
-      "Stat": "Average"
-    }
-  }
-]
-```
-
-Example AWS CLI call:
-
-```bash
-aws --endpoint-url http://127.0.0.1:8080 cloudwatch get-metric-data \
-  --metric-data-queries file:///tmp/metric_queries.json \
-  --start-time 2026-03-11T00:00:00Z \
-  --end-time 2026-03-11T12:00:00Z
-```
-
-Current `get-metric-data` behavior:
-
-- Preserves the caller query id in the response
-- Buckets timestamps cleanly by `MetricStat.Period`
-- Supports `Average`, `Sum`, `Minimum`, and `Maximum`
-- Keeps timestamp and value arrays aligned
-- Paginates deterministically
-- Supports up to 50 queries on both the JSON target path and the AWS CLI Query/XML path
-
-## Local Helper Endpoints
-
-These are local helper routes for debugging, dashboards, and scenario control. They are not part of the public AWS-compatible surface.
-
-### `GET /_mock/status`
-
-Returns service health and seed counts.
-
-Example:
-
-```bash
-curl http://127.0.0.1:8080/_mock/status
-```
-
-### `POST /_mock/scenario`
-
-Applies a scenario mutation to the current dataset.
-
-Request body:
-
-```json
-{
-  "scenario": "Baseline",
-  "resource_id": "i-20652c71bedc57ced"
-}
-```
-
-Fields:
-
-- `scenario`: one of `Baseline`, `Spike`, `IdleHeavy`
-- `resource_id`: optional, scope the scenario change to one resource
-
-If `AWS_MOCK_ADMIN_TOKEN` is set in the environment, callers must also send `x-mock-admin-token`.
-
-### Dashboard Routes
-
-These routes share the same optional query parameters:
-
-- `scope=aggregate|service|resource`
-- `resource_type=<type>`
-- `resource_id=<id>`
-- `namespace=<metric-namespace>`
-- `metric_name=<metric-name>`
-- `top_n=<count>`
-- `window_hours=<hours>`
-
-Supported dashboard routes:
-
-| Method and path | Purpose |
-| --- | --- |
-| `GET /_mock/dashboard/data` | Full dashboard payload, including supported API metadata |
-| `GET /_mock/dashboard/resources` | Resource catalog, top-cost resources, and low-utilization candidates |
-| `GET /_mock/dashboard/trends/cloudwatch` | Aggregated CloudWatch trend series |
-| `GET /_mock/dashboard/trends/cost` | Aggregated cost trend series |
-
-Example:
-
-```bash
-curl "http://127.0.0.1:8080/_mock/dashboard/resources?scope=resource&top_n=5"
-```
-
-## Discovery Workflow
-
-If the scenario changes, do not rely on remembered resource ids.
+If you change scenarios, do not assume resource ids stayed the same.
 
 Use this flow:
 
-1. Seed or switch a scenario.
-2. Discover available services or resources with `ce get-dimension-values`.
-3. Discover available metrics with `cloudwatch list-metrics`.
-4. Use the returned ids and metric definitions in `get-metric-statistics` or `get-metric-data`.
+1. Seed or switch a scenario
+2. Discover resources with `ce get-dimension-values` or `resourcegroupstaggingapi get-resources`
+3. Discover metrics with `cloudwatch list-metrics`
+4. Query the returned ids with `cloudwatch get-metric-statistics` or `cloudwatch get-metric-data`
 
 Example:
 
@@ -449,18 +247,78 @@ aws --endpoint-url http://127.0.0.1:8080 cloudwatch list-metrics \
   --metric-name CPUUtilization
 ```
 
+## Developer Commands
+
+### Make Targets
+
+| Command | Purpose |
+| --- | --- |
+| `make help` | Show local commands |
+| `make build` | Build the debug binary |
+| `make build-release` | Build the release binary |
+| `make gen` | Discover resources and regenerate `mock_data.db` |
+| `make gen-baseline` | Seed baseline scenario |
+| `make gen-spike` | Seed spike scenario |
+| `make gen-idle-heavy` | Seed idle-heavy scenario |
+| `make serve` | Start the local API server |
+| `make setup` | Build and seed baseline data |
+| `make setup-mock` | Alias for `make setup` |
+| `make verify-cli-interoperability` | Run the AWS CLI smoke suite |
+| `make verify-wrapper-routing` | Verify wrapper routing with stub executables |
+
+### Binary Commands
+
+Main service binary:
+
+```bash
+target/debug/aws-mock-data-service --database-url sqlite:mock_data.db ...
+```
+
+Subcommands:
+
+- `gen`
+- `serve`
+
+Examples:
+
+```bash
+target/debug/aws-mock-data-service gen \
+  --endpoint-url http://localhost:4566 \
+  --region us-east-1 \
+  --scenario baseline \
+  --prune \
+  --json
+```
+
+```bash
+target/debug/aws-mock-data-service serve --address 127.0.0.1 --port 8080
+```
+
 ## Verification
 
 Core local checks:
 
 ```bash
-cargo fmt
+cargo fmt --all
 cargo test
 cargo clippy --all-targets --all-features
 ```
 
-Full CLI smoke verification:
+Smoke checks:
 
 ```bash
 make verify-cli-interoperability
+make verify-wrapper-routing
 ```
+
+## Configuration
+
+Useful environment variables:
+
+- `DATABASE_URL`
+- `AWS_ENDPOINT_URL`
+- `AWS_DEFAULT_REGION`
+- `AWS_MOCK_ADMIN_TOKEN`
+- `FOXTAIL_ENDPOINT_URL`
+- `FOXTAIL_AWS_BIN`
+- `FOXTAIL_AWSLOCAL_BIN`
