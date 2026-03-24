@@ -23,6 +23,16 @@
   - the `foxtail` routing wrapper that sends FinOps commands to the mock service and everything else to LocalStack or AWS
 - Included practical examples, scenario-driven usage, and clear guidance on when Foxtail is the right tool versus when real AWS validation is still required.
 
+## Blog Post Medium Formatting Work
+
+- [x] Reformat the published draft for Medium-style readability without changing the article wording.
+- [x] Use only structural presentation changes such as headings, spacing, and pull-quote treatment.
+
+## Blog Post Medium Formatting Results
+
+- Reformatted `docs/posts/2026-03-23-why-i-built-foxtail-for-agentic-finops.md` for Medium-style scannability while keeping the article text intact.
+- Promoted existing transition lines into section headings and turned the key problem statement into a pull quote.
+
 ## Review
 
 - User clarified on 2026-03-11 that admin and dashboard auth is intentionally out of scope because this is a local mock service.
