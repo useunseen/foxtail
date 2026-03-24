@@ -363,6 +363,61 @@ enum MetricDataError {
     Internal(anyhow::Error),
 }
 
+enum MetricStatisticsError {
+    Validation(String),
+    Internal(anyhow::Error),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StandardStatistic {
+    SampleCount,
+    Average,
+    Sum,
+    Minimum,
+    Maximum,
+}
+
+impl StandardStatistic {
+    fn parse_metric_data_stat(value: &str) -> std::result::Result<Self, MetricDataError> {
+        match value.to_ascii_lowercase().as_str() {
+            "average" => Ok(Self::Average),
+            "sum" => Ok(Self::Sum),
+            "minimum" => Ok(Self::Minimum),
+            "maximum" => Ok(Self::Maximum),
+            _ => Err(MetricDataError::Validation(format!(
+                "Unsupported MetricStat.Stat '{}'.",
+                value
+            ))),
+        }
+    }
+
+    fn parse_metric_statistics_stat(
+        value: &str,
+    ) -> std::result::Result<Self, MetricStatisticsError> {
+        match value.to_ascii_lowercase().as_str() {
+            "samplecount" => Ok(Self::SampleCount),
+            "average" => Ok(Self::Average),
+            "sum" => Ok(Self::Sum),
+            "minimum" => Ok(Self::Minimum),
+            "maximum" => Ok(Self::Maximum),
+            _ => Err(MetricStatisticsError::Validation(format!(
+                "Unsupported Statistics value '{}'.",
+                value
+            ))),
+        }
+    }
+
+    fn value(self, point: &AggregatedMetricPoint) -> f64 {
+        match self {
+            Self::SampleCount => point.sample_count,
+            Self::Average => point.average,
+            Self::Sum => point.sum,
+            Self::Minimum => point.minimum,
+            Self::Maximum => point.maximum,
+        }
+    }
+}
+
 #[derive(Default, Clone)]
 struct CeFilterCriteria {
     services: Option<BTreeSet<String>>,
@@ -438,6 +493,26 @@ struct MetricDataSeriesRequest {
     start_time: DateTime<Utc>,
     end_time: DateTime<Utc>,
     injected_now: Option<DateTime<Utc>>,
+}
+
+struct GetMetricStatisticsRequest {
+    namespace: String,
+    metric_name: String,
+    start_time: DateTime<Utc>,
+    end_time: DateTime<Utc>,
+    period: i64,
+    resource_id: Option<String>,
+    statistics: Vec<StandardStatistic>,
+}
+
+#[derive(Clone, Copy)]
+struct AggregatedMetricPoint {
+    timestamp: DateTime<Utc>,
+    sample_count: f64,
+    average: f64,
+    sum: f64,
+    minimum: f64,
+    maximum: f64,
 }
 
 #[derive(Serialize)]
@@ -886,6 +961,88 @@ fn extract_resource_id_from_query(query: &CloudWatchQuery) -> Option<String> {
     None
 }
 
+fn parse_get_metric_statistics_request_from_form(
+    query: &CloudWatchQuery,
+    body: &[u8],
+) -> std::result::Result<GetMetricStatisticsRequest, MetricStatisticsError> {
+    let pairs: Vec<(String, String)> = serde_urlencoded::from_bytes(body)
+        .map_err(|e| MetricStatisticsError::Validation(format!("Failed to parse body: {}", e)))?;
+    let mut statistics = BTreeMap::new();
+    let mut extended_statistics = BTreeMap::new();
+
+    for (key, value) in pairs {
+        let parts = key.split('.').collect::<Vec<_>>();
+        match parts.as_slice() {
+            ["Statistics", "member", index] => {
+                let index = index.parse::<usize>().map_err(|_| {
+                    MetricStatisticsError::Validation(format!(
+                        "Invalid Statistics member index in '{}'.",
+                        key
+                    ))
+                })?;
+                statistics.insert(index, value);
+            }
+            ["ExtendedStatistics", "member", index] => {
+                let index = index.parse::<usize>().map_err(|_| {
+                    MetricStatisticsError::Validation(format!(
+                        "Invalid ExtendedStatistics member index in '{}'.",
+                        key
+                    ))
+                })?;
+                extended_statistics.insert(index, value);
+            }
+            _ => {}
+        }
+    }
+
+    if statistics.is_empty() && extended_statistics.is_empty() {
+        return Err(MetricStatisticsError::Validation(
+            "GetMetricStatistics requires Statistics.member.N or ExtendedStatistics.member.N."
+                .to_string(),
+        ));
+    }
+    if !statistics.is_empty() && !extended_statistics.is_empty() {
+        return Err(MetricStatisticsError::Validation(
+            "GetMetricStatistics does not allow both Statistics and ExtendedStatistics."
+                .to_string(),
+        ));
+    }
+    if !extended_statistics.is_empty() {
+        return Err(MetricStatisticsError::Validation(
+            "ExtendedStatistics are not supported.".to_string(),
+        ));
+    }
+
+    let namespace = query.namespace.clone().ok_or_else(|| {
+        MetricStatisticsError::Validation("Missing required field 'Namespace'.".to_string())
+    })?;
+    let metric_name = query.metric_name.clone().ok_or_else(|| {
+        MetricStatisticsError::Validation("Missing required field 'MetricName'.".to_string())
+    })?;
+    let start_time = parse_rfc3339_required("StartTime", query.start_time.as_deref())
+        .map_err(MetricStatisticsError::Validation)?;
+    let end_time = parse_rfc3339_required("EndTime", query.end_time.as_deref())
+        .map_err(MetricStatisticsError::Validation)?;
+    let period = query.period.ok_or_else(|| {
+        MetricStatisticsError::Validation("Missing required field 'Period'.".to_string())
+    })? as i64;
+
+    let statistics = statistics
+        .into_values()
+        .map(|value| StandardStatistic::parse_metric_statistics_stat(&value))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    Ok(GetMetricStatisticsRequest {
+        namespace,
+        metric_name,
+        start_time,
+        end_time,
+        period,
+        resource_id: extract_resource_id_from_query(query),
+        statistics,
+    })
+}
+
 fn parse_metric_data_queries_from_form(
     body: &[u8],
 ) -> std::result::Result<Vec<GetMetricDataQuery>, MetricDataError> {
@@ -1138,12 +1295,13 @@ async fn build_metric_data_series(
     .await
     .map_err(MetricDataError::Internal)?;
 
+    let stat = StandardStatistic::parse_metric_data_stat(&request.stat)?;
     let aggregated = aggregate_metric_points(
         &points,
         request.start_time,
         request.end_time,
         request.period,
-        &request.stat,
+        stat,
     )?;
 
     Ok(MetricDataSeries {
@@ -1939,25 +2097,16 @@ fn extract_resource_id_from_dimensions(
     })
 }
 
-fn aggregate_metric_points(
+fn aggregate_metric_buckets(
     points: &[metrics::MetricPoint],
     start_time: DateTime<Utc>,
     end_time: DateTime<Utc>,
     period_seconds: i64,
-    stat: &str,
-) -> std::result::Result<Vec<metrics::MetricPoint>, MetricDataError> {
+) -> std::result::Result<Vec<AggregatedMetricPoint>, MetricDataError> {
     if period_seconds <= 0 {
         return Err(MetricDataError::Validation(
             "MetricStat.Period must be greater than 0.".to_string(),
         ));
-    }
-
-    let stat_key = stat.to_ascii_lowercase();
-    if !matches!(stat_key.as_str(), "average" | "sum" | "minimum" | "maximum") {
-        return Err(MetricDataError::Validation(format!(
-            "Unsupported MetricStat.Stat '{}'.",
-            stat
-        )));
     }
 
     let mut buckets: BTreeMap<i64, Vec<f64>> = BTreeMap::new();
@@ -1977,22 +2126,45 @@ fn aggregate_metric_points(
         .into_iter()
         .map(|(bucket_index, values)| {
             let timestamp = start_time + chrono::Duration::seconds(bucket_index * period_seconds);
-            let value = match stat_key.as_str() {
-                "average" => values.iter().sum::<f64>() / values.len() as f64,
-                "sum" => values.iter().sum::<f64>(),
-                "minimum" => values
-                    .iter()
-                    .copied()
-                    .fold(f64::INFINITY, |acc, value| acc.min(value)),
-                "maximum" => values
-                    .iter()
-                    .copied()
-                    .fold(f64::NEG_INFINITY, |acc, value| acc.max(value)),
-                _ => unreachable!("validated above"),
-            };
-            metrics::MetricPoint { value, timestamp }
+            let sample_count = values.len() as f64;
+            let sum = values.iter().sum::<f64>();
+            let minimum = values
+                .iter()
+                .copied()
+                .fold(f64::INFINITY, |acc, value| acc.min(value));
+            let maximum = values
+                .iter()
+                .copied()
+                .fold(f64::NEG_INFINITY, |acc, value| acc.max(value));
+            let average = sum / sample_count;
+            AggregatedMetricPoint {
+                timestamp,
+                sample_count,
+                average,
+                sum,
+                minimum,
+                maximum,
+            }
         })
         .collect())
+}
+
+fn aggregate_metric_points(
+    points: &[metrics::MetricPoint],
+    start_time: DateTime<Utc>,
+    end_time: DateTime<Utc>,
+    period_seconds: i64,
+    stat: StandardStatistic,
+) -> std::result::Result<Vec<metrics::MetricPoint>, MetricDataError> {
+    Ok(
+        aggregate_metric_buckets(points, start_time, end_time, period_seconds)?
+            .into_iter()
+            .map(|point| metrics::MetricPoint {
+                value: stat.value(&point),
+                timestamp: point.timestamp,
+            })
+            .collect(),
+    )
 }
 
 fn ensure_admin_authorized(
@@ -4874,11 +5046,17 @@ async fn handle_cloudwatch_query(
                     StatusCode::BAD_REQUEST,
                 );
             }
-            match handle_get_metric_statistics(pool, query, injected_now).await {
+            match handle_get_metric_statistics(pool, query, &body, injected_now).await {
                 Ok(xml) => {
                     (StatusCode::OK, [(header::CONTENT_TYPE, "text/xml")], xml).into_response()
                 }
-                Err(e) => error_response(
+                Err(MetricStatisticsError::Validation(message)) => error_response(
+                    protocol,
+                    "InvalidParameterValueException",
+                    &message,
+                    StatusCode::BAD_REQUEST,
+                ),
+                Err(MetricStatisticsError::Internal(e)) => error_response(
                     protocol,
                     "InternalFailure",
                     &e.to_string(),
@@ -5085,55 +5263,78 @@ async fn handle_get_metric_data_xml(
 async fn handle_get_metric_statistics(
     pool: SqlitePool,
     query: CloudWatchQuery,
+    body: &Bytes,
     injected_now: Option<DateTime<Utc>>,
-) -> Result<String> {
+) -> std::result::Result<String, MetricStatisticsError> {
+    let request = parse_get_metric_statistics_request_from_form(&query, body)?;
+    let GetMetricStatisticsRequest {
+        namespace,
+        metric_name,
+        start_time,
+        end_time,
+        period,
+        resource_id,
+        statistics,
+    } = request;
     let metric_unit =
-        cloudwatch_metric_unit(query.namespace.as_deref(), query.metric_name.as_deref())
-            .to_string();
+        cloudwatch_metric_unit(Some(namespace.as_str()), Some(metric_name.as_str())).to_string();
 
     let params = MetricQueryParams {
-        resource_id: extract_resource_id_from_query(&query),
-        metric_name: query.metric_name.clone(),
-        namespace: query.namespace,
-        start_time: query.start_time.and_then(|s| {
-            DateTime::parse_from_rfc3339(&s)
-                .ok()
-                .map(|t| t.with_timezone(&Utc))
-        }),
-        end_time: query.end_time.and_then(|s| {
-            DateTime::parse_from_rfc3339(&s)
-                .ok()
-                .map(|t| t.with_timezone(&Utc))
-        }),
-        limit: Some(100),
+        resource_id,
+        metric_name: Some(metric_name.clone()),
+        namespace: Some(namespace),
+        start_time: Some(start_time),
+        end_time: Some(end_time),
+        limit: Some(10_000),
         injected_now,
     };
 
-    let points = metrics::query_metrics(&pool, params).await?;
+    let points = metrics::query_metrics(&pool, params)
+        .await
+        .map_err(MetricStatisticsError::Internal)?;
+    let aggregated =
+        aggregate_metric_buckets(&points, start_time, end_time, period).map_err(|e| match e {
+            MetricDataError::Validation(message) | MetricDataError::InvalidNextToken(message) => {
+                MetricStatisticsError::Validation(message)
+            }
+            MetricDataError::Internal(err) => MetricStatisticsError::Internal(err),
+        })?;
 
     let response = cw::GetMetricStatisticsResponse {
         xmlns: "http://monitoring.amazonaws.com/doc/2010-08-01/".to_string(),
         result: cw::GetMetricStatisticsResult {
             datapoints: cw::Datapoints {
-                members: points
+                members: aggregated
                     .into_iter()
-                    .map(|p| cw::Datapoint {
-                        timestamp: p.timestamp.to_rfc3339(),
-                        average: p.value,
+                    .map(|point| cw::Datapoint {
+                        timestamp: point.timestamp.to_rfc3339(),
+                        sample_count: statistics
+                            .contains(&StandardStatistic::SampleCount)
+                            .then_some(point.sample_count),
+                        average: statistics
+                            .contains(&StandardStatistic::Average)
+                            .then_some(point.average),
+                        sum: statistics
+                            .contains(&StandardStatistic::Sum)
+                            .then_some(point.sum),
+                        minimum: statistics
+                            .contains(&StandardStatistic::Minimum)
+                            .then_some(point.minimum),
+                        maximum: statistics
+                            .contains(&StandardStatistic::Maximum)
+                            .then_some(point.maximum),
                         unit: metric_unit.clone(),
                     })
                     .collect(),
             },
-            label: query
-                .metric_name
-                .unwrap_or_else(|| "CPUUtilization".to_string()),
+            label: metric_name,
         },
         metadata: cw::ResponseMetadata {
             request_id: "mock-id".to_string(),
         },
     };
 
-    cw::to_xml(&response)
+    cw::to_xml(&response).map_err(MetricStatisticsError::Internal)
 }
 
 // --- CloudWatch JSON ---
@@ -5277,6 +5478,14 @@ mod tests {
             .await
             .expect("response body should read");
         serde_json::from_slice(&body).expect("response body should be valid JSON")
+    }
+
+    fn xml_tag_value(xml: &str, tag: &str) -> Option<String> {
+        let start_tag = format!("<{}>", tag);
+        let end_tag = format!("</{}>", tag);
+        let (_, rest) = xml.split_once(&start_tag)?;
+        let (value, _) = rest.split_once(&end_tag)?;
+        Some(value.to_string())
     }
 
     #[tokio::test]
@@ -6417,7 +6626,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cloudwatch_query_xml_returns_metric_statistics() {
+    async fn cloudwatch_query_xml_returns_requested_standard_statistics() {
         let pool = test_pool().await;
         sqlx::query(
             "INSERT INTO resources (id, resource_type, region, scenario, tags)
@@ -6426,16 +6635,20 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::query(
-            "INSERT INTO metrics (resource_id, namespace, metric_name, seconds_from_now, value)
-             VALUES ('i-test', 'AWS/EC2', 'CPUUtilization', -3600, 12.0)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        for (offset, value) in [(-3590, 10.0), (-3500, 20.0), (-3400, 30.0)] {
+            sqlx::query(
+                "INSERT INTO metrics (resource_id, namespace, metric_name, seconds_from_now, value)
+                 VALUES ('i-test', 'AWS/EC2', 'CPUUtilization', ?, ?)",
+            )
+            .bind(offset)
+            .bind(value)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
 
         let app = build_app(pool);
-        let form = "Action=GetMetricStatistics&Namespace=AWS%2FEC2&MetricName=CPUUtilization&StartTime=2026-03-11T11%3A00%3A00Z&EndTime=2026-03-11T12%3A00%3A00Z&Period=60&Dimensions.member.1.Name=InstanceId&Dimensions.member.1.Value=i-test";
+        let form = "Action=GetMetricStatistics&Namespace=AWS%2FEC2&MetricName=CPUUtilization&StartTime=2026-03-11T11%3A00%3A00Z&EndTime=2026-03-11T12%3A00%3A00Z&Period=3600&Statistics.member.1=SampleCount&Statistics.member.2=Average&Statistics.member.3=Sum&Statistics.member.4=Minimum&Statistics.member.5=Maximum&Dimensions.member.1.Name=InstanceId&Dimensions.member.1.Value=i-test";
 
         let response = app
             .oneshot(
@@ -6455,6 +6668,118 @@ mod tests {
         let xml = String::from_utf8(body.to_vec()).unwrap();
         assert!(xml.contains("GetMetricStatisticsResponse"));
         assert!(xml.contains("CPUUtilization"));
+        assert!(xml.contains("2026-03-11T11:00:00+00:00"));
+        assert_eq!(
+            xml_tag_value(&xml, "SampleCount")
+                .unwrap()
+                .parse::<f64>()
+                .unwrap(),
+            3.0
+        );
+        assert_eq!(
+            xml_tag_value(&xml, "Average")
+                .unwrap()
+                .parse::<f64>()
+                .unwrap(),
+            20.0
+        );
+        assert_eq!(
+            xml_tag_value(&xml, "Sum").unwrap().parse::<f64>().unwrap(),
+            60.0
+        );
+        assert_eq!(
+            xml_tag_value(&xml, "Minimum")
+                .unwrap()
+                .parse::<f64>()
+                .unwrap(),
+            10.0
+        );
+        assert_eq!(
+            xml_tag_value(&xml, "Maximum")
+                .unwrap()
+                .parse::<f64>()
+                .unwrap(),
+            30.0
+        );
+    }
+
+    #[tokio::test]
+    async fn cloudwatch_query_xml_metric_statistics_requires_statistics() {
+        let pool = test_pool().await;
+        let app = build_app(pool);
+        let form = "Action=GetMetricStatistics&Namespace=AWS%2FEC2&MetricName=CPUUtilization&StartTime=2026-03-11T11%3A00%3A00Z&EndTime=2026-03-11T12%3A00%3A00Z&Period=3600";
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header("x-mock-now", "2026-03-11T12:00:00Z")
+                    .body(Body::from(form))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let xml = String::from_utf8(body.to_vec()).unwrap();
+        assert!(xml.contains(
+            "GetMetricStatistics requires Statistics.member.N or ExtendedStatistics.member.N."
+        ));
+    }
+
+    #[tokio::test]
+    async fn cloudwatch_query_xml_metric_statistics_rejects_mixed_stat_inputs() {
+        let pool = test_pool().await;
+        let app = build_app(pool);
+        let form = "Action=GetMetricStatistics&Namespace=AWS%2FEC2&MetricName=CPUUtilization&StartTime=2026-03-11T11%3A00%3A00Z&EndTime=2026-03-11T12%3A00%3A00Z&Period=3600&Statistics.member.1=Average&ExtendedStatistics.member.1=p99";
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header("x-mock-now", "2026-03-11T12:00:00Z")
+                    .body(Body::from(form))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let xml = String::from_utf8(body.to_vec()).unwrap();
+        assert!(xml.contains(
+            "GetMetricStatistics does not allow both Statistics and ExtendedStatistics."
+        ));
+    }
+
+    #[tokio::test]
+    async fn cloudwatch_query_xml_metric_statistics_rejects_unsupported_statistic() {
+        let pool = test_pool().await;
+        let app = build_app(pool);
+        let form = "Action=GetMetricStatistics&Namespace=AWS%2FEC2&MetricName=CPUUtilization&StartTime=2026-03-11T11%3A00%3A00Z&EndTime=2026-03-11T12%3A00%3A00Z&Period=3600&Statistics.member.1=Median";
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header("x-mock-now", "2026-03-11T12:00:00Z")
+                    .body(Body::from(form))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let xml = String::from_utf8(body.to_vec()).unwrap();
+        assert!(xml.contains("Unsupported Statistics value 'Median'."));
     }
 
     #[tokio::test]

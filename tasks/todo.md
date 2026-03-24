@@ -1,5 +1,24 @@
 # Review Follow-Up Plan
 
+## Current Execution Focus
+
+- [x] Add typed Query/XML parsing for `GetMetricStatistics` standard statistics and validation rules.
+- [x] Rework CloudWatch metric-statistics aggregation so one period bucket can emit `SampleCount`, `Average`, `Sum`, `Minimum`, and `Maximum`.
+- [x] Update the XML response model plus route tests, CLI smoke checks, and README notes for the expanded standard-statistics support.
+- [x] Run `cargo fmt`, `cargo test`, and `cargo clippy --all-targets --all-features`, then record results here.
+
+## Current Execution Results
+
+- `GetMetricStatistics` now parses `Statistics.member.N`, rejects mixed or unsupported stat inputs, and returns the full standard statistics set on the Query/XML path: `SampleCount`, `Average`, `Sum`, `Minimum`, and `Maximum`.
+- CloudWatch period bucketing now computes shared aggregate bucket data once and reuses it for both `GetMetricStatistics` and the existing `GetMetricData` stat selection path.
+- XML datapoints now emit only the requested statistic fields, which restores CLI-visible `Maximum` for `CPUUtilization` and adds explicit `SampleCount`, `Sum`, and `Minimum` support.
+- Added route coverage for standard-stat aggregation and validation failures, extended the CLI smoke script with multi-stat `CPUUtilization` assertions, and updated the README CloudWatch contract notes.
+- Verification completed successfully:
+  - `cargo fmt`
+  - `cargo test`
+  - `cargo clippy --all-targets --all-features`
+  - `bash scripts/verify_cli_interop.sh`
+
 - [x] Re-scope review follow-up to exclude admin/dashboard auth hardening for this local-only mock service.
 - [x] Refactor dashboard/resource/trend handlers so they do not all compute the full dashboard payload.
 - [x] Surface dashboard database failures explicitly instead of returning empty success responses.

@@ -48,8 +48,16 @@ pub struct Datapoints {
 pub struct Datapoint {
     #[serde(rename = "Timestamp")]
     pub timestamp: String,
-    #[serde(rename = "Average")]
-    pub average: f64,
+    #[serde(rename = "SampleCount", skip_serializing_if = "Option::is_none")]
+    pub sample_count: Option<f64>,
+    #[serde(rename = "Average", skip_serializing_if = "Option::is_none")]
+    pub average: Option<f64>,
+    #[serde(rename = "Sum", skip_serializing_if = "Option::is_none")]
+    pub sum: Option<f64>,
+    #[serde(rename = "Minimum", skip_serializing_if = "Option::is_none")]
+    pub minimum: Option<f64>,
+    #[serde(rename = "Maximum", skip_serializing_if = "Option::is_none")]
+    pub maximum: Option<f64>,
     #[serde(rename = "Unit")]
     pub unit: String,
 }

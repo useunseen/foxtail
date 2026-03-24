@@ -1,7 +1,7 @@
 ---
 title: fix: restore standard statistics in CloudWatch GetMetricStatistics
 type: fix
-status: active
+status: completed
 date: 2026-03-24
 ---
 
@@ -175,18 +175,18 @@ External research is required because this is an AWS API contract bug on a publi
 
 ## Acceptance Criteria
 
-- [ ] `aws cloudwatch get-metric-statistics --statistics Maximum` against Foxtail returns datapoints with `Maximum` for `CPUUtilization`.
-- [ ] `GetMetricStatistics` aggregates raw metric rows by the requested `Period` before returning datapoints.
-- [ ] The Query/XML path supports `Average`, `Sum`, `Minimum`, `Maximum`, and `SampleCount`.
-- [ ] `SampleCount` reflects the number of raw rows inside each returned period bucket.
-- [ ] Multi-stat requests return all requested standard stat fields on each datapoint.
-- [ ] Requests with unsupported stats, missing stats, or both `Statistics` and `ExtendedStatistics` fail with clear validation errors.
-- [ ] Existing `Average` behavior remains correct for current callers and smoke tests.
-- [ ] Route coverage includes a regression test for the original `Maximum` failure case.
-- [ ] Route coverage includes explicit assertions for `SampleCount`, `Sum`, and `Minimum`.
-- [ ] CLI smoke verification includes at least one `CPUUtilization --statistics Maximum` assertion.
-- [ ] CLI smoke verification includes at least one multi-stat `CPUUtilization` assertion covering more than `Average` and `Maximum`.
-- [ ] README examples and notes accurately describe supported `GetMetricStatistics` behavior after the fix.
+- [x] `aws cloudwatch get-metric-statistics --statistics Maximum` against Foxtail returns datapoints with `Maximum` for `CPUUtilization`.
+- [x] `GetMetricStatistics` aggregates raw metric rows by the requested `Period` before returning datapoints.
+- [x] The Query/XML path supports `Average`, `Sum`, `Minimum`, `Maximum`, and `SampleCount`.
+- [x] `SampleCount` reflects the number of raw rows inside each returned period bucket.
+- [x] Multi-stat requests return all requested standard stat fields on each datapoint.
+- [x] Requests with unsupported stats, missing stats, or both `Statistics` and `ExtendedStatistics` fail with clear validation errors.
+- [x] Existing `Average` behavior remains correct for current callers and smoke tests.
+- [x] Route coverage includes a regression test for the original `Maximum` failure case.
+- [x] Route coverage includes explicit assertions for `SampleCount`, `Sum`, and `Minimum`.
+- [x] CLI smoke verification includes at least one `CPUUtilization --statistics Maximum` assertion.
+- [x] CLI smoke verification includes at least one multi-stat `CPUUtilization` assertion covering more than `Average` and `Maximum`.
+- [x] README examples and notes accurately describe supported `GetMetricStatistics` behavior after the fix.
 
 ## Success Metrics
 

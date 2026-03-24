@@ -301,6 +301,32 @@ if not any(point.get("Average", 0) > 0 for point in datapoints):
     raise SystemExit("NetworkIn get-metric-statistics returned only zero datapoints")
 PY
 
+CPU_STANDARD_STATS_OUTPUT="$(aws_json cloudwatch get-metric-statistics \
+  --namespace AWS/EC2 \
+  --metric-name CPUUtilization \
+  --statistics SampleCount Average Sum Minimum Maximum \
+  --period 3600 \
+  --start-time "$CW_START_TIME" \
+  --end-time "$CW_END_TIME" \
+  --dimensions Name=InstanceId,Value="$INSTANCE_ID")"
+
+CPU_STANDARD_STATS_OUTPUT="$CPU_STANDARD_STATS_OUTPUT" python3 - <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ["CPU_STANDARD_STATS_OUTPUT"])
+datapoints = payload.get("Datapoints", [])
+if not datapoints:
+    raise SystemExit("CPUUtilization multi-stat get-metric-statistics returned no datapoints")
+
+required_fields = {"SampleCount", "Average", "Sum", "Minimum", "Maximum"}
+if not any(required_fields.issubset(point.keys()) for point in datapoints):
+    raise SystemExit("CPUUtilization multi-stat get-metric-statistics omitted one or more standard statistics")
+
+if not any(point.get("SampleCount", 0) >= 1 for point in datapoints):
+    raise SystemExit("CPUUtilization multi-stat get-metric-statistics returned invalid SampleCount values")
+PY
+
 QUERY_FILE="$TMP_DIR/metric_queries.json"
 cat >"$QUERY_FILE" <<EOF
 [

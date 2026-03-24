@@ -165,9 +165,10 @@ Notes:
 
 - AWS CLI `cloudwatch ...` uses the Query/XML path
 - direct `x-amz-target: GraniteServiceVersion20100801.GetMetricData` uses the JSON path
+- `get-metric-statistics` supports `SampleCount`, `Average`, `Sum`, `Minimum`, and `Maximum`
 - `get-metric-data` supports up to 50 queries on both paths
 - `get-metric-data` preserves query ids, aligns timestamps and values, and paginates deterministically
-- supported stats are `Average`, `Sum`, `Minimum`, and `Maximum`
+- `get-metric-data` supports `Average`, `Sum`, `Minimum`, and `Maximum`
 
 ### Resource Groups Tagging API
 
