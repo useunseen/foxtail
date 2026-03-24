@@ -61,8 +61,7 @@ enum Protocol {
     Xml,
 }
 
-#[derive(Deserialize, Debug)]
-#[serde(rename_all = "PascalCase")]
+#[derive(Debug, Clone)]
 struct CloudWatchQuery {
     action: String,
     namespace: Option<String>,
@@ -70,20 +69,15 @@ struct CloudWatchQuery {
     start_time: Option<String>,
     end_time: Option<String>,
     period: Option<i32>,
-    #[serde(rename = "MaxDatapoints")]
     max_datapoints: Option<u64>,
-    #[serde(rename = "NextToken")]
     next_token: Option<String>,
-    #[serde(rename = "RecentlyActive")]
     recently_active: Option<String>,
-    #[serde(rename = "Dimensions.member.1.Name")]
     dim_name_1: Option<String>,
-    #[serde(rename = "Dimensions.member.1.Value")]
     dim_value_1: Option<String>,
-    #[serde(rename = "Dimensions.member.2.Name")]
     dim_name_2: Option<String>,
-    #[serde(rename = "Dimensions.member.2.Value")]
     dim_value_2: Option<String>,
+    statistics: Vec<String>,
+    extended_statistics: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -364,9 +358,13 @@ enum MetricDataError {
 }
 
 enum MetricStatisticsError {
+    MissingParameter(String),
+    InvalidParameterCombination(String),
     Validation(String),
     Internal(anyhow::Error),
 }
+
+const GET_METRIC_STATISTICS_RAW_ROW_LIMIT: i64 = 10_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StandardStatistic {
@@ -513,6 +511,43 @@ struct AggregatedMetricPoint {
     sum: f64,
     minimum: f64,
     maximum: f64,
+}
+
+#[derive(Clone, Copy)]
+struct MetricBucketAccumulator {
+    sample_count: f64,
+    sum: f64,
+    minimum: f64,
+    maximum: f64,
+}
+
+impl MetricBucketAccumulator {
+    fn new(value: f64) -> Self {
+        Self {
+            sample_count: 1.0,
+            sum: value,
+            minimum: value,
+            maximum: value,
+        }
+    }
+
+    fn record(&mut self, value: f64) {
+        self.sample_count += 1.0;
+        self.sum += value;
+        self.minimum = self.minimum.min(value);
+        self.maximum = self.maximum.max(value);
+    }
+
+    fn into_point(self, timestamp: DateTime<Utc>) -> AggregatedMetricPoint {
+        AggregatedMetricPoint {
+            timestamp,
+            sample_count: self.sample_count,
+            average: self.sum / self.sample_count,
+            sum: self.sum,
+            minimum: self.minimum,
+            maximum: self.maximum,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -961,62 +996,118 @@ fn extract_resource_id_from_query(query: &CloudWatchQuery) -> Option<String> {
     None
 }
 
-fn parse_get_metric_statistics_request_from_form(
-    query: &CloudWatchQuery,
-    body: &[u8],
-) -> std::result::Result<GetMetricStatisticsRequest, MetricStatisticsError> {
-    let pairs: Vec<(String, String)> = serde_urlencoded::from_bytes(body)
-        .map_err(|e| MetricStatisticsError::Validation(format!("Failed to parse body: {}", e)))?;
+fn parse_cloudwatch_query_from_form(body: &[u8]) -> std::result::Result<CloudWatchQuery, String> {
+    let pairs: Vec<(String, String)> =
+        serde_urlencoded::from_bytes(body).map_err(|e| format!("Failed to parse body: {}", e))?;
+    let mut action = None;
+    let mut namespace = None;
+    let mut metric_name = None;
+    let mut start_time = None;
+    let mut end_time = None;
+    let mut period = None;
+    let mut max_datapoints = None;
+    let mut next_token = None;
+    let mut recently_active = None;
+    let mut dim_name_1 = None;
+    let mut dim_value_1 = None;
+    let mut dim_name_2 = None;
+    let mut dim_value_2 = None;
     let mut statistics = BTreeMap::new();
     let mut extended_statistics = BTreeMap::new();
 
     for (key, value) in pairs {
-        let parts = key.split('.').collect::<Vec<_>>();
-        match parts.as_slice() {
-            ["Statistics", "member", index] => {
-                let index = index.parse::<usize>().map_err(|_| {
-                    MetricStatisticsError::Validation(format!(
-                        "Invalid Statistics member index in '{}'.",
-                        key
-                    ))
-                })?;
-                statistics.insert(index, value);
+        match key.as_str() {
+            "Action" => action = Some(value),
+            "Namespace" => namespace = Some(value),
+            "MetricName" => metric_name = Some(value),
+            "StartTime" => start_time = Some(value),
+            "EndTime" => end_time = Some(value),
+            "Period" => {
+                period = Some(
+                    value
+                        .parse::<i32>()
+                        .map_err(|e| format!("Failed to parse body: {}", e))?,
+                )
             }
-            ["ExtendedStatistics", "member", index] => {
-                let index = index.parse::<usize>().map_err(|_| {
-                    MetricStatisticsError::Validation(format!(
-                        "Invalid ExtendedStatistics member index in '{}'.",
-                        key
-                    ))
-                })?;
-                extended_statistics.insert(index, value);
+            "MaxDatapoints" => {
+                max_datapoints = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|e| format!("Failed to parse body: {}", e))?,
+                )
             }
-            _ => {}
+            "NextToken" => next_token = Some(value),
+            "RecentlyActive" => recently_active = Some(value),
+            "Dimensions.member.1.Name" => dim_name_1 = Some(value),
+            "Dimensions.member.1.Value" => dim_value_1 = Some(value),
+            "Dimensions.member.2.Name" => dim_name_2 = Some(value),
+            "Dimensions.member.2.Value" => dim_value_2 = Some(value),
+            _ => {
+                let parts = key.split('.').collect::<Vec<_>>();
+                match parts.as_slice() {
+                    ["Statistics", "member", index] => {
+                        let index = index.parse::<usize>().map_err(|_| {
+                            format!("Invalid Statistics member index in '{}'.", key)
+                        })?;
+                        statistics.insert(index, value);
+                    }
+                    ["ExtendedStatistics", "member", index] => {
+                        let index = index.parse::<usize>().map_err(|_| {
+                            format!("Invalid ExtendedStatistics member index in '{}'.", key)
+                        })?;
+                        extended_statistics.insert(index, value);
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 
-    if statistics.is_empty() && extended_statistics.is_empty() {
-        return Err(MetricStatisticsError::Validation(
+    Ok(CloudWatchQuery {
+        action: action.ok_or_else(|| "Missing required field 'Action'.".to_string())?,
+        namespace,
+        metric_name,
+        start_time,
+        end_time,
+        period,
+        max_datapoints,
+        next_token,
+        recently_active,
+        dim_name_1,
+        dim_value_1,
+        dim_name_2,
+        dim_value_2,
+        statistics: statistics.into_values().collect(),
+        extended_statistics: extended_statistics.into_values().collect(),
+    })
+}
+
+fn build_get_metric_statistics_request(
+    query: CloudWatchQuery,
+) -> std::result::Result<GetMetricStatisticsRequest, MetricStatisticsError> {
+    let resource_id = extract_resource_id_from_query(&query);
+    if query.statistics.is_empty() && query.extended_statistics.is_empty() {
+        return Err(MetricStatisticsError::MissingParameter(
             "GetMetricStatistics requires Statistics.member.N or ExtendedStatistics.member.N."
                 .to_string(),
         ));
     }
-    if !statistics.is_empty() && !extended_statistics.is_empty() {
-        return Err(MetricStatisticsError::Validation(
+    if !query.statistics.is_empty() && !query.extended_statistics.is_empty() {
+        return Err(MetricStatisticsError::InvalidParameterCombination(
             "GetMetricStatistics does not allow both Statistics and ExtendedStatistics."
                 .to_string(),
         ));
     }
-    if !extended_statistics.is_empty() {
+    if !query.extended_statistics.is_empty() {
         return Err(MetricStatisticsError::Validation(
             "ExtendedStatistics are not supported.".to_string(),
         ));
     }
 
-    let namespace = query.namespace.clone().ok_or_else(|| {
+    let namespace = query.namespace.ok_or_else(|| {
         MetricStatisticsError::Validation("Missing required field 'Namespace'.".to_string())
     })?;
-    let metric_name = query.metric_name.clone().ok_or_else(|| {
+    let metric_name = query.metric_name.ok_or_else(|| {
         MetricStatisticsError::Validation("Missing required field 'MetricName'.".to_string())
     })?;
     let start_time = parse_rfc3339_required("StartTime", query.start_time.as_deref())
@@ -1027,8 +1118,10 @@ fn parse_get_metric_statistics_request_from_form(
         MetricStatisticsError::Validation("Missing required field 'Period'.".to_string())
     })? as i64;
 
-    let statistics = statistics
-        .into_values()
+    let statistics = query
+        .statistics
+        .clone()
+        .into_iter()
         .map(|value| StandardStatistic::parse_metric_statistics_stat(&value))
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
@@ -1038,7 +1131,7 @@ fn parse_get_metric_statistics_request_from_form(
         start_time,
         end_time,
         period,
-        resource_id: extract_resource_id_from_query(query),
+        resource_id,
         statistics,
     })
 }
@@ -2109,7 +2202,7 @@ fn aggregate_metric_buckets(
         ));
     }
 
-    let mut buckets: BTreeMap<i64, Vec<f64>> = BTreeMap::new();
+    let mut buckets: BTreeMap<i64, MetricBucketAccumulator> = BTreeMap::new();
     for point in points {
         if point.timestamp < start_time || point.timestamp > end_time {
             continue;
@@ -2119,32 +2212,17 @@ fn aggregate_metric_buckets(
             continue;
         }
         let bucket_index = offset_seconds / period_seconds;
-        buckets.entry(bucket_index).or_default().push(point.value);
+        buckets
+            .entry(bucket_index)
+            .and_modify(|bucket| bucket.record(point.value))
+            .or_insert_with(|| MetricBucketAccumulator::new(point.value));
     }
 
     Ok(buckets
         .into_iter()
-        .map(|(bucket_index, values)| {
+        .map(|(bucket_index, bucket)| {
             let timestamp = start_time + chrono::Duration::seconds(bucket_index * period_seconds);
-            let sample_count = values.len() as f64;
-            let sum = values.iter().sum::<f64>();
-            let minimum = values
-                .iter()
-                .copied()
-                .fold(f64::INFINITY, |acc, value| acc.min(value));
-            let maximum = values
-                .iter()
-                .copied()
-                .fold(f64::NEG_INFINITY, |acc, value| acc.max(value));
-            let average = sum / sample_count;
-            AggregatedMetricPoint {
-                timestamp,
-                sample_count,
-                average,
-                sum,
-                minimum,
-                maximum,
-            }
+            bucket.into_point(timestamp)
         })
         .collect())
 }
@@ -5000,7 +5078,7 @@ async fn handle_cloudwatch_query(
     protocol: Protocol,
     injected_now: Option<DateTime<Utc>>,
 ) -> axum::response::Response {
-    let query: CloudWatchQuery = match serde_urlencoded::from_bytes(&body) {
+    let query: CloudWatchQuery = match parse_cloudwatch_query_from_form(&body) {
         Ok(q) => q,
         Err(e) => {
             return error_response(
@@ -5046,13 +5124,25 @@ async fn handle_cloudwatch_query(
                     StatusCode::BAD_REQUEST,
                 );
             }
-            match handle_get_metric_statistics(pool, query, &body, injected_now).await {
+            match handle_get_metric_statistics(pool, query, injected_now).await {
                 Ok(xml) => {
                     (StatusCode::OK, [(header::CONTENT_TYPE, "text/xml")], xml).into_response()
                 }
                 Err(MetricStatisticsError::Validation(message)) => error_response(
                     protocol,
                     "InvalidParameterValueException",
+                    &message,
+                    StatusCode::BAD_REQUEST,
+                ),
+                Err(MetricStatisticsError::MissingParameter(message)) => error_response(
+                    protocol,
+                    "MissingParameter",
+                    &message,
+                    StatusCode::BAD_REQUEST,
+                ),
+                Err(MetricStatisticsError::InvalidParameterCombination(message)) => error_response(
+                    protocol,
+                    "InvalidParameterCombination",
                     &message,
                     StatusCode::BAD_REQUEST,
                 ),
@@ -5263,10 +5353,9 @@ async fn handle_get_metric_data_xml(
 async fn handle_get_metric_statistics(
     pool: SqlitePool,
     query: CloudWatchQuery,
-    body: &Bytes,
     injected_now: Option<DateTime<Utc>>,
 ) -> std::result::Result<String, MetricStatisticsError> {
-    let request = parse_get_metric_statistics_request_from_form(&query, body)?;
+    let request = build_get_metric_statistics_request(query)?;
     let GetMetricStatisticsRequest {
         namespace,
         metric_name,
@@ -5285,13 +5374,19 @@ async fn handle_get_metric_statistics(
         namespace: Some(namespace),
         start_time: Some(start_time),
         end_time: Some(end_time),
-        limit: Some(10_000),
+        limit: Some(GET_METRIC_STATISTICS_RAW_ROW_LIMIT + 1),
         injected_now,
     };
 
     let points = metrics::query_metrics(&pool, params)
         .await
         .map_err(MetricStatisticsError::Internal)?;
+    if points.len() as i64 > GET_METRIC_STATISTICS_RAW_ROW_LIMIT {
+        return Err(MetricStatisticsError::Validation(format!(
+            "GetMetricStatistics cannot aggregate more than {} raw metric rows without truncating results.",
+            GET_METRIC_STATISTICS_RAW_ROW_LIMIT
+        )));
+    }
     let aggregated =
         aggregate_metric_buckets(&points, start_time, end_time, period).map_err(|e| match e {
             MetricDataError::Validation(message) | MetricDataError::InvalidNextToken(message) => {
@@ -5486,6 +5581,10 @@ mod tests {
         let (_, rest) = xml.split_once(&start_tag)?;
         let (value, _) = rest.split_once(&end_tag)?;
         Some(value.to_string())
+    }
+
+    fn xml_error_code(xml: &str) -> Option<String> {
+        xml_tag_value(xml, "Code")
     }
 
     #[tokio::test]
@@ -6703,6 +6802,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cloudwatch_query_parser_collects_metric_statistics_members_once() {
+        let form = b"Action=GetMetricStatistics&Namespace=AWS%2FEC2&MetricName=CPUUtilization&StartTime=2026-03-11T11%3A00%3A00Z&EndTime=2026-03-11T12%3A00%3A00Z&Period=3600&Statistics.member.1=SampleCount&Statistics.member.2=Average&ExtendedStatistics.member.1=p99&Dimensions.member.1.Name=InstanceId&Dimensions.member.1.Value=i-test";
+
+        let query = parse_cloudwatch_query_from_form(form).unwrap();
+
+        assert_eq!(query.action, "GetMetricStatistics");
+        assert_eq!(query.namespace.as_deref(), Some("AWS/EC2"));
+        assert_eq!(query.metric_name.as_deref(), Some("CPUUtilization"));
+        assert_eq!(query.statistics, vec!["SampleCount", "Average"]);
+        assert_eq!(query.extended_statistics, vec!["p99"]);
+    }
+
+    #[test]
+    fn aggregate_metric_buckets_streams_standard_statistics() {
+        let start_time = chrono::DateTime::parse_from_rfc3339("2026-03-11T11:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let end_time = chrono::DateTime::parse_from_rfc3339("2026-03-11T13:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let points = vec![
+            metrics::MetricPoint {
+                value: 20.0,
+                timestamp: start_time + chrono::Duration::seconds(3599),
+            },
+            metrics::MetricPoint {
+                value: 10.0,
+                timestamp: start_time + chrono::Duration::seconds(5),
+            },
+            metrics::MetricPoint {
+                value: 30.0,
+                timestamp: start_time + chrono::Duration::seconds(20),
+            },
+            metrics::MetricPoint {
+                value: 50.0,
+                timestamp: start_time + chrono::Duration::seconds(3601),
+            },
+        ];
+
+        let buckets = aggregate_metric_buckets(&points, start_time, end_time, 3600)
+            .unwrap_or_else(|_| panic!("bucket aggregation should succeed"));
+
+        assert_eq!(buckets.len(), 2);
+        assert_eq!(buckets[0].timestamp, start_time);
+        assert_eq!(buckets[0].sample_count, 3.0);
+        assert_eq!(buckets[0].average, 20.0);
+        assert_eq!(buckets[0].sum, 60.0);
+        assert_eq!(buckets[0].minimum, 10.0);
+        assert_eq!(buckets[0].maximum, 30.0);
+        assert_eq!(
+            buckets[1].timestamp,
+            start_time + chrono::Duration::seconds(3600)
+        );
+        assert_eq!(buckets[1].sample_count, 1.0);
+        assert_eq!(buckets[1].average, 50.0);
+        assert_eq!(buckets[1].sum, 50.0);
+        assert_eq!(buckets[1].minimum, 50.0);
+        assert_eq!(buckets[1].maximum, 50.0);
+    }
+
     #[tokio::test]
     async fn cloudwatch_query_xml_metric_statistics_requires_statistics() {
         let pool = test_pool().await;
@@ -6725,6 +6885,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let xml = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(xml_error_code(&xml).as_deref(), Some("MissingParameter"));
         assert!(xml.contains(
             "GetMetricStatistics requires Statistics.member.N or ExtendedStatistics.member.N."
         ));
@@ -6752,8 +6913,73 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let xml = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(
+            xml_error_code(&xml).as_deref(),
+            Some("InvalidParameterCombination")
+        );
         assert!(xml.contains(
             "GetMetricStatistics does not allow both Statistics and ExtendedStatistics."
+        ));
+    }
+
+    #[tokio::test]
+    async fn cloudwatch_query_xml_metric_statistics_rejects_truncated_raw_rows() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO resources (id, resource_type, region, scenario, tags)
+             VALUES ('i-test', 'ec2', 'us-east-1', 'Baseline', '{}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for _ in 0..100 {
+            let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                "INSERT INTO metrics (resource_id, namespace, metric_name, seconds_from_now, value) ",
+            );
+            builder.push_values(0..100, |mut row, _| {
+                row.push_bind("i-test")
+                    .push_bind("AWS/EC2")
+                    .push_bind("CPUUtilization")
+                    .push_bind(-3600)
+                    .push_bind(1.0f64);
+            });
+            builder.build().execute(&pool).await.unwrap();
+        }
+
+        sqlx::query(
+            "INSERT INTO metrics (resource_id, namespace, metric_name, seconds_from_now, value)
+             VALUES ('i-test', 'AWS/EC2', 'CPUUtilization', -3600, 1.0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let app = build_app(pool);
+        let form = "Action=GetMetricStatistics&Namespace=AWS%2FEC2&MetricName=CPUUtilization&StartTime=2026-03-11T11%3A00%3A00Z&EndTime=2026-03-11T12%3A00%3A00Z&Period=3600&Statistics.member.1=SampleCount&Statistics.member.2=Average&Dimensions.member.1.Name=InstanceId&Dimensions.member.1.Value=i-test";
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header("x-mock-now", "2026-03-11T12:00:00Z")
+                    .body(Body::from(form))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let xml = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(
+            xml_error_code(&xml).as_deref(),
+            Some("InvalidParameterValueException")
+        );
+        assert!(xml.contains(
+            "GetMetricStatistics cannot aggregate more than 10000 raw metric rows without truncating results."
         ));
     }
 
@@ -6779,6 +7005,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let xml = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(
+            xml_error_code(&xml).as_deref(),
+            Some("InvalidParameterValueException")
+        );
         assert!(xml.contains("Unsupported Statistics value 'Median'."));
     }
 
