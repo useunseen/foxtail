@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p1
 issue_id: "056"
 tags: [code-review, backend, finops, cost-explorer, cloudwatch, cur, integration]
@@ -61,7 +61,7 @@ The branch adds substantial mock-service parity for Cost Explorer and some Cloud
 
 ## Recommended Action
 
-Not actionable in this extracted Rust service repo. The runtime files named in this finding (`graph_builder.py`, `models.py`, and orchestrator modules) are not present here, so this work should stay with the parent runtime repository or be rewritten as a service-local todo if new repo-local requirements emerge.
+Resolved as repo-external. The runtime files named in this finding (`graph_builder.py`, `models.py`, and orchestrator modules) are not present in this extracted Rust service repo, so no repo-local code change is required here.
 
 ## Technical Details
 
@@ -125,3 +125,15 @@ Not actionable in this extracted Rust service repo. The runtime files named in t
 
 **Learnings:**
 - Some review findings were carried over from a larger multi-repo context and need repo-local triage before they are treated as executable work.
+
+### 2026-03-24 - Resolution
+
+**By:** Codex
+
+**Actions:**
+- Marked the todo complete in repo-local scope.
+- Preserved the original discovery and triage history.
+- Closed the finding as not actionable in this extracted service repo.
+
+**Learnings:**
+- This issue belongs in the parent runtime repository, not in this checkout.

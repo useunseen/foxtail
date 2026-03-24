@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p2
 issue_id: "057"
 tags: [code-review, security, operations, rust]
@@ -110,3 +110,15 @@ Scoped out on 2026-03-11. This repo is intentionally treated as a local-only moc
 
 **Learnings:**
 - Local mock-service assumptions should be validated before treating internal admin surfaces as required security work.
+
+### 2026-03-24 - Resolution
+
+**By:** Codex
+
+**Actions:**
+- Marked the todo complete in repo-local scope.
+- Preserved the original discovery and scope-decision history.
+- Closed the finding as intentionally out of scope for this local-only mock service.
+
+**Learnings:**
+- Some security findings are valid but intentionally deferred by the repository's deployment model.
