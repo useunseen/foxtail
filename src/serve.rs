@@ -3710,6 +3710,53 @@ async fn build_cost_usage_response(
                 })
             })
             .collect::<Vec<Value>>()
+    } else if daily {
+        let mut bucket_totals: BTreeMap<String, f64> = BTreeMap::new();
+        let mut bucket_ranges: BTreeMap<String, String> = BTreeMap::new();
+
+        let mut cursor = start;
+        while cursor < end {
+            let bucket_start = cursor.format("%Y-%m-%d").to_string();
+            let bucket_end = (cursor + chrono::Duration::days(1))
+                .format("%Y-%m-%d")
+                .to_string();
+            bucket_totals.insert(bucket_start.clone(), 0.0);
+            bucket_ranges.insert(bucket_start, bucket_end);
+            cursor += chrono::Duration::days(1);
+        }
+
+        for row in &filtered_rows {
+            let bucket_start = (now + chrono::Duration::seconds(row.seconds_from_now))
+                .format("%Y-%m-%d")
+                .to_string();
+            if let Some(total) = bucket_totals.get_mut(&bucket_start) {
+                *total += row.amount;
+            }
+        }
+
+        bucket_totals
+            .into_iter()
+            .map(|(bucket_start, total)| {
+                let bucket_end = bucket_ranges
+                    .get(&bucket_start)
+                    .cloned()
+                    .unwrap_or_else(|| req.time_period.end.clone());
+                json!({
+                    "TimePeriod": {
+                        "Start": bucket_start,
+                        "End": bucket_end
+                    },
+                    "Total": {
+                        "UnblendedCost": {
+                            "Amount": format!("{:.2}", total),
+                            "Unit": "USD"
+                        }
+                    },
+                    "Groups": [],
+                    "Estimated": true
+                })
+            })
+            .collect::<Vec<Value>>()
     } else {
         vec![json!({
             "TimePeriod": {
