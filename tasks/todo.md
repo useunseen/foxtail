@@ -1,3 +1,26 @@
+# Database Reset Make Target
+
+- [x] Rename `make reset-db` to `make reset`.
+- [x] Change reset behavior to delete `mock_data.db` without reseeding.
+- [x] Update user-facing command docs to include the renamed cleanup-only target.
+
+## Database Reset Rename Results
+
+- Replaced `make reset-db` with `make reset`.
+- `make reset` now only removes `mock_data.db`; reseeding remains explicit via `make gen` or scenario-specific generation targets.
+- Updated the `Makefile` help text and the README make-target table so the cleanup-only reset flow is discoverable.
+- Verification pending below.
+
+- [x] Add a `make` target that resets the generated SQLite database.
+- [x] Update user-facing command docs to include the new target.
+- [x] Record the result here.
+
+## Database Reset Results
+
+- Historical note: the earlier `make reset-db` target removed `mock_data.db` and reseeded baseline data.
+- That command has now been replaced by cleanup-only `make reset`.
+- Runtime verification was not needed for this documentation-and-build-target change.
+
 # Review Follow-Up Plan
 
 ## Current Execution Focus

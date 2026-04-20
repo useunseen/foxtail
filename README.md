@@ -261,6 +261,7 @@ aws --endpoint-url http://127.0.0.1:8080 cloudwatch list-metrics \
 | `make gen-baseline` | Seed baseline scenario |
 | `make gen-spike` | Seed spike scenario |
 | `make gen-idle-heavy` | Seed idle-heavy scenario |
+| `make reset` | Delete `mock_data.db` |
 | `make serve` | Start the local API server |
 | `make setup` | Build and seed baseline data |
 | `make setup-mock` | Alias for `make setup` |

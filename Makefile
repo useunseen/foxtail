@@ -3,7 +3,7 @@
 BIN := target/debug/aws-mock-data-service
 DB_PATH := mock_data.db
 
-.PHONY: build build-release run gen gen-baseline gen-spike gen-idle-heavy serve setup setup-mock verify-cli-interoperability verify-wrapper-routing help
+.PHONY: build build-release run gen gen-baseline gen-spike gen-idle-heavy reset serve setup setup-mock verify-cli-interoperability verify-wrapper-routing help
 
 help:
 	@echo "AWS Mock Data Service"
@@ -13,6 +13,7 @@ help:
 	@echo "  make gen-baseline   - Regenerate data with Baseline scenario"
 	@echo "  make gen-spike      - Regenerate data with Spike scenario"
 	@echo "  make gen-idle-heavy - Regenerate data with IdleHeavy scenario"
+	@echo "  make reset          - Delete mock_data.db"
 	@echo "  make serve  - Start the API server"
 	@echo "  make setup  - Build and generate data"
 	@echo "  make verify-cli-interoperability - Run AWS CLI smoke checks against a local server"
@@ -35,6 +36,9 @@ gen-spike:
 
 gen-idle-heavy:
 	DATABASE_URL="sqlite:$(DB_PATH)" ./$(BIN) gen --prune --scenario idle-heavy
+
+reset:
+	rm -f $(DB_PATH)
 
 serve:
 	DATABASE_URL="sqlite:$(DB_PATH)" ./$(BIN) serve --port 8080
