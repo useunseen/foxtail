@@ -185,35 +185,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aws-mock-data-service"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "aws-config",
- "aws-sdk-cloudwatch",
- "aws-sdk-ec2",
- "aws-sdk-elasticloadbalancingv2",
- "aws-sdk-rds",
- "aws-sdk-s3",
- "axum",
- "chrono",
- "clap",
- "dotenvy",
- "quick-xml",
- "serde",
- "serde_json",
- "serde_urlencoded",
- "sqlx",
- "tokio",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "urlencoding",
- "uuid",
-]
-
-[[package]]
 name = "aws-runtime"
 version = "1.5.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -269,6 +240,29 @@ name = "aws-sdk-ec2"
 version = "1.177.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eeb6a61f0c3afa511147d8a0ac591344af16b118eb84538193d4ba7b583986ad"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-query",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-smithy-xml",
+ "aws-types",
+ "fastrand",
+ "http 0.2.12",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sdk-elasticache"
+version = "1.96.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d90c7a746ce3dc0b5739fe1278dce40a7eb042033a92e673dc951355bb4d65d"
 dependencies = [
  "aws-credential-types",
  "aws-runtime",
@@ -1255,6 +1249,37 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "foxtail"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aws-config",
+ "aws-sdk-cloudwatch",
+ "aws-sdk-ec2",
+ "aws-sdk-elasticache",
+ "aws-sdk-elasticloadbalancingv2",
+ "aws-sdk-rds",
+ "aws-sdk-s3",
+ "aws-smithy-http-client",
+ "axum",
+ "chrono",
+ "clap",
+ "dotenvy",
+ "quick-xml",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "sqlx",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "urlencoding",
+ "uuid",
 ]
 
 [[package]]

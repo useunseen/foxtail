@@ -307,11 +307,49 @@ struct TimePeriod {
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct GetMetricDataRequest {
-    start_time: String,
-    end_time: String,
+    start_time: CloudWatchDateTimeInput,
+    end_time: CloudWatchDateTimeInput,
     metric_data_queries: Vec<GetMetricDataQuery>,
     next_token: Option<String>,
     max_datapoints: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct GetMetricStatisticsJsonRequest {
+    namespace: Option<String>,
+    metric_name: Option<String>,
+    dimensions: Option<Vec<GetMetricDimension>>,
+    start_time: Option<CloudWatchDateTimeInput>,
+    end_time: Option<CloudWatchDateTimeInput>,
+    period: Option<i64>,
+    statistics: Option<Vec<String>>,
+    extended_statistics: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ListMetricsJsonRequest {
+    namespace: Option<String>,
+    metric_name: Option<String>,
+    dimensions: Option<Vec<ListMetricsDimension>>,
+    next_token: Option<String>,
+    recently_active: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ListMetricsDimension {
+    name: String,
+    value: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CloudWatchDateTimeInput {
+    String(String),
+    Integer(i64),
+    Float(f64),
 }
 
 #[derive(Deserialize)]
@@ -493,6 +531,11 @@ struct MetricDataSeriesRequest {
     injected_now: Option<DateTime<Utc>>,
 }
 
+struct ListMetricsPage {
+    metrics: Vec<cw::Metric>,
+    next_token: Option<String>,
+}
+
 struct GetMetricStatisticsRequest {
     namespace: String,
     metric_name: String,
@@ -501,6 +544,24 @@ struct GetMetricStatisticsRequest {
     period: i64,
     resource_id: Option<String>,
     statistics: Vec<StandardStatistic>,
+}
+
+struct MetricStatisticsSeries {
+    metric_name: String,
+    metric_unit: String,
+    statistics: Vec<StandardStatistic>,
+    datapoints: Vec<AggregatedMetricPoint>,
+}
+
+struct MetricStatisticsRequestParts {
+    namespace: String,
+    metric_name: String,
+    start_time: DateTime<Utc>,
+    end_time: DateTime<Utc>,
+    period: i64,
+    resource_id: Option<String>,
+    statistics: Vec<String>,
+    extended_statistics: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -975,7 +1036,8 @@ fn extract_resource_id_from_query(query: &CloudWatchQuery) -> Option<String> {
         && (name == "InstanceId"
             || name == "VolumeId"
             || name == "BucketName"
-            || name == "DBInstanceIdentifier")
+            || name == "DBInstanceIdentifier"
+            || name == "CacheClusterId")
     {
         return query.dim_value_1.clone();
     }
@@ -983,7 +1045,8 @@ fn extract_resource_id_from_query(query: &CloudWatchQuery) -> Option<String> {
         && (name == "InstanceId"
             || name == "VolumeId"
             || name == "BucketName"
-            || name == "DBInstanceIdentifier")
+            || name == "DBInstanceIdentifier"
+            || name == "CacheClusterId")
     {
         return query.dim_value_2.clone();
     }
@@ -1086,24 +1149,6 @@ fn build_get_metric_statistics_request(
     query: CloudWatchQuery,
 ) -> std::result::Result<GetMetricStatisticsRequest, MetricStatisticsError> {
     let resource_id = extract_resource_id_from_query(&query);
-    if query.statistics.is_empty() && query.extended_statistics.is_empty() {
-        return Err(MetricStatisticsError::MissingParameter(
-            "GetMetricStatistics requires Statistics.member.N or ExtendedStatistics.member.N."
-                .to_string(),
-        ));
-    }
-    if !query.statistics.is_empty() && !query.extended_statistics.is_empty() {
-        return Err(MetricStatisticsError::InvalidParameterCombination(
-            "GetMetricStatistics does not allow both Statistics and ExtendedStatistics."
-                .to_string(),
-        ));
-    }
-    if !query.extended_statistics.is_empty() {
-        return Err(MetricStatisticsError::Validation(
-            "ExtendedStatistics are not supported.".to_string(),
-        ));
-    }
-
     let namespace = query.namespace.ok_or_else(|| {
         MetricStatisticsError::Validation("Missing required field 'Namespace'.".to_string())
     })?;
@@ -1118,20 +1163,52 @@ fn build_get_metric_statistics_request(
         MetricStatisticsError::Validation("Missing required field 'Period'.".to_string())
     })? as i64;
 
-    let statistics = query
-        .statistics
-        .clone()
-        .into_iter()
-        .map(|value| StandardStatistic::parse_metric_statistics_stat(&value))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-
-    Ok(GetMetricStatisticsRequest {
+    build_get_metric_statistics_request_from_parts(MetricStatisticsRequestParts {
         namespace,
         metric_name,
         start_time,
         end_time,
         period,
         resource_id,
+        statistics: query.statistics,
+        extended_statistics: query.extended_statistics,
+    })
+}
+
+fn build_get_metric_statistics_request_from_parts(
+    parts: MetricStatisticsRequestParts,
+) -> std::result::Result<GetMetricStatisticsRequest, MetricStatisticsError> {
+    if parts.statistics.is_empty() && parts.extended_statistics.is_empty() {
+        return Err(MetricStatisticsError::MissingParameter(
+            "GetMetricStatistics requires Statistics.member.N or ExtendedStatistics.member.N."
+                .to_string(),
+        ));
+    }
+    if !parts.statistics.is_empty() && !parts.extended_statistics.is_empty() {
+        return Err(MetricStatisticsError::InvalidParameterCombination(
+            "GetMetricStatistics does not allow both Statistics and ExtendedStatistics."
+                .to_string(),
+        ));
+    }
+    if !parts.extended_statistics.is_empty() {
+        return Err(MetricStatisticsError::Validation(
+            "ExtendedStatistics are not supported.".to_string(),
+        ));
+    }
+
+    let statistics = parts
+        .statistics
+        .into_iter()
+        .map(|value| StandardStatistic::parse_metric_statistics_stat(&value))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    Ok(GetMetricStatisticsRequest {
+        namespace: parts.namespace,
+        metric_name: parts.metric_name,
+        start_time: parts.start_time,
+        end_time: parts.end_time,
+        period: parts.period,
+        resource_id: parts.resource_id,
         statistics,
     })
 }
@@ -1466,6 +1543,27 @@ fn parse_rfc3339_required(
         .map_err(|e| format!("Invalid {}: {}", field_name, e))
 }
 
+fn parse_cloudwatch_datetime_required(
+    field_name: &str,
+    value: Option<&CloudWatchDateTimeInput>,
+) -> std::result::Result<DateTime<Utc>, String> {
+    match value.ok_or_else(|| format!("Missing required field '{}'.", field_name))? {
+        CloudWatchDateTimeInput::String(raw) => DateTime::parse_from_rfc3339(raw)
+            .map(|dt| dt.with_timezone(&Utc))
+            .map_err(|e| format!("Invalid {}: {}", field_name, e)),
+        CloudWatchDateTimeInput::Integer(epoch_seconds) => {
+            DateTime::from_timestamp(*epoch_seconds, 0)
+                .ok_or_else(|| format!("Invalid {} epoch seconds '{}'.", field_name, epoch_seconds))
+        }
+        CloudWatchDateTimeInput::Float(epoch_seconds) => {
+            let whole_seconds = epoch_seconds.trunc() as i64;
+            let nanos = ((epoch_seconds.fract().abs()) * 1_000_000_000.0).round() as u32;
+            DateTime::from_timestamp(whole_seconds, nanos)
+                .ok_or_else(|| format!("Invalid {} epoch seconds '{}'.", field_name, epoch_seconds))
+        }
+    }
+}
+
 fn parse_day_start_utc(
     field_name: &str,
     value: &str,
@@ -1504,6 +1602,7 @@ fn ce_service_name_from_resource_type(resource_type: &str) -> &'static str {
     match resource_type {
         "ec2" => "Amazon Elastic Compute Cloud - Compute",
         "rds" => "Amazon Relational Database Service",
+        "elasticache" => "Amazon ElastiCache",
         "s3" => "Amazon Simple Storage Service",
         "elb" => "Elastic Load Balancing",
         _ => "AWS Service",
@@ -1516,6 +1615,7 @@ fn cloudwatch_dimension_name_for_resource_type(resource_type: &str) -> Option<&'
         "s3" => Some("BucketName"),
         "rds" => Some("DBInstanceIdentifier"),
         "elb" => Some("LoadBalancer"),
+        "elasticache" => Some("CacheClusterId"),
         _ => None,
     }
 }
@@ -1561,6 +1661,10 @@ fn resource_arn(resource_type: &str, region: &str, resource_id: &str) -> String 
             "arn:aws:elasticloadbalancing:{region}:{}:loadbalancer/app/{resource_id}/mock",
             mock_account_id()
         ),
+        "elasticache" => format!(
+            "arn:aws:elasticache:{region}:{}:cluster:{resource_id}",
+            mock_account_id()
+        ),
         _ => format!(
             "arn:aws:{resource_type}:{region}:{}:{resource_id}",
             mock_account_id()
@@ -1574,6 +1678,7 @@ fn tagging_resource_type_filter(resource_type: &str) -> &'static str {
         "rds" => "rds:db",
         "s3" => "s3:bucket",
         "elb" => "elasticloadbalancing:loadbalancer",
+        "elasticache" => "elasticache:cluster",
         _ => "resource",
     }
 }
@@ -2119,6 +2224,7 @@ fn mock_usage_rate_for_resource_type(resource_type: &str) -> f64 {
     match resource_type {
         "ec2" => 0.0960,
         "rds" => 0.0670,
+        "elasticache" => 0.0340,
         "elb" => 0.0225,
         "s3" => 0.0230,
         _ => 1.0,
@@ -2165,6 +2271,7 @@ fn cloudwatch_metric_unit(namespace: Option<&str>, metric_name: Option<&str>) ->
         | (_, "RequestCount")
         | (_, "HTTPCode_Target_5XX_Count")
         | (_, "DatabaseConnections")
+        | (_, "CurrConnections")
         | (_, "NumberOfObjects") => "Count",
         ("AWS/RDS", "ReadIOPS") | ("AWS/RDS", "WriteIOPS") => "Count/Second",
         (_, "TargetResponseTime") => "Seconds",
@@ -2182,6 +2289,7 @@ fn extract_resource_id_from_dimensions(
                 || dimension.name == "VolumeId"
                 || dimension.name == "BucketName"
                 || dimension.name == "DBInstanceIdentifier"
+                || dimension.name == "CacheClusterId"
             {
                 return Some(dimension.value.clone());
             }
@@ -2586,6 +2694,7 @@ fn resource_type_label(resource_type: &str) -> String {
     match resource_type {
         "ec2" => "EC2".to_string(),
         "rds" => "RDS".to_string(),
+        "elasticache" => "ElastiCache".to_string(),
         "s3" => "S3".to_string(),
         "elb" => "ELB".to_string(),
         _ => resource_type.to_uppercase(),
@@ -5236,6 +5345,28 @@ async fn handle_list_metrics(
     pool: SqlitePool,
     query: CloudWatchQuery,
 ) -> std::result::Result<String, String> {
+    let page = list_metrics_page(&pool, query).await?;
+
+    let response = cw::ListMetricsResponse {
+        xmlns: "http://monitoring.amazonaws.com/doc/2010-08-01/".to_string(),
+        result: cw::ListMetricsResult {
+            metrics: cw::Metrics {
+                members: page.metrics,
+            },
+            next_token: page.next_token,
+        },
+        metadata: cw::ResponseMetadata {
+            request_id: "mock-id".to_string(),
+        },
+    };
+
+    cw::to_xml(&response).map_err(|e| e.to_string())
+}
+
+async fn list_metrics_page(
+    pool: &SqlitePool,
+    query: CloudWatchQuery,
+) -> std::result::Result<ListMetricsPage, String> {
     if let Some(recently_active) = query.recently_active.as_deref()
         && recently_active != "PT3H"
     {
@@ -5255,7 +5386,7 @@ async fn handle_list_metrics(
          JOIN resources r ON r.id = m.resource_id
          ORDER BY m.namespace, m.metric_name, r.resource_type, r.id",
     )
-    .fetch_all(&pool)
+    .fetch_all(pool)
     .await
     .map_err(|e| e.to_string())?;
 
@@ -5321,18 +5452,10 @@ async fn handle_list_metrics(
         .take(page_end - page_start)
         .collect::<Vec<_>>();
 
-    let response = cw::ListMetricsResponse {
-        xmlns: "http://monitoring.amazonaws.com/doc/2010-08-01/".to_string(),
-        result: cw::ListMetricsResult {
-            metrics: cw::Metrics { members: metrics },
-            next_token,
-        },
-        metadata: cw::ResponseMetadata {
-            request_id: "mock-id".to_string(),
-        },
-    };
-
-    cw::to_xml(&response).map_err(|e| e.to_string())
+    Ok(ListMetricsPage {
+        metrics,
+        next_token,
+    })
 }
 
 async fn handle_get_metric_data_xml(
@@ -5403,50 +5526,18 @@ async fn handle_get_metric_statistics(
     injected_now: Option<DateTime<Utc>>,
 ) -> std::result::Result<String, MetricStatisticsError> {
     let request = build_get_metric_statistics_request(query)?;
-    let GetMetricStatisticsRequest {
-        namespace,
+    let MetricStatisticsSeries {
         metric_name,
-        start_time,
-        end_time,
-        period,
-        resource_id,
+        metric_unit,
         statistics,
-    } = request;
-    let metric_unit =
-        cloudwatch_metric_unit(Some(namespace.as_str()), Some(metric_name.as_str())).to_string();
-
-    let params = MetricQueryParams {
-        resource_id,
-        metric_name: Some(metric_name.clone()),
-        namespace: Some(namespace),
-        start_time: Some(start_time),
-        end_time: Some(end_time),
-        limit: Some(GET_METRIC_STATISTICS_RAW_ROW_LIMIT + 1),
-        injected_now,
-    };
-
-    let points = metrics::query_metrics(&pool, params)
-        .await
-        .map_err(MetricStatisticsError::Internal)?;
-    if points.len() as i64 > GET_METRIC_STATISTICS_RAW_ROW_LIMIT {
-        return Err(MetricStatisticsError::Validation(format!(
-            "GetMetricStatistics cannot aggregate more than {} raw metric rows without truncating results.",
-            GET_METRIC_STATISTICS_RAW_ROW_LIMIT
-        )));
-    }
-    let aggregated =
-        aggregate_metric_buckets(&points, start_time, end_time, period).map_err(|e| match e {
-            MetricDataError::Validation(message) | MetricDataError::InvalidNextToken(message) => {
-                MetricStatisticsError::Validation(message)
-            }
-            MetricDataError::Internal(err) => MetricStatisticsError::Internal(err),
-        })?;
+        datapoints,
+    } = build_metric_statistics_series(&pool, request, injected_now).await?;
 
     let response = cw::GetMetricStatisticsResponse {
         xmlns: "http://monitoring.amazonaws.com/doc/2010-08-01/".to_string(),
         result: cw::GetMetricStatisticsResult {
             datapoints: cw::Datapoints {
-                members: aggregated
+                members: datapoints
                     .into_iter()
                     .map(|point| cw::Datapoint {
                         timestamp: point.timestamp.to_rfc3339(),
@@ -5479,6 +5570,58 @@ async fn handle_get_metric_statistics(
     cw::to_xml(&response).map_err(MetricStatisticsError::Internal)
 }
 
+async fn build_metric_statistics_series(
+    pool: &SqlitePool,
+    request: GetMetricStatisticsRequest,
+    injected_now: Option<DateTime<Utc>>,
+) -> std::result::Result<MetricStatisticsSeries, MetricStatisticsError> {
+    let GetMetricStatisticsRequest {
+        namespace,
+        metric_name,
+        start_time,
+        end_time,
+        period,
+        resource_id,
+        statistics,
+    } = request;
+    let metric_unit =
+        cloudwatch_metric_unit(Some(namespace.as_str()), Some(metric_name.as_str())).to_string();
+
+    let params = MetricQueryParams {
+        resource_id,
+        metric_name: Some(metric_name.clone()),
+        namespace: Some(namespace),
+        start_time: Some(start_time),
+        end_time: Some(end_time),
+        limit: Some(GET_METRIC_STATISTICS_RAW_ROW_LIMIT + 1),
+        injected_now,
+    };
+
+    let points = metrics::query_metrics(pool, params)
+        .await
+        .map_err(MetricStatisticsError::Internal)?;
+    if points.len() as i64 > GET_METRIC_STATISTICS_RAW_ROW_LIMIT {
+        return Err(MetricStatisticsError::Validation(format!(
+            "GetMetricStatistics cannot aggregate more than {} raw metric rows without truncating results.",
+            GET_METRIC_STATISTICS_RAW_ROW_LIMIT
+        )));
+    }
+    let datapoints =
+        aggregate_metric_buckets(&points, start_time, end_time, period).map_err(|e| match e {
+            MetricDataError::Validation(message) | MetricDataError::InvalidNextToken(message) => {
+                MetricStatisticsError::Validation(message)
+            }
+            MetricDataError::Internal(err) => MetricStatisticsError::Internal(err),
+        })?;
+
+    Ok(MetricStatisticsSeries {
+        metric_name,
+        metric_unit,
+        statistics,
+        datapoints,
+    })
+}
+
 // --- CloudWatch JSON ---
 
 async fn handle_cloudwatch_json(
@@ -5489,6 +5632,56 @@ async fn handle_cloudwatch_json(
     injected_now: Option<DateTime<Utc>>,
 ) -> axum::response::Response {
     match target {
+        "GraniteServiceVersion20100801.ListMetrics" => {
+            match handle_list_metrics_json(pool, body).await {
+                Ok(res) => (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/x-amz-json-1.0")],
+                    Json(res),
+                )
+                    .into_response(),
+                Err(message) => error_response(
+                    protocol,
+                    "InvalidParameterValueException",
+                    &message,
+                    StatusCode::BAD_REQUEST,
+                ),
+            }
+        }
+        "GraniteServiceVersion20100801.GetMetricStatistics" => {
+            match handle_get_metric_statistics_json(pool, body, injected_now).await {
+                Ok(res) => (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/x-amz-json-1.0")],
+                    Json(res),
+                )
+                    .into_response(),
+                Err(MetricStatisticsError::Validation(message)) => error_response(
+                    protocol,
+                    "InvalidParameterValueException",
+                    &message,
+                    StatusCode::BAD_REQUEST,
+                ),
+                Err(MetricStatisticsError::MissingParameter(message)) => error_response(
+                    protocol,
+                    "MissingParameter",
+                    &message,
+                    StatusCode::BAD_REQUEST,
+                ),
+                Err(MetricStatisticsError::InvalidParameterCombination(message)) => error_response(
+                    protocol,
+                    "InvalidParameterCombination",
+                    &message,
+                    StatusCode::BAD_REQUEST,
+                ),
+                Err(MetricStatisticsError::Internal(e)) => error_response(
+                    protocol,
+                    "InternalFailure",
+                    &e.to_string(),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                ),
+            }
+        }
         "GraniteServiceVersion20100801.GetMetricData" => {
             match handle_get_metric_data(pool, body, injected_now).await {
                 Ok(res) => (
@@ -5526,6 +5719,138 @@ async fn handle_cloudwatch_json(
     }
 }
 
+async fn handle_list_metrics_json(
+    pool: SqlitePool,
+    body: Bytes,
+) -> std::result::Result<Value, String> {
+    let req: ListMetricsJsonRequest =
+        serde_json::from_slice(&body).map_err(|e| format!("Invalid JSON body: {}", e))?;
+    let mut query = CloudWatchQuery {
+        action: "ListMetrics".to_string(),
+        namespace: req.namespace,
+        metric_name: req.metric_name,
+        start_time: None,
+        end_time: None,
+        period: None,
+        max_datapoints: None,
+        next_token: req.next_token,
+        recently_active: req.recently_active,
+        dim_name_1: None,
+        dim_value_1: None,
+        dim_name_2: None,
+        dim_value_2: None,
+        statistics: Vec::new(),
+        extended_statistics: Vec::new(),
+    };
+    if let Some(dimensions) = req.dimensions {
+        if let Some(dimension) = dimensions.first() {
+            query.dim_name_1 = Some(dimension.name.clone());
+            query.dim_value_1 = dimension.value.clone();
+        }
+        if let Some(dimension) = dimensions.get(1) {
+            query.dim_name_2 = Some(dimension.name.clone());
+            query.dim_value_2 = dimension.value.clone();
+        }
+    }
+
+    let page = list_metrics_page(&pool, query).await?;
+    let metrics = page
+        .metrics
+        .into_iter()
+        .map(|metric| {
+            json!({
+                "Namespace": metric.namespace,
+                "MetricName": metric.metric_name,
+                "Dimensions": metric.dimensions.members.into_iter().map(|dimension| {
+                    json!({
+                        "Name": dimension.name,
+                        "Value": dimension.value
+                    })
+                }).collect::<Vec<_>>()
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut response = json!({
+        "Metrics": metrics
+    });
+    if let Some(next_token) = page.next_token {
+        response["NextToken"] = json!(next_token);
+    }
+    Ok(response)
+}
+
+async fn handle_get_metric_statistics_json(
+    pool: SqlitePool,
+    body: Bytes,
+    injected_now: Option<DateTime<Utc>>,
+) -> std::result::Result<Value, MetricStatisticsError> {
+    let req: GetMetricStatisticsJsonRequest = serde_json::from_slice(&body)
+        .map_err(|e| MetricStatisticsError::Validation(format!("Invalid JSON body: {}", e)))?;
+    let start_time = parse_cloudwatch_datetime_required("StartTime", req.start_time.as_ref())
+        .map_err(MetricStatisticsError::Validation)?;
+    let end_time = parse_cloudwatch_datetime_required("EndTime", req.end_time.as_ref())
+        .map_err(MetricStatisticsError::Validation)?;
+    let request = build_get_metric_statistics_request_from_parts(MetricStatisticsRequestParts {
+        namespace: req.namespace.ok_or_else(|| {
+            MetricStatisticsError::Validation("Missing required field 'Namespace'.".to_string())
+        })?,
+        metric_name: req.metric_name.ok_or_else(|| {
+            MetricStatisticsError::Validation("Missing required field 'MetricName'.".to_string())
+        })?,
+        start_time,
+        end_time,
+        period: req.period.ok_or_else(|| {
+            MetricStatisticsError::Validation("Missing required field 'Period'.".to_string())
+        })?,
+        resource_id: extract_resource_id_from_dimensions(req.dimensions.as_deref()),
+        statistics: req.statistics.unwrap_or_default(),
+        extended_statistics: req.extended_statistics.unwrap_or_default(),
+    })?;
+    if request.period <= 0 {
+        return Err(MetricStatisticsError::Validation(
+            "Period must be greater than zero.".to_string(),
+        ));
+    }
+
+    let MetricStatisticsSeries {
+        metric_name,
+        metric_unit,
+        statistics,
+        datapoints,
+    } = build_metric_statistics_series(&pool, request, injected_now).await?;
+    let datapoints = datapoints
+        .into_iter()
+        .map(|point| {
+            let mut datapoint = json!({
+                "Timestamp": point.timestamp.to_rfc3339(),
+                "Unit": metric_unit.clone()
+            });
+            if statistics.contains(&StandardStatistic::SampleCount) {
+                datapoint["SampleCount"] = json!(point.sample_count);
+            }
+            if statistics.contains(&StandardStatistic::Average) {
+                datapoint["Average"] = json!(point.average);
+            }
+            if statistics.contains(&StandardStatistic::Sum) {
+                datapoint["Sum"] = json!(point.sum);
+            }
+            if statistics.contains(&StandardStatistic::Minimum) {
+                datapoint["Minimum"] = json!(point.minimum);
+            }
+            if statistics.contains(&StandardStatistic::Maximum) {
+                datapoint["Maximum"] = json!(point.maximum);
+            }
+            datapoint
+        })
+        .collect::<Vec<_>>();
+
+    Ok(json!({
+        "Label": metric_name,
+        "Datapoints": datapoints
+    }))
+}
+
 async fn handle_get_metric_data(
     pool: SqlitePool,
     body: Bytes,
@@ -5534,9 +5859,9 @@ async fn handle_get_metric_data(
     let req: GetMetricDataRequest = serde_json::from_slice(&body)
         .map_err(|e| MetricDataError::Validation(format!("Invalid JSON body: {}", e)))?;
 
-    let start_time = parse_rfc3339_required("StartTime", Some(req.start_time.as_str()))
+    let start_time = parse_cloudwatch_datetime_required("StartTime", Some(&req.start_time))
         .map_err(MetricDataError::Validation)?;
-    let end_time = parse_rfc3339_required("EndTime", Some(req.end_time.as_str()))
+    let end_time = parse_cloudwatch_datetime_required("EndTime", Some(&req.end_time))
         .map_err(MetricDataError::Validation)?;
     if req.metric_data_queries.is_empty() {
         return Err(MetricDataError::Validation(
@@ -5991,6 +6316,129 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn cloudwatch_json_metric_statistics_returns_requested_standard_stats() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO resources (id, resource_type, region, scenario, tags)
+             VALUES ('i-test', 'ec2', 'us-east-1', 'Baseline', '{}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (offset, value) in [(-7200, 10.0), (-7100, 30.0), (-3600, 40.0)] {
+            sqlx::query(
+                "INSERT INTO metrics (resource_id, namespace, metric_name, seconds_from_now, value)
+                 VALUES ('i-test', 'AWS/EC2', 'CPUUtilization', ?, ?)",
+            )
+            .bind(offset)
+            .bind(value)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let app = build_app(pool);
+        let start_time = chrono::DateTime::parse_from_rfc3339("2026-03-11T10:00:00Z")
+            .unwrap()
+            .timestamp();
+        let end_time = chrono::DateTime::parse_from_rfc3339("2026-03-11T12:00:00Z")
+            .unwrap()
+            .timestamp();
+        let body = json!({
+            "Namespace": "AWS/EC2",
+            "MetricName": "CPUUtilization",
+            "Dimensions": [{
+                "Name": "InstanceId",
+                "Value": "i-test"
+            }],
+            "StartTime": start_time,
+            "EndTime": end_time,
+            "Period": 3600,
+            "Statistics": ["Average", "Maximum"]
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-amz-json-1.0")
+                    .header(
+                        "x-amz-target",
+                        "GraniteServiceVersion20100801.GetMetricStatistics",
+                    )
+                    .header("x-amzn-query-mode", "true")
+                    .header("x-mock-now", "2026-03-11T12:00:00Z")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        let datapoints = body["Datapoints"].as_array().unwrap();
+        assert_eq!(datapoints.len(), 2);
+        assert_eq!(body["Label"], "CPUUtilization");
+        assert_eq!(datapoints[0]["Average"], json!(20.0));
+        assert_eq!(datapoints[0]["Maximum"], json!(30.0));
+        assert!(datapoints[0].get("SampleCount").is_none());
+        assert_eq!(datapoints[0]["Unit"], "Percent");
+    }
+
+    #[tokio::test]
+    async fn cloudwatch_json_list_metrics_returns_seeded_elasticache_metric() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO resources (id, resource_type, region, scenario, tags)
+             VALUES ('cache-1', 'elasticache', 'us-east-1', 'Baseline', '{}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO metrics (resource_id, namespace, metric_name, seconds_from_now, value)
+             VALUES ('cache-1', 'AWS/ElastiCache', 'CurrConnections', -3600, 25.0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let app = build_app(pool);
+        let body = json!({
+            "Namespace": "AWS/ElastiCache",
+            "MetricName": "CurrConnections",
+            "Dimensions": [{
+                "Name": "CacheClusterId"
+            }]
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-amz-json-1.0")
+                    .header("x-amz-target", "GraniteServiceVersion20100801.ListMetrics")
+                    .header("x-amzn-query-mode", "true")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["Metrics"][0]["Namespace"], "AWS/ElastiCache");
+        assert_eq!(body["Metrics"][0]["MetricName"], "CurrConnections");
+        assert_eq!(
+            body["Metrics"][0]["Dimensions"][0]["Name"],
+            "CacheClusterId"
+        );
+        assert_eq!(body["Metrics"][0]["Dimensions"][0]["Value"], "cache-1");
     }
 
     #[tokio::test]
@@ -7323,5 +7771,48 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(scenario, "Spike");
+    }
+
+    #[tokio::test]
+    async fn scenario_endpoint_generates_elasticache_metrics() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO resources (id, resource_type, region, scenario, tags)
+             VALUES ('cache-1', 'elasticache', 'us-east-1', 'Baseline', '{}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let app = build_app(pool.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_mock/scenario")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "scenario": "Spike",
+                            "resource_id": "cache-1"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let metric_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM metrics
+             WHERE resource_id = 'cache-1'
+               AND namespace = 'AWS/ElastiCache'
+               AND metric_name IN ('CPUUtilization', 'CurrConnections')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(metric_count, 672);
     }
 }
