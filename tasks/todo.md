@@ -1,3 +1,25 @@
+# Cost Explorer USAGE_TYPE Grouping Work
+
+- [x] Diagnose why AWS CLI `ce get-cost-and-usage --group-by Type=DIMENSION,Key=USAGE_TYPE` fails validation.
+- [x] Add `USAGE_TYPE` as a supported Cost Explorer grouping dimension.
+- [x] Return AWS-style mock usage type keys and `UsageQuantity` metrics for grouped cost responses.
+- [x] Add route tests for EC2 Compute and Elastic Load Balancing service-filtered usage type grouping.
+- [x] Run `cargo fmt`, focused Cost Explorer tests, `cargo test`, and `cargo clippy --all-targets --all-features`.
+
+## Cost Explorer USAGE_TYPE Results
+
+- `ce get-cost-and-usage` now accepts `GroupBy` key `USAGE_TYPE`.
+- Grouped Cost Explorer responses now include `UsageQuantity` when requested, using the same mock usage-rate mapping as usage forecasts.
+- Service-filtered EC2 Compute requests return `USE1-BoxUsage:m6i.xlarge`; service-filtered Elastic Load Balancing requests return `USE1-LoadBalancerUsage`.
+- Verification completed successfully:
+  - `cargo fmt`
+  - `cargo test cost_explorer_group_by_usage_type`
+  - `cargo test cost_explorer_group_by_service_returns_populated_groups`
+  - `cargo test`
+  - `cargo clippy --all-targets --all-features`
+  - `bash scripts/verify_cli_interop.sh`
+  - Targeted AWS CLI `USAGE_TYPE` checks for EC2 Compute and Elastic Load Balancing
+
 # CloudWatch JSON And ElastiCache Metrics Work
 
 - [x] Add CloudWatch JSON target support for `GraniteServiceVersion20100801.ListMetrics`.

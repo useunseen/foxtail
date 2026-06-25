@@ -159,6 +159,7 @@ curl http://127.0.0.1:8080/_mock/status
 Notes:
 
 - Cost Explorer targets accept both `AWSCostExplorer.*` and `AWSInsightsIndexService.*`
+- `get-cost-and-usage` supports grouping by `SERVICE`, `REGION`, `RESOURCE_ID`, and `USAGE_TYPE`
 - `get-cost-and-usage-with-resources` defaults to resource grouping in this mock
 - reservation, savings plan, anomaly, and rightsizing operations return synthetic mock outputs
 

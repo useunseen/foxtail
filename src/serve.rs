@@ -471,6 +471,26 @@ struct CostRow {
     tags_json: Option<String>,
 }
 
+#[derive(Clone, Copy, Default)]
+struct CostUsageAmounts {
+    unblended_cost: f64,
+    usage_quantity: f64,
+}
+
+impl CostUsageAmounts {
+    fn from_row(row: &CostRow) -> Self {
+        Self {
+            unblended_cost: row.amount,
+            usage_quantity: row.amount / mock_usage_rate_for_resource_type(&row.resource_type),
+        }
+    }
+
+    fn add(&mut self, other: Self) {
+        self.unblended_cost += other.unblended_cost;
+        self.usage_quantity += other.usage_quantity;
+    }
+}
+
 #[derive(Clone)]
 struct TaggedResource {
     arn: String,
@@ -1609,6 +1629,17 @@ fn ce_service_name_from_resource_type(resource_type: &str) -> &'static str {
     }
 }
 
+fn ce_usage_type_from_resource_type(resource_type: &str) -> &'static str {
+    match resource_type {
+        "ec2" => "USE1-BoxUsage:m6i.xlarge",
+        "rds" => "USE1-InstanceUsage:db.t3.medium",
+        "elasticache" => "USE1-NodeUsage:cache.t3.micro",
+        "elb" => "USE1-LoadBalancerUsage",
+        "s3" => "TimedStorage-ByteHrs",
+        _ => "Usage",
+    }
+}
+
 fn cloudwatch_dimension_name_for_resource_type(resource_type: &str) -> Option<&'static str> {
     match resource_type {
         "ec2" => Some("InstanceId"),
@@ -1889,12 +1920,45 @@ fn parse_group_by_dimension(
     }
 
     match group_key {
-        "SERVICE" | "REGION" | "RESOURCE_ID" => Ok(Some(group_key)),
+        "SERVICE" | "REGION" | "RESOURCE_ID" | "USAGE_TYPE" => Ok(Some(group_key)),
         _ => Err(CostUsageError::Validation(format!(
             "Unsupported GroupBy Key '{}'.",
             group_key
         ))),
     }
+}
+
+fn requested_cost_metric(metrics: Option<&Vec<String>>, metric: &str) -> bool {
+    match metrics {
+        Some(metrics) => metrics.iter().any(|requested| requested == metric),
+        None => metric == "UnblendedCost",
+    }
+}
+
+fn cost_usage_metrics_json(amounts: CostUsageAmounts, metrics: Option<&Vec<String>>) -> Value {
+    let mut metric_values = serde_json::Map::new();
+
+    if requested_cost_metric(metrics, "UnblendedCost") {
+        metric_values.insert(
+            "UnblendedCost".to_string(),
+            json!({
+                "Amount": format!("{:.2}", amounts.unblended_cost),
+                "Unit": "USD"
+            }),
+        );
+    }
+
+    if requested_cost_metric(metrics, "UsageQuantity") {
+        metric_values.insert(
+            "UsageQuantity".to_string(),
+            json!({
+                "Amount": format!("{:.4}", amounts.usage_quantity),
+                "Unit": "N/A"
+            }),
+        );
+    }
+
+    Value::Object(metric_values)
 }
 
 fn parse_resource_tags(tags_json: Option<&str>) -> HashMap<String, String> {
@@ -3736,11 +3800,18 @@ async fn build_cost_usage_response(
         .into_iter()
         .filter(|row| cost_row_matches_filter(row, &filter))
         .collect::<Vec<_>>();
-    let total_cost = filtered_rows.iter().map(|row| row.amount).sum::<f64>();
+    let total_amounts =
+        filtered_rows
+            .iter()
+            .fold(CostUsageAmounts::default(), |mut accumulator, row| {
+                accumulator.add(CostUsageAmounts::from_row(row));
+                accumulator
+            });
 
     let results_by_time = if let Some(group_dimension) = group_dimension {
-        let mut bucket_groups: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
-        let mut bucket_totals: BTreeMap<String, f64> = BTreeMap::new();
+        let mut bucket_groups: BTreeMap<String, BTreeMap<String, CostUsageAmounts>> =
+            BTreeMap::new();
+        let mut bucket_totals: BTreeMap<String, CostUsageAmounts> = BTreeMap::new();
         let mut bucket_ranges: BTreeMap<String, String> = BTreeMap::new();
 
         if daily {
@@ -3751,13 +3822,13 @@ async fn build_cost_usage_response(
                     .format("%Y-%m-%d")
                     .to_string();
                 bucket_groups.insert(bucket_start.clone(), BTreeMap::new());
-                bucket_totals.insert(bucket_start.clone(), 0.0);
+                bucket_totals.insert(bucket_start.clone(), CostUsageAmounts::default());
                 bucket_ranges.insert(bucket_start, bucket_end);
                 cursor += chrono::Duration::days(1);
             }
         } else {
             bucket_groups.insert(req.time_period.start.clone(), BTreeMap::new());
-            bucket_totals.insert(req.time_period.start.clone(), total_cost);
+            bucket_totals.insert(req.time_period.start.clone(), total_amounts);
             bucket_ranges.insert(req.time_period.start.clone(), req.time_period.end.clone());
         }
 
@@ -3774,13 +3845,15 @@ async fn build_cost_usage_response(
                 "SERVICE" => ce_service_name_from_resource_type(&row.resource_type).to_string(),
                 "REGION" => row.region.clone(),
                 "RESOURCE_ID" => row.resource_id.clone(),
+                "USAGE_TYPE" => ce_usage_type_from_resource_type(&row.resource_type).to_string(),
                 _ => unreachable!("group dimension validated above"),
             };
+            let amounts = CostUsageAmounts::from_row(&row);
 
             if let Some(groups) = bucket_groups.get_mut(&bucket_start) {
-                *groups.entry(group_key).or_insert(0.0) += row.amount;
+                groups.entry(group_key).or_default().add(amounts);
                 if daily {
-                    *bucket_totals.entry(bucket_start).or_insert(0.0) += row.amount;
+                    bucket_totals.entry(bucket_start).or_default().add(amounts);
                 }
             }
         }
@@ -3788,7 +3861,10 @@ async fn build_cost_usage_response(
         bucket_groups
             .into_iter()
             .map(|(bucket_start, groups)| {
-                let bucket_total = bucket_totals.get(&bucket_start).copied().unwrap_or(0.0);
+                let bucket_total = bucket_totals
+                    .get(&bucket_start)
+                    .copied()
+                    .unwrap_or_default();
                 let bucket_end = bucket_ranges
                     .get(&bucket_start)
                     .cloned()
@@ -3798,21 +3874,11 @@ async fn build_cost_usage_response(
                         "Start": bucket_start,
                         "End": bucket_end
                     },
-                    "Total": {
-                        "UnblendedCost": {
-                            "Amount": format!("{:.2}", bucket_total),
-                            "Unit": "USD"
-                        }
-                    },
+                    "Total": cost_usage_metrics_json(bucket_total, req.metrics.as_ref()),
                     "Groups": groups.into_iter().map(|(group_key, amount)| {
                         json!({
                             "Keys": [group_key],
-                            "Metrics": {
-                                "UnblendedCost": {
-                                    "Amount": format!("{:.2}", amount),
-                                    "Unit": "USD"
-                                }
-                            }
+                            "Metrics": cost_usage_metrics_json(amount, req.metrics.as_ref())
                         })
                     }).collect::<Vec<Value>>(),
                     "Estimated": true
@@ -3820,7 +3886,7 @@ async fn build_cost_usage_response(
             })
             .collect::<Vec<Value>>()
     } else if daily {
-        let mut bucket_totals: BTreeMap<String, f64> = BTreeMap::new();
+        let mut bucket_totals: BTreeMap<String, CostUsageAmounts> = BTreeMap::new();
         let mut bucket_ranges: BTreeMap<String, String> = BTreeMap::new();
 
         let mut cursor = start;
@@ -3829,7 +3895,7 @@ async fn build_cost_usage_response(
             let bucket_end = (cursor + chrono::Duration::days(1))
                 .format("%Y-%m-%d")
                 .to_string();
-            bucket_totals.insert(bucket_start.clone(), 0.0);
+            bucket_totals.insert(bucket_start.clone(), CostUsageAmounts::default());
             bucket_ranges.insert(bucket_start, bucket_end);
             cursor += chrono::Duration::days(1);
         }
@@ -3839,7 +3905,7 @@ async fn build_cost_usage_response(
                 .format("%Y-%m-%d")
                 .to_string();
             if let Some(total) = bucket_totals.get_mut(&bucket_start) {
-                *total += row.amount;
+                total.add(CostUsageAmounts::from_row(row));
             }
         }
 
@@ -3855,12 +3921,7 @@ async fn build_cost_usage_response(
                         "Start": bucket_start,
                         "End": bucket_end
                     },
-                    "Total": {
-                        "UnblendedCost": {
-                            "Amount": format!("{:.2}", total),
-                            "Unit": "USD"
-                        }
-                    },
+                    "Total": cost_usage_metrics_json(total, req.metrics.as_ref()),
                     "Groups": [],
                     "Estimated": true
                 })
@@ -3872,12 +3933,7 @@ async fn build_cost_usage_response(
                 "Start": req.time_period.start.clone(),
                 "End": req.time_period.end.clone()
             },
-            "Total": {
-                "UnblendedCost": {
-                    "Amount": format!("{:.2}", total_cost),
-                    "Unit": "USD"
-                }
-            },
+            "Total": cost_usage_metrics_json(total_amounts, req.metrics.as_ref()),
             "Groups": [],
             "Estimated": true
         })]
@@ -6586,6 +6642,157 @@ mod tests {
         assert_eq!(
             groups[0]["Metrics"]["UnblendedCost"]["Unit"],
             Value::String("USD".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn cost_explorer_group_by_usage_type_filters_ec2_and_returns_usage_quantity() {
+        let pool = test_pool().await;
+        let end = Utc::now().date_naive();
+        let start = end - chrono::Duration::days(1);
+        sqlx::query(
+            "INSERT INTO resources (id, resource_type, region, scenario, tags)
+             VALUES ('i-ec2', 'ec2', 'us-east-1', 'Baseline', '{}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO resources (id, resource_type, region, scenario, tags)
+             VALUES ('app/lb', 'elb', 'us-east-1', 'Baseline', '{}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO cost_records (resource_id, seconds_from_now, amount)
+             VALUES ('i-ec2', -86400, 19.20), ('app/lb', -86400, 2.25)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let app = build_app(pool);
+        let body = json!({
+            "TimePeriod": {
+                "Start": start.format("%Y-%m-%d").to_string(),
+                "End": end.format("%Y-%m-%d").to_string()
+            },
+            "Granularity": "MONTHLY",
+            "Metrics": ["UnblendedCost", "UsageQuantity"],
+            "GroupBy": [{
+                "Type": "DIMENSION",
+                "Key": "USAGE_TYPE"
+            }],
+            "Filter": {
+                "Dimensions": {
+                    "Key": "SERVICE",
+                    "Values": ["Amazon Elastic Compute Cloud - Compute"]
+                }
+            }
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-amz-json-1.1")
+                    .header("x-amz-target", "AWSInsightsIndexService.GetCostAndUsage")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["GroupDefinitions"][0]["Key"], "USAGE_TYPE");
+        let groups = body["ResultsByTime"][0]["Groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0]["Keys"][0], "USE1-BoxUsage:m6i.xlarge");
+        assert_eq!(
+            groups[0]["Metrics"]["UnblendedCost"]["Amount"],
+            Value::String("19.20".to_string())
+        );
+        assert_eq!(
+            groups[0]["Metrics"]["UsageQuantity"]["Amount"],
+            Value::String("200.0000".to_string())
+        );
+        assert_eq!(
+            body["ResultsByTime"][0]["Total"]["UsageQuantity"]["Unit"],
+            Value::String("N/A".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn cost_explorer_group_by_usage_type_filters_elb() {
+        let pool = test_pool().await;
+        let end = Utc::now().date_naive();
+        let start = end - chrono::Duration::days(1);
+        sqlx::query(
+            "INSERT INTO resources (id, resource_type, region, scenario, tags)
+             VALUES ('i-ec2', 'ec2', 'us-east-1', 'Baseline', '{}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO resources (id, resource_type, region, scenario, tags)
+             VALUES ('app/lb', 'elb', 'us-east-1', 'Baseline', '{}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO cost_records (resource_id, seconds_from_now, amount)
+             VALUES ('i-ec2', -86400, 19.20), ('app/lb', -86400, 2.25)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let app = build_app(pool);
+        let body = json!({
+            "TimePeriod": {
+                "Start": start.format("%Y-%m-%d").to_string(),
+                "End": end.format("%Y-%m-%d").to_string()
+            },
+            "Granularity": "MONTHLY",
+            "Metrics": ["UnblendedCost", "UsageQuantity"],
+            "GroupBy": [{
+                "Type": "DIMENSION",
+                "Key": "USAGE_TYPE"
+            }],
+            "Filter": {
+                "Dimensions": {
+                    "Key": "SERVICE",
+                    "Values": ["Elastic Load Balancing"]
+                }
+            }
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-amz-json-1.1")
+                    .header("x-amz-target", "AWSInsightsIndexService.GetCostAndUsage")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        let groups = body["ResultsByTime"][0]["Groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0]["Keys"][0], "USE1-LoadBalancerUsage");
+        assert_eq!(
+            groups[0]["Metrics"]["UsageQuantity"]["Amount"],
+            Value::String("100.0000".to_string())
         );
     }
 
