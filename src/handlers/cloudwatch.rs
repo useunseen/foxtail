@@ -183,6 +183,13 @@ pub struct MetricDataXmlSeries {
     pub timestamps: Vec<String>,
 }
 
+pub struct MetricDataJsonSeries {
+    pub id: String,
+    pub label: String,
+    pub values: Vec<f64>,
+    pub timestamps: Vec<String>,
+}
+
 pub fn to_xml<T: Serialize>(val: &T) -> Result<String> {
     Ok(to_string(val)?)
 }
@@ -260,6 +267,33 @@ pub fn get_metric_data_xml(
     };
 
     to_xml(&response)
+}
+
+pub fn get_metric_data_json(
+    series: Vec<MetricDataJsonSeries>,
+    next_token: Option<String>,
+) -> Value {
+    let results = series
+        .into_iter()
+        .map(|series| {
+            json!({
+                "Id": series.id,
+                "Label": series.label,
+                "StatusCode": "Complete",
+                "Values": series.values,
+                "Timestamps": series.timestamps
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut response = json!({
+        "MetricDataResults": results,
+        "Messages": []
+    });
+    if let Some(next_token) = next_token {
+        response["NextToken"] = json!(next_token);
+    }
+    response
 }
 
 pub fn list_metrics_json(metrics: Vec<Metric>, next_token: Option<String>) -> Value {

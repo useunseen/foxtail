@@ -61,6 +61,13 @@ pub fn cost_and_usage_response(
     response
 }
 
+pub fn dimension_group_definition(key: &str) -> Value {
+    json!({
+        "Type": "DIMENSION",
+        "Key": key
+    })
+}
+
 pub fn metrics_json(amounts: CostUsageMetricAmounts, metrics: Option<&Vec<String>>) -> Value {
     let mut metric_values = serde_json::Map::new();
 

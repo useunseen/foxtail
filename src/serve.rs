@@ -3923,10 +3923,7 @@ async fn build_cost_usage_response(
     let group_definitions = if let Some(group_by) = req.group_by.clone() {
         group_by
     } else if let Some(default_group_dimension) = default_group_dimension {
-        vec![json!({
-            "Type": "DIMENSION",
-            "Key": default_group_dimension
-        })]
+        vec![ce::dimension_group_definition(default_group_dimension)]
     } else {
         Vec::new()
     };
@@ -5844,27 +5841,15 @@ async fn handle_get_metric_data(
     let results = paginated
         .results
         .into_iter()
-        .map(|series| {
-            json!({
-                "Id": series.id,
-                "Label": series.label,
-                "StatusCode": "Complete",
-                "Values": series.values,
-                "Timestamps": series.timestamps
-            })
+        .map(|series| cw::MetricDataJsonSeries {
+            id: series.id,
+            label: series.label,
+            values: series.values,
+            timestamps: series.timestamps,
         })
         .collect::<Vec<_>>();
 
-    let mut response = json!({
-        "MetricDataResults": results
-    });
-    // Keep field present for coverage/contract shape expectations.
-    response["Messages"] = json!([]);
-    if let Some(next_token) = paginated.next_token {
-        response["NextToken"] = json!(next_token);
-    }
-
-    Ok(response)
+    Ok(cw::get_metric_data_json(results, paginated.next_token))
 }
 
 #[cfg(test)]
