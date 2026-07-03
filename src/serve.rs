@@ -17,7 +17,7 @@ use tracing::{debug, info, warn};
 
 use crate::cli::Scenario;
 use crate::generator;
-use crate::handlers::cloudwatch as cw;
+use crate::handlers::{cloudwatch as cw, cost_explorer as ce};
 use crate::metrics::{self, MetricQueryParams};
 
 const ADMIN_TOKEN_HEADER: &str = "x-mock-admin-token";
@@ -34,7 +34,7 @@ pub async fn run(pool: SqlitePool, address: String, port: u16) -> Result<()> {
     Ok(())
 }
 
-fn build_app(pool: SqlitePool) -> Router {
+pub fn build_app(pool: SqlitePool) -> Router {
     Router::new()
         .route("/", post(aws_handler))
         .route("/_mock/status", get(status_handler))
@@ -488,6 +488,15 @@ impl CostUsageAmounts {
     fn add(&mut self, other: Self) {
         self.unblended_cost += other.unblended_cost;
         self.usage_quantity += other.usage_quantity;
+    }
+}
+
+impl From<CostUsageAmounts> for ce::CostUsageMetricAmounts {
+    fn from(amounts: CostUsageAmounts) -> Self {
+        Self {
+            unblended_cost: amounts.unblended_cost,
+            usage_quantity: amounts.usage_quantity,
+        }
     }
 }
 
@@ -1926,39 +1935,6 @@ fn parse_group_by_dimension(
             group_key
         ))),
     }
-}
-
-fn requested_cost_metric(metrics: Option<&Vec<String>>, metric: &str) -> bool {
-    match metrics {
-        Some(metrics) => metrics.iter().any(|requested| requested == metric),
-        None => metric == "UnblendedCost",
-    }
-}
-
-fn cost_usage_metrics_json(amounts: CostUsageAmounts, metrics: Option<&Vec<String>>) -> Value {
-    let mut metric_values = serde_json::Map::new();
-
-    if requested_cost_metric(metrics, "UnblendedCost") {
-        metric_values.insert(
-            "UnblendedCost".to_string(),
-            json!({
-                "Amount": format!("{:.2}", amounts.unblended_cost),
-                "Unit": "USD"
-            }),
-        );
-    }
-
-    if requested_cost_metric(metrics, "UsageQuantity") {
-        metric_values.insert(
-            "UsageQuantity".to_string(),
-            json!({
-                "Amount": format!("{:.4}", amounts.usage_quantity),
-                "Unit": "N/A"
-            }),
-        );
-    }
-
-    Value::Object(metric_values)
 }
 
 fn parse_resource_tags(tags_json: Option<&str>) -> HashMap<String, String> {
@@ -3874,11 +3850,11 @@ async fn build_cost_usage_response(
                         "Start": bucket_start,
                         "End": bucket_end
                     },
-                    "Total": cost_usage_metrics_json(bucket_total, req.metrics.as_ref()),
+                    "Total": ce::metrics_json(bucket_total.into(), req.metrics.as_ref()),
                     "Groups": groups.into_iter().map(|(group_key, amount)| {
                         json!({
                             "Keys": [group_key],
-                            "Metrics": cost_usage_metrics_json(amount, req.metrics.as_ref())
+                            "Metrics": ce::metrics_json(amount.into(), req.metrics.as_ref())
                         })
                     }).collect::<Vec<Value>>(),
                     "Estimated": true
@@ -3921,7 +3897,7 @@ async fn build_cost_usage_response(
                         "Start": bucket_start,
                         "End": bucket_end
                     },
-                    "Total": cost_usage_metrics_json(total, req.metrics.as_ref()),
+                    "Total": ce::metrics_json(total.into(), req.metrics.as_ref()),
                     "Groups": [],
                     "Estimated": true
                 })
@@ -3933,7 +3909,7 @@ async fn build_cost_usage_response(
                 "Start": req.time_period.start.clone(),
                 "End": req.time_period.end.clone()
             },
-            "Total": cost_usage_metrics_json(total_amounts, req.metrics.as_ref()),
+            "Total": ce::metrics_json(total_amounts.into(), req.metrics.as_ref()),
             "Groups": [],
             "Estimated": true
         })]
@@ -5810,30 +5786,7 @@ async fn handle_list_metrics_json(
     }
 
     let page = list_metrics_page(&pool, query).await?;
-    let metrics = page
-        .metrics
-        .into_iter()
-        .map(|metric| {
-            json!({
-                "Namespace": metric.namespace,
-                "MetricName": metric.metric_name,
-                "Dimensions": metric.dimensions.members.into_iter().map(|dimension| {
-                    json!({
-                        "Name": dimension.name,
-                        "Value": dimension.value
-                    })
-                }).collect::<Vec<_>>()
-            })
-        })
-        .collect::<Vec<_>>();
-
-    let mut response = json!({
-        "Metrics": metrics
-    });
-    if let Some(next_token) = page.next_token {
-        response["NextToken"] = json!(next_token);
-    }
-    Ok(response)
+    Ok(cw::list_metrics_json(page.metrics, page.next_token))
 }
 
 async fn handle_get_metric_statistics_json(
@@ -5877,34 +5830,28 @@ async fn handle_get_metric_statistics_json(
     } = build_metric_statistics_series(&pool, request, injected_now).await?;
     let datapoints = datapoints
         .into_iter()
-        .map(|point| {
-            let mut datapoint = json!({
-                "Timestamp": point.timestamp.to_rfc3339(),
-                "Unit": metric_unit.clone()
-            });
-            if statistics.contains(&StandardStatistic::SampleCount) {
-                datapoint["SampleCount"] = json!(point.sample_count);
-            }
-            if statistics.contains(&StandardStatistic::Average) {
-                datapoint["Average"] = json!(point.average);
-            }
-            if statistics.contains(&StandardStatistic::Sum) {
-                datapoint["Sum"] = json!(point.sum);
-            }
-            if statistics.contains(&StandardStatistic::Minimum) {
-                datapoint["Minimum"] = json!(point.minimum);
-            }
-            if statistics.contains(&StandardStatistic::Maximum) {
-                datapoint["Maximum"] = json!(point.maximum);
-            }
-            datapoint
+        .map(|point| cw::JsonDatapoint {
+            timestamp: point.timestamp.to_rfc3339(),
+            unit: metric_unit.clone(),
+            sample_count: statistics
+                .contains(&StandardStatistic::SampleCount)
+                .then_some(point.sample_count),
+            average: statistics
+                .contains(&StandardStatistic::Average)
+                .then_some(point.average),
+            sum: statistics
+                .contains(&StandardStatistic::Sum)
+                .then_some(point.sum),
+            minimum: statistics
+                .contains(&StandardStatistic::Minimum)
+                .then_some(point.minimum),
+            maximum: statistics
+                .contains(&StandardStatistic::Maximum)
+                .then_some(point.maximum),
         })
         .collect::<Vec<_>>();
 
-    Ok(json!({
-        "Label": metric_name,
-        "Datapoints": datapoints
-    }))
+    Ok(cw::get_metric_statistics_json(metric_name, datapoints))
 }
 
 async fn handle_get_metric_data(

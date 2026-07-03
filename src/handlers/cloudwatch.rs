@@ -1,6 +1,7 @@
 use anyhow::Result;
 use quick_xml::se::to_string;
 use serde::Serialize;
+use serde_json::{Value, json};
 
 #[derive(Serialize)]
 #[serde(rename = "ErrorResponse")]
@@ -166,6 +167,75 @@ pub struct Dimension {
     pub value: String,
 }
 
+pub struct JsonDatapoint {
+    pub timestamp: String,
+    pub unit: String,
+    pub sample_count: Option<f64>,
+    pub average: Option<f64>,
+    pub sum: Option<f64>,
+    pub minimum: Option<f64>,
+    pub maximum: Option<f64>,
+}
+
 pub fn to_xml<T: Serialize>(val: &T) -> Result<String> {
     Ok(to_string(val)?)
+}
+
+pub fn list_metrics_json(metrics: Vec<Metric>, next_token: Option<String>) -> Value {
+    let metrics = metrics
+        .into_iter()
+        .map(|metric| {
+            json!({
+                "Namespace": metric.namespace,
+                "MetricName": metric.metric_name,
+                "Dimensions": metric.dimensions.members.into_iter().map(|dimension| {
+                    json!({
+                        "Name": dimension.name,
+                        "Value": dimension.value
+                    })
+                }).collect::<Vec<_>>()
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut response = json!({
+        "Metrics": metrics
+    });
+    if let Some(next_token) = next_token {
+        response["NextToken"] = json!(next_token);
+    }
+    response
+}
+
+pub fn get_metric_statistics_json(label: String, datapoints: Vec<JsonDatapoint>) -> Value {
+    let datapoints = datapoints
+        .into_iter()
+        .map(|point| {
+            let mut datapoint = json!({
+                "Timestamp": point.timestamp,
+                "Unit": point.unit
+            });
+            if let Some(sample_count) = point.sample_count {
+                datapoint["SampleCount"] = json!(sample_count);
+            }
+            if let Some(average) = point.average {
+                datapoint["Average"] = json!(average);
+            }
+            if let Some(sum) = point.sum {
+                datapoint["Sum"] = json!(sum);
+            }
+            if let Some(minimum) = point.minimum {
+                datapoint["Minimum"] = json!(minimum);
+            }
+            if let Some(maximum) = point.maximum {
+                datapoint["Maximum"] = json!(maximum);
+            }
+            datapoint
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "Label": label,
+        "Datapoints": datapoints
+    })
 }

@@ -452,3 +452,9 @@
   - `make -n gen-idle-heavy`
   - `make gen-idle-heavy`
 - `bash scripts/verify_cli_interop.sh` was not completed because the first run happened before `mock_data.db` existed. After generation, LocalStack discovery completed but found no resources in this environment, so the full AWS CLI smoke suite would not have useful seeded data to validate.
+
+## PR Review Follow-Up
+
+- [x] Move newly added CloudWatch JSON and Cost Explorer metric response formatting into `src/handlers/`.
+- [x] Add integration tests under `tests/` for CloudWatch JSON/XML statistic responses and Cost Explorer `USAGE_TYPE` grouping.
+- [x] Update the local repository instructions to reference `target/debug/foxtail`.
