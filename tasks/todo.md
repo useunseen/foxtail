@@ -464,3 +464,4 @@
 - [x] Add CloudWatch JSON `ListMetrics` and `GetMetricStatistics` targets to the dashboard supported API inventory.
 - [x] Move generic AWS JSON/XML error body serialization into `src/handlers/aws.rs`.
 - [x] Clarify the handler ownership standard so reusable/extracted response builders live in `src/handlers/` while established endpoint orchestration can remain in `serve.rs`.
+- [x] Count distinct operation names, not protocol inventory entries, in dashboard service scorecards.

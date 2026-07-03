@@ -1038,11 +1038,15 @@ fn build_coverage_scorecard(supported_apis: &[DashboardApiEntry]) -> DashboardCo
     let cloudwatch_implemented_operations = supported_apis
         .iter()
         .filter(|entry| entry.service == "cloudwatch")
-        .count() as i64;
+        .map(|entry| entry.operation.as_str())
+        .collect::<BTreeSet<_>>()
+        .len() as i64;
     let cost_explorer_implemented_operations = supported_apis
         .iter()
         .filter(|entry| entry.service == "cost-explorer")
-        .count() as i64;
+        .map(|entry| entry.operation.as_str())
+        .collect::<BTreeSet<_>>()
+        .len() as i64;
     let cloudwatch_summary = DashboardCoverageServiceSummary {
         total_operations: 39,
         implemented_operations: cloudwatch_implemented_operations,
@@ -5944,7 +5948,9 @@ mod tests {
             .unwrap()
             .iter()
             .filter(|entry| entry["service"] == "cloudwatch")
-            .count() as i64;
+            .filter_map(|entry| entry["operation"].as_str())
+            .collect::<BTreeSet<_>>()
+            .len() as i64;
         let supported_targets = body["supported_apis"]
             .as_array()
             .unwrap()
