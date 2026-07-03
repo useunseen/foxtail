@@ -177,8 +177,89 @@ pub struct JsonDatapoint {
     pub maximum: Option<f64>,
 }
 
+pub struct MetricDataXmlSeries {
+    pub id: String,
+    pub values: Vec<f64>,
+    pub timestamps: Vec<String>,
+}
+
 pub fn to_xml<T: Serialize>(val: &T) -> Result<String> {
     Ok(to_string(val)?)
+}
+
+pub fn list_metrics_xml(metrics: Vec<Metric>, next_token: Option<String>) -> Result<String> {
+    let response = ListMetricsResponse {
+        xmlns: "http://monitoring.amazonaws.com/doc/2010-08-01/".to_string(),
+        result: ListMetricsResult {
+            metrics: Metrics { members: metrics },
+            next_token,
+        },
+        metadata: ResponseMetadata {
+            request_id: "mock-id".to_string(),
+        },
+    };
+
+    to_xml(&response)
+}
+
+pub fn get_metric_statistics_xml(label: String, datapoints: Vec<JsonDatapoint>) -> Result<String> {
+    let response = GetMetricStatisticsResponse {
+        xmlns: "http://monitoring.amazonaws.com/doc/2010-08-01/".to_string(),
+        result: GetMetricStatisticsResult {
+            datapoints: Datapoints {
+                members: datapoints
+                    .into_iter()
+                    .map(|point| Datapoint {
+                        timestamp: point.timestamp,
+                        sample_count: point.sample_count,
+                        average: point.average,
+                        sum: point.sum,
+                        minimum: point.minimum,
+                        maximum: point.maximum,
+                        unit: point.unit,
+                    })
+                    .collect(),
+            },
+            label,
+        },
+        metadata: ResponseMetadata {
+            request_id: "mock-id".to_string(),
+        },
+    };
+
+    to_xml(&response)
+}
+
+pub fn get_metric_data_xml(
+    series: Vec<MetricDataXmlSeries>,
+    next_token: Option<String>,
+) -> Result<String> {
+    let response = GetMetricDataResponse {
+        xmlns: "http://monitoring.amazonaws.com/doc/2010-08-01/".to_string(),
+        result: GetMetricDataResult {
+            results: MetricDataResults {
+                members: series
+                    .into_iter()
+                    .map(|series| MetricDataResult {
+                        id: series.id,
+                        status_code: "Complete".to_string(),
+                        values: Values {
+                            members: series.values,
+                        },
+                        timestamps: Timestamps {
+                            members: series.timestamps,
+                        },
+                    })
+                    .collect(),
+            },
+            next_token,
+        },
+        metadata: ResponseMetadata {
+            request_id: "mock-id".to_string(),
+        },
+    };
+
+    to_xml(&response)
 }
 
 pub fn list_metrics_json(metrics: Vec<Metric>, next_token: Option<String>) -> Value {

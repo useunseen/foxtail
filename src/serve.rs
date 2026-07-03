@@ -1033,16 +1033,25 @@ async fn fetch_dashboard_cost_rows(
     .await?)
 }
 
-fn build_coverage_scorecard(implemented_api_entries: i64) -> DashboardCoverageScorecard {
+fn build_coverage_scorecard(supported_apis: &[DashboardApiEntry]) -> DashboardCoverageScorecard {
+    let implemented_api_entries = supported_apis.len() as i64;
+    let cloudwatch_implemented_operations = supported_apis
+        .iter()
+        .filter(|entry| entry.service == "cloudwatch")
+        .count() as i64;
+    let cost_explorer_implemented_operations = supported_apis
+        .iter()
+        .filter(|entry| entry.service == "cost-explorer")
+        .count() as i64;
     let cloudwatch_summary = DashboardCoverageServiceSummary {
         total_operations: 39,
-        implemented_operations: 2,
-        unimplemented_operations: 37,
+        implemented_operations: cloudwatch_implemented_operations,
+        unimplemented_operations: 39 - cloudwatch_implemented_operations,
     };
     let cost_explorer_summary = DashboardCoverageServiceSummary {
         total_operations: 46,
-        implemented_operations: 13,
-        unimplemented_operations: 33,
+        implemented_operations: cost_explorer_implemented_operations,
+        unimplemented_operations: 46 - cost_explorer_implemented_operations,
     };
 
     DashboardCoverageScorecard {
@@ -3194,7 +3203,7 @@ async fn build_dashboard_data(
         endpoint: None,
     });
 
-    let implemented_api_entries = supported_apis.len() as i64;
+    let coverage_scorecard = build_coverage_scorecard(&supported_apis);
 
     Ok(DashboardDataResponse {
         generated_at: now.to_rfc3339(),
@@ -3208,7 +3217,7 @@ async fn build_dashboard_data(
         top_cost_resources,
         top_low_utilization_resources,
         applied_filters: dashboard_applied_filters(&query),
-        coverage_scorecard: build_coverage_scorecard(implemented_api_entries),
+        coverage_scorecard,
     })
 }
 
@@ -3845,20 +3854,20 @@ async fn build_cost_usage_response(
                     .get(&bucket_start)
                     .cloned()
                     .unwrap_or_else(|| req.time_period.end.clone());
-                json!({
-                    "TimePeriod": {
-                        "Start": bucket_start,
-                        "End": bucket_end
-                    },
-                    "Total": ce::metrics_json(bucket_total.into(), req.metrics.as_ref()),
-                    "Groups": groups.into_iter().map(|(group_key, amount)| {
-                        json!({
-                            "Keys": [group_key],
-                            "Metrics": ce::metrics_json(amount.into(), req.metrics.as_ref())
-                        })
-                    }).collect::<Vec<Value>>(),
-                    "Estimated": true
-                })
+                let groups = groups
+                    .into_iter()
+                    .map(|(key, amount)| ce::CostUsageGroup {
+                        key,
+                        amounts: amount.into(),
+                    })
+                    .collect::<Vec<_>>();
+                ce::time_bucket_json(
+                    bucket_start,
+                    bucket_end,
+                    bucket_total.into(),
+                    groups,
+                    req.metrics.as_ref(),
+                )
             })
             .collect::<Vec<Value>>()
     } else if daily {
@@ -3892,27 +3901,23 @@ async fn build_cost_usage_response(
                     .get(&bucket_start)
                     .cloned()
                     .unwrap_or_else(|| req.time_period.end.clone());
-                json!({
-                    "TimePeriod": {
-                        "Start": bucket_start,
-                        "End": bucket_end
-                    },
-                    "Total": ce::metrics_json(total.into(), req.metrics.as_ref()),
-                    "Groups": [],
-                    "Estimated": true
-                })
+                ce::time_bucket_json(
+                    bucket_start,
+                    bucket_end,
+                    total.into(),
+                    Vec::new(),
+                    req.metrics.as_ref(),
+                )
             })
             .collect::<Vec<Value>>()
     } else {
-        vec![json!({
-            "TimePeriod": {
-                "Start": req.time_period.start.clone(),
-                "End": req.time_period.end.clone()
-            },
-            "Total": ce::metrics_json(total_amounts.into(), req.metrics.as_ref()),
-            "Groups": [],
-            "Estimated": true
-        })]
+        vec![ce::time_bucket_json(
+            req.time_period.start.clone(),
+            req.time_period.end.clone(),
+            total_amounts.into(),
+            Vec::new(),
+            req.metrics.as_ref(),
+        )]
     };
 
     let group_definitions = if let Some(group_by) = req.group_by.clone() {
@@ -3926,26 +3931,16 @@ async fn build_cost_usage_response(
         Vec::new()
     };
 
-    let mut response = json!({
-        "GroupDefinitions": group_definitions,
-        "DimensionValueAttributes": [],
-        "ResultsByTime": results_by_time
-    });
+    let include_next_page_token =
+        req.next_page_token.is_some() || req.billing_view_arn.is_some() || req.filter.is_some();
 
-    // Include token key when caller is traversing pages so parity coverage can
-    // validate top-level token shape.
-    if req.next_page_token.is_some() || req.billing_view_arn.is_some() || req.filter.is_some() {
-        response["NextPageToken"] = Value::Null;
-    }
-
-    if let Some(granularity) = req.granularity.as_ref() {
-        response["Granularity"] = json!(granularity);
-    }
-    if let Some(metrics) = req.metrics.clone() {
-        response["RequestedMetrics"] = json!(metrics);
-    }
-
-    Ok(response)
+    Ok(ce::cost_and_usage_response(
+        group_definitions,
+        results_by_time,
+        include_next_page_token,
+        req.granularity.as_ref(),
+        req.metrics.as_ref(),
+    ))
 }
 
 async fn handle_get_cost_forecast(
@@ -5378,21 +5373,7 @@ async fn handle_list_metrics(
     query: CloudWatchQuery,
 ) -> std::result::Result<String, String> {
     let page = list_metrics_page(&pool, query).await?;
-
-    let response = cw::ListMetricsResponse {
-        xmlns: "http://monitoring.amazonaws.com/doc/2010-08-01/".to_string(),
-        result: cw::ListMetricsResult {
-            metrics: cw::Metrics {
-                members: page.metrics,
-            },
-            next_token: page.next_token,
-        },
-        metadata: cw::ResponseMetadata {
-            request_id: "mock-id".to_string(),
-        },
-    };
-
-    cw::to_xml(&response).map_err(|e| e.to_string())
+    cw::list_metrics_xml(page.metrics, page.next_token).map_err(|e| e.to_string())
 }
 
 async fn list_metrics_page(
@@ -5523,33 +5504,17 @@ async fn handle_get_metric_data_xml(
     .await?;
     let paginated = paginate_metric_data_series(series_list, page_start, max_datapoints)?;
 
-    let response = cw::GetMetricDataResponse {
-        xmlns: "http://monitoring.amazonaws.com/doc/2010-08-01/".to_string(),
-        result: cw::GetMetricDataResult {
-            results: cw::MetricDataResults {
-                members: paginated
-                    .results
-                    .into_iter()
-                    .map(|series| cw::MetricDataResult {
-                        id: series.id,
-                        status_code: "Complete".to_string(),
-                        values: cw::Values {
-                            members: series.values,
-                        },
-                        timestamps: cw::Timestamps {
-                            members: series.timestamps,
-                        },
-                    })
-                    .collect(),
-            },
-            next_token: paginated.next_token,
-        },
-        metadata: cw::ResponseMetadata {
-            request_id: "mock-id".to_string(),
-        },
-    };
+    let series = paginated
+        .results
+        .into_iter()
+        .map(|series| cw::MetricDataXmlSeries {
+            id: series.id,
+            values: series.values,
+            timestamps: series.timestamps,
+        })
+        .collect::<Vec<_>>();
 
-    cw::to_xml(&response).map_err(MetricDataError::Internal)
+    cw::get_metric_data_xml(series, paginated.next_token).map_err(MetricDataError::Internal)
 }
 
 async fn handle_get_metric_statistics(
@@ -5565,41 +5530,37 @@ async fn handle_get_metric_statistics(
         datapoints,
     } = build_metric_statistics_series(&pool, request, injected_now).await?;
 
-    let response = cw::GetMetricStatisticsResponse {
-        xmlns: "http://monitoring.amazonaws.com/doc/2010-08-01/".to_string(),
-        result: cw::GetMetricStatisticsResult {
-            datapoints: cw::Datapoints {
-                members: datapoints
-                    .into_iter()
-                    .map(|point| cw::Datapoint {
-                        timestamp: point.timestamp.to_rfc3339(),
-                        sample_count: statistics
-                            .contains(&StandardStatistic::SampleCount)
-                            .then_some(point.sample_count),
-                        average: statistics
-                            .contains(&StandardStatistic::Average)
-                            .then_some(point.average),
-                        sum: statistics
-                            .contains(&StandardStatistic::Sum)
-                            .then_some(point.sum),
-                        minimum: statistics
-                            .contains(&StandardStatistic::Minimum)
-                            .then_some(point.minimum),
-                        maximum: statistics
-                            .contains(&StandardStatistic::Maximum)
-                            .then_some(point.maximum),
-                        unit: metric_unit.clone(),
-                    })
-                    .collect(),
-            },
-            label: metric_name,
-        },
-        metadata: cw::ResponseMetadata {
-            request_id: "mock-id".to_string(),
-        },
-    };
+    let datapoints = metric_statistics_datapoints(datapoints, &statistics, &metric_unit);
+    cw::get_metric_statistics_xml(metric_name, datapoints).map_err(MetricStatisticsError::Internal)
+}
 
-    cw::to_xml(&response).map_err(MetricStatisticsError::Internal)
+fn metric_statistics_datapoints(
+    datapoints: Vec<AggregatedMetricPoint>,
+    statistics: &[StandardStatistic],
+    metric_unit: &str,
+) -> Vec<cw::JsonDatapoint> {
+    datapoints
+        .into_iter()
+        .map(|point| cw::JsonDatapoint {
+            timestamp: point.timestamp.to_rfc3339(),
+            unit: metric_unit.to_string(),
+            sample_count: statistics
+                .contains(&StandardStatistic::SampleCount)
+                .then_some(point.sample_count),
+            average: statistics
+                .contains(&StandardStatistic::Average)
+                .then_some(point.average),
+            sum: statistics
+                .contains(&StandardStatistic::Sum)
+                .then_some(point.sum),
+            minimum: statistics
+                .contains(&StandardStatistic::Minimum)
+                .then_some(point.minimum),
+            maximum: statistics
+                .contains(&StandardStatistic::Maximum)
+                .then_some(point.maximum),
+        })
+        .collect()
 }
 
 async fn build_metric_statistics_series(
@@ -5828,28 +5789,7 @@ async fn handle_get_metric_statistics_json(
         statistics,
         datapoints,
     } = build_metric_statistics_series(&pool, request, injected_now).await?;
-    let datapoints = datapoints
-        .into_iter()
-        .map(|point| cw::JsonDatapoint {
-            timestamp: point.timestamp.to_rfc3339(),
-            unit: metric_unit.clone(),
-            sample_count: statistics
-                .contains(&StandardStatistic::SampleCount)
-                .then_some(point.sample_count),
-            average: statistics
-                .contains(&StandardStatistic::Average)
-                .then_some(point.average),
-            sum: statistics
-                .contains(&StandardStatistic::Sum)
-                .then_some(point.sum),
-            minimum: statistics
-                .contains(&StandardStatistic::Minimum)
-                .then_some(point.minimum),
-            maximum: statistics
-                .contains(&StandardStatistic::Maximum)
-                .then_some(point.maximum),
-        })
-        .collect::<Vec<_>>();
+    let datapoints = metric_statistics_datapoints(datapoints, &statistics, &metric_unit);
 
     Ok(cw::get_metric_statistics_json(metric_name, datapoints))
 }
@@ -6013,6 +5953,16 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
+        let supported_cloudwatch_operations = body["supported_apis"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["service"] == "cloudwatch")
+            .count() as i64;
+        assert_eq!(
+            body["coverage_scorecard"]["cloudwatch"]["implemented_operations"],
+            json!(supported_cloudwatch_operations)
+        );
         assert_eq!(body["coverage_scorecard"]["implemented_tested_entries"], 0);
         assert_eq!(
             body["coverage_scorecard"]["benchmarks"]["operation_coverage"],

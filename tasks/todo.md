@@ -458,3 +458,5 @@
 - [x] Move newly added CloudWatch JSON and Cost Explorer metric response formatting into `src/handlers/`.
 - [x] Add integration tests under `tests/` for CloudWatch JSON/XML statistic responses and Cost Explorer `USAGE_TYPE` grouping.
 - [x] Update the local repository instructions to reference `target/debug/foxtail`.
+- [x] Move the remaining touched CloudWatch and Cost Explorer response envelope builders into `src/handlers/`.
+- [x] Derive the dashboard CloudWatch scorecard count from the supported API inventory.
