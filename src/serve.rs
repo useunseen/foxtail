@@ -3074,9 +3074,25 @@ async fn build_dashboard_data(
         DashboardApiEntry {
             service: "cloudwatch".to_string(),
             operation: "GetMetricStatistics".to_string(),
+            protocol: "json-1.0".to_string(),
+            target: Some("GraniteServiceVersion20100801.GetMetricStatistics".to_string()),
+            action: None,
+            endpoint: None,
+        },
+        DashboardApiEntry {
+            service: "cloudwatch".to_string(),
+            operation: "GetMetricStatistics".to_string(),
             protocol: "query-xml".to_string(),
             target: None,
             action: Some("GetMetricStatistics".to_string()),
+            endpoint: None,
+        },
+        DashboardApiEntry {
+            service: "cloudwatch".to_string(),
+            operation: "ListMetrics".to_string(),
+            protocol: "json-1.0".to_string(),
+            target: Some("GraniteServiceVersion20100801.ListMetrics".to_string()),
+            action: None,
             endpoint: None,
         },
         DashboardApiEntry {
@@ -5944,6 +5960,14 @@ mod tests {
             .iter()
             .filter(|entry| entry["service"] == "cloudwatch")
             .count() as i64;
+        let supported_targets = body["supported_apis"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["target"].as_str())
+            .collect::<Vec<_>>();
+        assert!(supported_targets.contains(&"GraniteServiceVersion20100801.ListMetrics"));
+        assert!(supported_targets.contains(&"GraniteServiceVersion20100801.GetMetricStatistics"));
         assert_eq!(
             body["coverage_scorecard"]["cloudwatch"]["implemented_operations"],
             json!(supported_cloudwatch_operations)

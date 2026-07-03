@@ -461,3 +461,4 @@
 - [x] Move the remaining touched CloudWatch and Cost Explorer response envelope builders into `src/handlers/`.
 - [x] Derive the dashboard CloudWatch scorecard count from the supported API inventory.
 - [x] Move CloudWatch JSON `GetMetricData` and default Cost Explorer group-definition shaping into handler helpers.
+- [x] Add CloudWatch JSON `ListMetrics` and `GetMetricStatistics` targets to the dashboard supported API inventory.
