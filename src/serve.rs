@@ -17,7 +17,7 @@ use tracing::{debug, info, warn};
 
 use crate::cli::Scenario;
 use crate::generator;
-use crate::handlers::{cloudwatch as cw, cost_explorer as ce};
+use crate::handlers::{aws, cloudwatch as cw, cost_explorer as ce};
 use crate::metrics::{self, MetricQueryParams};
 
 const ADMIN_TOKEN_HEADER: &str = "x-mock-admin-token";
@@ -1531,10 +1531,7 @@ fn error_response(
 ) -> axum::response::Response {
     match protocol {
         Protocol::Json => {
-            let body = Json(json!({
-                "__type": code,
-                "Message": message
-            }));
+            let body = Json(aws::json_error(code, message));
             let mut res = (status, body).into_response();
             res.headers_mut().insert(
                 header::CONTENT_TYPE,
@@ -1548,19 +1545,7 @@ fn error_response(
             res
         }
         Protocol::Xml => {
-            let error_xml = cw::ErrorResponse {
-                error: cw::ErrorDetails {
-                    code: code.to_string(),
-                    message: message.to_string(),
-                },
-                request_id: "mock-id".to_string(),
-            };
-            let body = cw::to_xml(&error_xml).unwrap_or_else(|_| {
-                format!(
-                    "<ErrorResponse><Error><Code>{}</Code><Message>{}</Message></Error><RequestId>mock-id</RequestId></ErrorResponse>",
-                    code, message
-                )
-            });
+            let body = aws::xml_error(code, message);
             let mut res = (status, body).into_response();
             res.headers_mut().insert(
                 header::CONTENT_TYPE,

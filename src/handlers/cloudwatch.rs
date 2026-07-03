@@ -4,23 +4,6 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 #[derive(Serialize)]
-#[serde(rename = "ErrorResponse")]
-pub struct ErrorResponse {
-    #[serde(rename = "Error")]
-    pub error: ErrorDetails,
-    #[serde(rename = "RequestId")]
-    pub request_id: String,
-}
-
-#[derive(Serialize)]
-pub struct ErrorDetails {
-    #[serde(rename = "Code")]
-    pub code: String,
-    #[serde(rename = "Message")]
-    pub message: String,
-}
-
-#[derive(Serialize)]
 #[serde(rename = "GetMetricStatisticsResponse")]
 pub struct GetMetricStatisticsResponse {
     #[serde(rename = "@xmlns")]
