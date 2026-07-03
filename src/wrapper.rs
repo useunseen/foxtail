@@ -4,6 +4,7 @@ use std::fmt;
 use std::process::Command;
 
 const DEFAULT_FOXTAIL_ENDPOINT: &str = "http://127.0.0.1:8080";
+const DEFAULT_DATABASE_URL: &str = "sqlite:mock_data.db";
 const DEFAULT_AWS_BIN: &str = "aws";
 const DEFAULT_AWSLOCAL_BIN: &str = "awslocal";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -65,6 +66,7 @@ impl fmt::Display for Backend {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
+    pub database_url: String,
     pub foxtail_endpoint: String,
     pub aws_bin: String,
     pub awslocal_bin: String,
@@ -74,6 +76,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            database_url: env::var("DATABASE_URL")
+                .unwrap_or_else(|_| DEFAULT_DATABASE_URL.to_string()),
             foxtail_endpoint: env::var("FOXTAIL_ENDPOINT_URL")
                 .unwrap_or_else(|_| DEFAULT_FOXTAIL_ENDPOINT.to_string()),
             aws_bin: env::var("FOXTAIL_AWS_BIN").unwrap_or_else(|_| DEFAULT_AWS_BIN.to_string()),
@@ -141,6 +145,15 @@ where
             }
             Some("--debug-routing") => {
                 config.debug_routing = true;
+            }
+            Some("--database-url") | Some("-d") => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--database-url requires a value".to_string())?;
+                config.database_url = value.to_string_lossy().into_owned();
+            }
+            Some(flag) if flag.starts_with("--database-url=") => {
+                config.database_url = flag.trim_start_matches("--database-url=").to_string();
             }
             Some("--foxtail-endpoint") => {
                 let value = iter
@@ -286,20 +299,27 @@ pub fn help_text() -> String {
 foxtail {VERSION}
 
 Usage:
-  foxtail [wrapper options] <service> <operation> [aws args...]
+  foxtail [foxtail options] <command>
+  foxtail [foxtail options] <service> <operation> [aws args...]
 
 Purpose:
-  Single local AWS CLI entrypoint for mixed LocalStack + Foxtail workflows.
-  Use `foxtail` instead of `awslocal` when you want automatic backend routing.
+  Single local entrypoint for Foxtail data generation, service hosting, and
+  mixed LocalStack + Foxtail AWS CLI workflows.
+
+Native commands:
+  gen                           Discover LocalStack resources and seed mock data
+  serve                         Start the AWS-compatible Foxtail API service
 
 Routing rules:
-  1. If `(service, operation)` is in the Foxtail support table, foxtail runs:
+  1. Native commands such as `gen` and `serve` run in this process.
+  2. If `(service, operation)` is in the Foxtail support table, foxtail runs:
        aws --endpoint-url http://127.0.0.1:8080 ...
-  2. Otherwise foxtail runs:
+  3. Otherwise foxtail runs:
        awslocal ...
-  3. If you already pass `--endpoint-url`, foxtail preserves your explicit value.
+  4. If you already pass `--endpoint-url`, foxtail preserves your explicit value.
 
-Wrapper options:
+Foxtail options:
+  -d, --database-url <url>      Database URL for native gen/serve commands
   --debug-routing              Print the selected backend and effective command to stderr
   --foxtail-endpoint <url>     Override the Foxtail endpoint for routed commands
   --aws-bin <path>             Override the aws executable for routed commands
@@ -339,6 +359,12 @@ LocalStack passthrough examples:
   foxtail ec2 describe-instances
 
 Examples:
+  Generate an idle-heavy dataset:
+    foxtail gen --scenario idle-heavy --prune
+
+  Start the service:
+    foxtail serve --port 8080
+
   Foxtail-routed Cost Explorer:
     foxtail ce get-cost-and-usage --time-period Start=2026-03-01,End=2026-03-11 --granularity DAILY --metrics UnblendedCost
 
@@ -396,6 +422,8 @@ mod tests {
     fn parses_wrapper_flags_before_forwarding() {
         let parsed = parse_cli_args(os(&[
             "--debug-routing",
+            "--database-url",
+            "sqlite:/tmp/foxtail.db",
             "--foxtail-endpoint",
             "http://127.0.0.1:19090",
             "ce",
@@ -404,6 +432,7 @@ mod tests {
         .unwrap();
 
         assert!(parsed.config.debug_routing);
+        assert_eq!(parsed.config.database_url, "sqlite:/tmp/foxtail.db");
         assert_eq!(parsed.config.foxtail_endpoint, "http://127.0.0.1:19090");
         assert_eq!(parsed.forwarded_args, os(&["ce", "get-cost-and-usage"]));
         assert_eq!(parsed.mode, RunMode::Execute);
@@ -494,6 +523,9 @@ mod tests {
     fn help_text_is_agent_friendly_and_explicit_about_routing() {
         let help = help_text();
 
+        assert!(help.contains("Native commands:"));
+        assert!(help.contains("foxtail gen --scenario idle-heavy --prune"));
+        assert!(help.contains("foxtail serve --port 8080"));
         assert!(help.contains("Routing rules:"));
         assert!(help.contains("If `(service, operation)` is in the Foxtail support table"));
         assert!(help.contains("Otherwise foxtail runs:"));

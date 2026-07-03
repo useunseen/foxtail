@@ -19,19 +19,10 @@ impl std::fmt::Display for Scenario {
 }
 
 #[derive(Parser)]
-#[command(name = "aws-mock", about = "AWS Mock Data Service", version)]
-pub struct Cli {
+#[command(name = "foxtail", about = "Foxtail native commands", version)]
+pub struct NativeCli {
     #[command(subcommand)]
     pub command: Commands,
-
-    /// Database URL (sqlite:path/to/db.sqlite)
-    #[arg(
-        short,
-        long,
-        env = "DATABASE_URL",
-        default_value = "sqlite:mock_data.db"
-    )]
-    pub database_url: String,
 }
 
 #[derive(Subcommand)]

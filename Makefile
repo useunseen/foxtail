@@ -1,6 +1,6 @@
 # Makefile for AWS Mock Data Service (Rust)
 
-BIN := target/debug/aws-mock-data-service
+BIN := target/debug/foxtail
 DB_PATH := mock_data.db
 
 .PHONY: build build-release run gen gen-baseline gen-spike gen-idle-heavy reset serve setup setup-mock verify-cli-interoperability verify-wrapper-routing help
@@ -25,25 +25,28 @@ build:
 build-release:
 	cargo build --release
 
-gen:
+$(BIN):
+	cargo build
+
+gen: $(BIN)
 	DATABASE_URL="sqlite:$(DB_PATH)" ./$(BIN) gen --prune
 
-gen-baseline:
+gen-baseline: $(BIN)
 	DATABASE_URL="sqlite:$(DB_PATH)" ./$(BIN) gen --prune --scenario baseline
 
-gen-spike:
+gen-spike: $(BIN)
 	DATABASE_URL="sqlite:$(DB_PATH)" ./$(BIN) gen --prune --scenario spike
 
-gen-idle-heavy:
+gen-idle-heavy: $(BIN)
 	DATABASE_URL="sqlite:$(DB_PATH)" ./$(BIN) gen --prune --scenario idle-heavy
 
 reset:
 	rm -f $(DB_PATH)
 
-serve:
+serve: $(BIN)
 	DATABASE_URL="sqlite:$(DB_PATH)" ./$(BIN) serve --port 8080
 
-setup: build gen
+setup: gen
 
 # Compatibility alias so users can run this target from service dir or repo root.
 setup-mock: setup
