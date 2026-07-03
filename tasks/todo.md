@@ -463,3 +463,4 @@
 - [x] Move CloudWatch JSON `GetMetricData` and default Cost Explorer group-definition shaping into handler helpers.
 - [x] Add CloudWatch JSON `ListMetrics` and `GetMetricStatistics` targets to the dashboard supported API inventory.
 - [x] Move generic AWS JSON/XML error body serialization into `src/handlers/aws.rs`.
+- [x] Clarify the handler ownership standard so reusable/extracted response builders live in `src/handlers/` while established endpoint orchestration can remain in `serve.rs`.

@@ -17,7 +17,7 @@ This repository is a small Rust service that generates and serves AWS-like mock 
 
 ## Coding Style & Naming Conventions
 
-Use standard Rust formatting with 4-space indentation and `cargo fmt`. Follow existing naming: `snake_case` for modules, files, functions, and fields; `PascalCase` for structs and enums; `SCREAMING_SNAKE_CASE` for constants. Keep route wiring in `serve.rs`, data access in `db.rs` or query helpers, and protocol-specific serialization inside `src/handlers/`.
+Use standard Rust formatting with 4-space indentation and `cargo fmt`. Follow existing naming: `snake_case` for modules, files, functions, and fields; `PascalCase` for structs and enums; `SCREAMING_SNAKE_CASE` for constants. Keep route dispatch and endpoint orchestration in `serve.rs`, data access in `db.rs` or query helpers, and reusable protocol serializers or extracted response builders inside `src/handlers/`.
 
 ## Testing Guidelines
 
