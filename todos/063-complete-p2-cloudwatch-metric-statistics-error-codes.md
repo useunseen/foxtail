@@ -66,7 +66,7 @@ Implemented in `src/serve.rs` by splitting `MetricStatisticsError` into distinct
 
 ## Technical Details
 
-- Affected files: [`src/serve.rs`](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs)
+- Affected files: [`src/serve.rs`](../src/serve.rs)
 - Related behavior: CloudWatch Query/XML `GetMetricStatistics`
 - Database changes: none
 

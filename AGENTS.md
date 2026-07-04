@@ -6,18 +6,18 @@ This repository is a small Rust service that generates and serves AWS-like mock 
 
 ## Build, Test, and Development Commands
 
-- `make build`: build the debug binary at `target/debug/aws-mock-data-service`.
+- `make build`: build the debug binary at `target/debug/foxtail`.
 - `make build-release`: build an optimized release binary.
 - `make gen`: discover resources and regenerate `mock_data.db`.
 - `make gen-baseline`, `make gen-spike`, `make gen-idle-heavy`: seed specific traffic scenarios.
 - `make serve`: run the API locally on `127.0.0.1:8080`.
 - `make setup`: build, then generate baseline data in one step.
-- `cargo test`: run the current Rust test suite. At present it compiles and runs with `0 tests`, so use it as a regression gate plus compile check.
+- `cargo test`: run the current Rust test suite and integration tests; use it as the default regression gate plus compile check.
 - `cargo fmt` and `cargo clippy --all-targets --all-features`: run before opening a PR.
 
 ## Coding Style & Naming Conventions
 
-Use standard Rust formatting with 4-space indentation and `cargo fmt`. Follow existing naming: `snake_case` for modules, files, functions, and fields; `PascalCase` for structs and enums; `SCREAMING_SNAKE_CASE` for constants. Keep route wiring in `serve.rs`, data access in `db.rs` or query helpers, and protocol-specific serialization inside `src/handlers/`.
+Use standard Rust formatting with 4-space indentation and `cargo fmt`. Follow existing naming: `snake_case` for modules, files, functions, and fields; `PascalCase` for structs and enums; `SCREAMING_SNAKE_CASE` for constants. Keep route dispatch and endpoint orchestration in `serve.rs`, data access in `db.rs` or query helpers, and reusable protocol serializers or extracted response builders inside `src/handlers/`.
 
 ## Testing Guidelines
 

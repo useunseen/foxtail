@@ -63,7 +63,7 @@ Replace per-bucket `Vec<f64>` storage with a running accumulator that tracks cou
 ## Technical Details
 
 - Affected files:
-  - [`src/serve.rs`](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs)
+  - [`src/serve.rs`](../src/serve.rs)
 - Related components:
   - shared metric aggregation used by `GetMetricStatistics`
   - `GetMetricData` stat selection wrapper

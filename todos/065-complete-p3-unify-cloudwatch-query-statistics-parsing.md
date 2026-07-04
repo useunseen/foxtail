@@ -65,7 +65,7 @@ Implemented on 2026-03-24 with a one-pass CloudWatch Query/XML parser that now p
 ## Technical Details
 
 - Affected files:
-  - [`src/serve.rs`](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs)
+  - [`src/serve.rs`](../src/serve.rs)
 - Related components:
   - CloudWatch Query/XML router
   - `GetMetricStatistics` validation and request shaping

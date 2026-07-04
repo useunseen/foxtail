@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BIN="${BIN:-$ROOT_DIR/target/debug/aws-mock-data-service}"
+BIN="${BIN:-$ROOT_DIR/target/debug/foxtail}"
 SOURCE_DB="${MOCK_DATA_DB:-$ROOT_DIR/mock_data.db}"
 PORT="${AWS_MOCK_VERIFY_PORT:-18080}"
 TMP_DIR="$(mktemp -d)"

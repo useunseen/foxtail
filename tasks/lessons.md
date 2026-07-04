@@ -7,3 +7,7 @@
 ## 2026-03-23
 
 - When the user provides a writing sample for tone, learn the naturalness and pacing from it but do not mirror the sample's rhetorical structure or phrasing too closely. Translate the lesson into a fresh voice.
+
+## 2026-05-13
+
+- When a Make target should recover from a missing local binary, depend on the binary file path rather than a phony `build` target if the desired behavior is "build only when absent."

@@ -23,11 +23,11 @@ This makes `GetMetricData` technically callable but not trustworthy for FinOps a
 ## Research Consolidation
 
 ### Internal Repo Findings
-- The JSON handler reads the body as untyped `serde_json::Value`, extracts `MetricDataQueries`, and then forwards the request directly to `metrics::query_metrics` with `limit: Some(10_000)`: [src/serve.rs](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs#L3015).
-- The current response is built by copying raw timestamps and values from queried rows without period bucketing or stat calculation: [src/serve.rs](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs#L3119).
-- Pagination uses one global `page_start` / `max_datapoints` slice across each query result and emits a single top-level `NextToken`, which is only partial parity: [src/serve.rs](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs#L3055).
-- Existing tests verify only that `NextToken` appears when truncated; they do not verify query identity, period aggregation, or non-duplicated timestamp behavior: [src/serve.rs](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs#L3260).
-- Prior parity planning already called out `GetMetricData` pagination/output parity as unfinished and critical to avoid false confidence: [docs/plans/2026-02-19-test-comprehensive-aws-api-parity-suite-plan.md](/Users/murphy/workspace/iacai0/foxtail/docs/plans/2026-02-19-test-comprehensive-aws-api-parity-suite-plan.md#L234).
+- The JSON handler reads the body as untyped `serde_json::Value`, extracts `MetricDataQueries`, and then forwards the request directly to `metrics::query_metrics` with `limit: Some(10_000)`: [src/serve.rs](../../src/serve.rs#L3015).
+- The current response is built by copying raw timestamps and values from queried rows without period bucketing or stat calculation: [src/serve.rs](../../src/serve.rs#L3119).
+- Pagination uses one global `page_start` / `max_datapoints` slice across each query result and emits a single top-level `NextToken`, which is only partial parity: [src/serve.rs](../../src/serve.rs#L3055).
+- Existing tests verify only that `NextToken` appears when truncated; they do not verify query identity, period aggregation, or non-duplicated timestamp behavior: [src/serve.rs](../../src/serve.rs#L3260).
+- Prior parity planning already called out `GetMetricData` pagination/output parity as unfinished and critical to avoid false confidence: [docs/plans/2026-02-19-test-comprehensive-aws-api-parity-suite-plan.md](2026-02-19-test-comprehensive-aws-api-parity-suite-plan.md#L234).
 
 ### Institutional Learnings
 - No relevant `docs/solutions/` entries exist in this checkout.
@@ -191,4 +191,4 @@ Resolution: return empty arrays with `StatusCode: Complete`.
 
 ## References
 - AWS CloudWatch `GetMetricData`: https://docs.aws.amazon.com/AmazonCloudWatch/latest/APIReference/API_GetMetricData.html
-- Existing parity roadmap: [2026-02-19-test-comprehensive-aws-api-parity-suite-plan.md](/Users/murphy/workspace/iacai0/foxtail/docs/plans/2026-02-19-test-comprehensive-aws-api-parity-suite-plan.md)
+- Existing parity roadmap: [2026-02-19-test-comprehensive-aws-api-parity-suite-plan.md](2026-02-19-test-comprehensive-aws-api-parity-suite-plan.md)

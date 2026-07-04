@@ -16,10 +16,10 @@ This matters because AWS CLI callers can request large time windows and expect `
 
 ## Findings
 
-- [`src/serve.rs:4965`](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs#L4965) builds the XML `GetMetricData` response directly from `series_list` and never reads `query.next_token` or any page-size/max-datapoints input.
-- [`src/serve.rs:5136`](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs#L5136) shows the JSON handler already implementing `MaxDatapoints`, `NextToken`, and deterministic slicing logic, so the parity gap is inside the XML path rather than the shared aggregation layer.
-- [`src/handlers/cloudwatch.rs:69`](/Users/murphy/workspace/iacai0/foxtail/src/handlers/cloudwatch.rs#L69) defines `GetMetricDataResult` without any `NextToken` field, so the XML serializer cannot emit continuation tokens even if the handler wanted to.
-- [`README.md:356`](/Users/murphy/workspace/iacai0/foxtail/README.md#L356) now claims `get-metric-data` “Paginates deterministically” and supports 50 queries on both paths, which overstates current AWS CLI Query/XML behavior.
+- [`src/serve.rs:4965`](../src/serve.rs#L4965) builds the XML `GetMetricData` response directly from `series_list` and never reads `query.next_token` or any page-size/max-datapoints input.
+- [`src/serve.rs:5136`](../src/serve.rs#L5136) shows the JSON handler already implementing `MaxDatapoints`, `NextToken`, and deterministic slicing logic, so the parity gap is inside the XML path rather than the shared aggregation layer.
+- [`src/handlers/cloudwatch.rs:69`](../src/handlers/cloudwatch.rs#L69) defines `GetMetricDataResult` without any `NextToken` field, so the XML serializer cannot emit continuation tokens even if the handler wanted to.
+- [`README.md:356`](../README.md#L356) now claims `get-metric-data` “Paginates deterministically” and supports 50 queries on both paths, which overstates current AWS CLI Query/XML behavior.
 - The new test coverage validates multi-query XML parsing and non-zero network datapoints, but there is no XML pagination regression test to catch this contract gap.
 
 ## Proposed Solutions
@@ -85,13 +85,13 @@ This matters because AWS CLI callers can request large time windows and expect `
 ## Technical Details
 
 **Affected files:**
-- [`src/serve.rs`](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs) - XML `GetMetricData` handler lacks token/page handling
-- [`src/handlers/cloudwatch.rs`](/Users/murphy/workspace/iacai0/foxtail/src/handlers/cloudwatch.rs) - XML response model cannot serialize `NextToken`
-- [`README.md`](/Users/murphy/workspace/iacai0/foxtail/README.md) - docs currently overclaim pagination parity
+- [`src/serve.rs`](../src/serve.rs) - XML `GetMetricData` handler lacks token/page handling
+- [`src/handlers/cloudwatch.rs`](../src/handlers/cloudwatch.rs) - XML response model cannot serialize `NextToken`
+- [`README.md`](../README.md) - docs currently overclaim pagination parity
 
 **Related components:**
-- JSON `GetMetricData` path in [`src/serve.rs`](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs)
-- CLI smoke verification in [`scripts/verify_cli_interop.sh`](/Users/murphy/workspace/iacai0/foxtail/scripts/verify_cli_interop.sh)
+- JSON `GetMetricData` path in [`src/serve.rs`](../src/serve.rs)
+- CLI smoke verification in [`scripts/verify_cli_interop.sh`](../scripts/verify_cli_interop.sh)
 
 **Database changes:**
 - Migration needed? No
@@ -100,8 +100,8 @@ This matters because AWS CLI callers can request large time windows and expect `
 ## Resources
 
 - **PR:** https://github.com/iacai0/foxtail/pull/1
-- **Plan:** [docs/plans/2026-03-16-fix-aws-cli-network-metric-queries-plan.md](/Users/murphy/workspace/iacai0/foxtail/docs/plans/2026-03-16-fix-aws-cli-network-metric-queries-plan.md)
-- **Reference implementation:** JSON `GetMetricData` pagination in [src/serve.rs](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs#L5136)
+- **Plan:** [docs/plans/2026-03-16-fix-aws-cli-network-metric-queries-plan.md](../docs/plans/2026-03-16-fix-aws-cli-network-metric-queries-plan.md)
+- **Reference implementation:** JSON `GetMetricData` pagination in [src/serve.rs](../src/serve.rs#L5136)
 
 ## Acceptance Criteria
 

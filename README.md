@@ -51,15 +51,49 @@ aws --endpoint-url http://127.0.0.1:8080 ce get-cost-and-usage \
 
 ## Main Ways To Use It
 
-### 1. AWS CLI Against Foxtail
+### 1. `foxtail` Command
 
-This is the main service interface:
+Foxtail builds one binary at `target/debug/foxtail`.
+
+Native commands run directly in the binary:
 
 ```bash
-aws --endpoint-url http://127.0.0.1:8080 ...
+target/debug/foxtail gen --scenario idle-heavy --prune
+target/debug/foxtail serve --port 8080
 ```
 
-Common examples:
+AWS CLI-compatible commands use the same binary:
+
+```bash
+target/debug/foxtail ce get-cost-and-usage \
+  --time-period Start=2026-03-01,End=2026-03-11 \
+  --granularity DAILY \
+  --metrics UnblendedCost
+```
+
+Supported FinOps commands are routed to the running Foxtail service through `aws --endpoint-url http://127.0.0.1:8080`. Everything else is delegated to `awslocal`:
+
+```bash
+target/debug/foxtail s3 ls
+```
+
+Useful routing flags:
+
+- `--debug-routing`
+- `--foxtail-endpoint <url>`
+- `--aws-bin <path>`
+- `--awslocal-bin <path>`
+
+Native command configuration:
+
+- `--database-url <url>`
+- `DATABASE_URL`
+- `AWS_ENDPOINT_URL`
+- `AWS_DEFAULT_REGION`
+
+### 2. AWS CLI Against Foxtail
+
+You can also call the service directly with the AWS CLI:
 
 ```bash
 aws --endpoint-url http://127.0.0.1:8080 ce get-cost-and-usage \
@@ -79,39 +113,12 @@ aws --endpoint-url http://127.0.0.1:8080 cloudwatch list-metrics \
 aws --endpoint-url http://127.0.0.1:8080 cloudwatch get-metric-statistics \
   --namespace AWS/EC2 \
   --metric-name CPUUtilization \
-  --statistics Average \
+  --statistics Average Maximum \
   --period 3600 \
   --start-time 2026-03-11T00:00:00Z \
   --end-time 2026-03-11T12:00:00Z \
   --dimensions Name=InstanceId,Value=i-20652c71bedc57ced
 ```
-
-### 2. `foxtail` Wrapper Command
-
-Foxtail also includes a standalone wrapper at `target/debug/foxtail`.
-
-- Supported FinOps commands are routed to Foxtail through `aws --endpoint-url http://127.0.0.1:8080`
-- Everything else is delegated to `awslocal`
-
-Examples:
-
-```bash
-target/debug/foxtail ce get-cost-and-usage \
-  --time-period Start=2026-03-01,End=2026-03-11 \
-  --granularity DAILY \
-  --metrics UnblendedCost
-```
-
-```bash
-target/debug/foxtail s3 ls
-```
-
-Useful wrapper flags:
-
-- `--debug-routing`
-- `--foxtail-endpoint <url>`
-- `--aws-bin <path>`
-- `--awslocal-bin <path>`
 
 ### 3. Local Helper Routes
 
@@ -152,6 +159,7 @@ curl http://127.0.0.1:8080/_mock/status
 Notes:
 
 - Cost Explorer targets accept both `AWSCostExplorer.*` and `AWSInsightsIndexService.*`
+- `get-cost-and-usage` supports grouping by `SERVICE`, `REGION`, `RESOURCE_ID`, and `USAGE_TYPE`
 - `get-cost-and-usage-with-resources` defaults to resource grouping in this mock
 - reservation, savings plan, anomaly, and rightsizing operations return synthetic mock outputs
 
@@ -163,9 +171,11 @@ Notes:
 
 Notes:
 
-- AWS CLI `cloudwatch ...` uses the Query/XML path
-- direct `x-amz-target: GraniteServiceVersion20100801.GetMetricData` uses the JSON path
+- AWS CLI `cloudwatch ...` may use CloudWatch JSON query mode or the older Query/XML path depending on CLI/botocore version
+- direct `x-amz-target: GraniteServiceVersion20100801.*` uses the JSON path
 - `get-metric-statistics` supports `SampleCount`, `Average`, `Sum`, `Minimum`, and `Maximum`
+- `list-metrics`, `get-metric-statistics`, and `get-metric-data` are supported on both JSON and Query/XML paths
+- ElastiCache clusters discovered during generation use the `AWS/ElastiCache` namespace with `CacheClusterId` dimensions
 - `get-metric-data` supports up to 50 queries on both paths
 - `get-metric-data` preserves query ids, aligns timestamps and values, and paginates deterministically
 - `get-metric-data` supports `Average`, `Sum`, `Minimum`, and `Maximum`
@@ -263,20 +273,20 @@ aws --endpoint-url http://127.0.0.1:8080 cloudwatch list-metrics \
 | `make gen-idle-heavy` | Seed idle-heavy scenario |
 | `make reset` | Delete `mock_data.db` |
 | `make serve` | Start the local API server |
-| `make setup` | Build and seed baseline data |
+| `make setup` | Build if needed and seed baseline data |
 | `make setup-mock` | Alias for `make setup` |
 | `make verify-cli-interoperability` | Run the AWS CLI smoke suite |
 | `make verify-wrapper-routing` | Verify wrapper routing with stub executables |
 
 ### Binary Commands
 
-Main service binary:
+Foxtail produces one binary:
 
 ```bash
-target/debug/aws-mock-data-service --database-url sqlite:mock_data.db ...
+target/debug/foxtail --database-url sqlite:mock_data.db ...
 ```
 
-Subcommands:
+Native subcommands:
 
 - `gen`
 - `serve`
@@ -284,7 +294,7 @@ Subcommands:
 Examples:
 
 ```bash
-target/debug/aws-mock-data-service gen \
+target/debug/foxtail gen \
   --endpoint-url http://localhost:4566 \
   --region us-east-1 \
   --scenario baseline \
@@ -293,7 +303,20 @@ target/debug/aws-mock-data-service gen \
 ```
 
 ```bash
-target/debug/aws-mock-data-service serve --address 127.0.0.1 --port 8080
+target/debug/foxtail serve --address 127.0.0.1 --port 8080
+```
+
+AWS CLI-compatible examples:
+
+```bash
+target/debug/foxtail ce get-cost-and-usage \
+  --time-period Start=2026-03-01,End=2026-03-11 \
+  --granularity DAILY \
+  --metrics UnblendedCost
+```
+
+```bash
+target/debug/foxtail s3 ls
 ```
 
 ## Verification

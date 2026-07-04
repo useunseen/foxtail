@@ -1,3 +1,47 @@
+# Cost Explorer USAGE_TYPE Grouping Work
+
+- [x] Diagnose why AWS CLI `ce get-cost-and-usage --group-by Type=DIMENSION,Key=USAGE_TYPE` fails validation.
+- [x] Add `USAGE_TYPE` as a supported Cost Explorer grouping dimension.
+- [x] Return AWS-style mock usage type keys and `UsageQuantity` metrics for grouped cost responses.
+- [x] Add route tests for EC2 Compute and Elastic Load Balancing service-filtered usage type grouping.
+- [x] Run `cargo fmt`, focused Cost Explorer tests, `cargo test`, and `cargo clippy --all-targets --all-features`.
+
+## Cost Explorer USAGE_TYPE Results
+
+- `ce get-cost-and-usage` now accepts `GroupBy` key `USAGE_TYPE`.
+- Grouped Cost Explorer responses now include `UsageQuantity` when requested, using the same mock usage-rate mapping as usage forecasts.
+- Service-filtered EC2 Compute requests return `USE1-BoxUsage:m6i.xlarge`; service-filtered Elastic Load Balancing requests return `USE1-LoadBalancerUsage`.
+- Verification completed successfully:
+  - `cargo fmt`
+  - `cargo test cost_explorer_group_by_usage_type`
+  - `cargo test cost_explorer_group_by_service_returns_populated_groups`
+  - `cargo test`
+  - `cargo clippy --all-targets --all-features`
+  - `bash scripts/verify_cli_interop.sh`
+  - Targeted AWS CLI `USAGE_TYPE` checks for EC2 Compute and Elastic Load Balancing
+
+# CloudWatch JSON And ElastiCache Metrics Work
+
+- [x] Add CloudWatch JSON target support for `GraniteServiceVersion20100801.ListMetrics`.
+- [x] Add CloudWatch JSON target support for `GraniteServiceVersion20100801.GetMetricStatistics`.
+- [x] Add ElastiCache metric modeling for `AWS/ElastiCache` `CPUUtilization` and `CurrConnections`.
+- [x] Add ElastiCache cluster discovery during generation.
+- [x] Update CLI smoke coverage and docs for current AWS CLI CloudWatch JSON query-mode behavior.
+- [x] Run `cargo fmt`, targeted tests, `cargo test`, and CLI smoke verification where feasible.
+
+## CloudWatch JSON And ElastiCache Metrics Results
+
+- CloudWatch JSON now supports `ListMetrics` and `GetMetricStatistics`, including the epoch-second timestamp shape emitted by AWS CLI v2.34 JSON query mode.
+- `GetMetricStatistics` JSON reuses the same period aggregation and standard-stat validation as the Query/XML path.
+- ElastiCache clusters discovered during generation now expose `AWS/ElastiCache` `CPUUtilization` and `CurrConnections` under the `CacheClusterId` dimension after scenario regeneration.
+- Verification completed successfully:
+  - `cargo fmt`
+  - `cargo test cloudwatch_json`
+  - `cargo test scenario_endpoint_generates_elasticache_metrics`
+  - `cargo clippy --all-targets --all-features`
+  - `cargo test`
+  - `bash scripts/verify_cli_interop.sh` with elevated localhost access
+
 # Database Reset Make Target
 
 - [x] Rename `make reset-db` to `make reset`.
@@ -357,3 +401,67 @@
   - `cargo test pricing_get_products`
   - manual AWS CLI check against a fresh server on `127.0.0.1:18080` without `--format-version`
 - Note: the long-running service on `127.0.0.1:8080` was still serving the old binary during verification, so end-to-end validation used a fresh instance on `127.0.0.1:18080`.
+
+## Make Scenario Targets Build Prerequisite
+
+- [x] Reproduce/inspect why `make gen-idle-heavy` can fail when `target/debug/aws-mock-data-service` is missing.
+- [x] Add a binary-file prerequisite to Make targets that execute the debug service binary, so Cargo only runs when the binary is absent.
+- [x] Verify the Make target plan without forcing a network-dependent rebuild.
+- [x] Record verification results here.
+
+## Make Scenario Targets Build Prerequisite Results
+
+- Historical note: before the single-binary consolidation, `gen`, `gen-baseline`, `gen-spike`, `gen-idle-heavy`, and `serve` were changed to depend on `$(BIN)` instead of the phony `build` target.
+- In the current single-binary setup, `$(BIN)` resolves to `target/debug/foxtail`.
+- If `target/debug/foxtail` exists, Make skips `cargo build` and runs the requested command directly.
+- If the binary is absent, Make invokes `cargo build` once to create it before running the command.
+- Verification:
+  - `make -n gen-idle-heavy` showed `cargo build` when the configured binary was missing.
+  - `make -n BIN=target/debug/foxtail gen-idle-heavy` shows only the generation command, proving the existing-binary path skips Cargo.
+  - `make -n BIN=target/debug/foxtail serve` shows only the serve command, proving the same for `serve`.
+- Full `make gen-idle-heavy` was not completed because Cargo needed to download missing crates and network access was not approved.
+
+## Single Foxtail Binary Consolidation
+
+- [x] Resolve CLI design decisions with the user.
+- [x] Rename the Cargo package/library/binary to `foxtail`.
+- [x] Merge native `gen`/`serve` commands and AWS CLI-compatible routing into one `foxtail` binary.
+- [x] Remove the separate `aws-mock-data-service` binary surface.
+- [x] Update active Makefile, scripts, README, and tests.
+- [x] Run formatting/tests where possible and record any verification blockers.
+
+## Single Foxtail Binary Consolidation Results
+
+- Cargo now exposes one library target named `foxtail` and one binary target named `foxtail`.
+- `src/main.rs` now handles both native commands and AWS CLI-compatible routing:
+  - `foxtail gen ...`
+  - `foxtail serve ...`
+  - `foxtail ce ...`
+  - `foxtail s3 ...`
+- Native `gen` and `serve` run in-process against the existing Rust service modules.
+- AWS-shaped commands remain subprocess-based, preserving AWS CLI behavior and `awslocal` passthrough.
+- Removed the separate `src/bin/foxtail.rs` wrapper binary source.
+- Active Makefile, README, and verification scripts now target `target/debug/foxtail`.
+- Added an HTTP-only AWS SDK client for `http://` discovery endpoints so LocalStack generation does not panic when native root certificates are unavailable.
+- Verification completed:
+  - `cargo fmt --all`
+  - `cargo test`
+  - `cargo clippy --all-targets --all-features`
+  - `bash scripts/verify_wrapper_routing.sh`
+  - `cargo metadata --no-deps --format-version 1`
+  - `make -n gen-idle-heavy`
+  - `make gen-idle-heavy`
+- `bash scripts/verify_cli_interop.sh` was not completed because the first run happened before `mock_data.db` existed. After generation, LocalStack discovery completed but found no resources in this environment, so the full AWS CLI smoke suite would not have useful seeded data to validate.
+
+## PR Review Follow-Up
+
+- [x] Move newly added CloudWatch JSON and Cost Explorer metric response formatting into `src/handlers/`.
+- [x] Add integration tests under `tests/` for CloudWatch JSON/XML statistic responses and Cost Explorer `USAGE_TYPE` grouping.
+- [x] Update the local repository instructions to reference `target/debug/foxtail`.
+- [x] Move the remaining touched CloudWatch and Cost Explorer response envelope builders into `src/handlers/`.
+- [x] Derive the dashboard CloudWatch scorecard count from the supported API inventory.
+- [x] Move CloudWatch JSON `GetMetricData` and default Cost Explorer group-definition shaping into handler helpers.
+- [x] Add CloudWatch JSON `ListMetrics` and `GetMetricStatistics` targets to the dashboard supported API inventory.
+- [x] Move generic AWS JSON/XML error body serialization into `src/handlers/aws.rs`.
+- [x] Clarify the handler ownership standard so reusable/extracted response builders live in `src/handlers/` while established endpoint orchestration can remain in `serve.rs`.
+- [x] Count distinct operation names, not protocol inventory entries, in dashboard service scorecards.

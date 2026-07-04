@@ -83,8 +83,8 @@ Implemented repo-local option 2: the `GetMetricStatistics` path now fetches one 
 ## Technical Details
 
 - Affected files:
-  - [`src/serve.rs`](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs)
-  - [`src/metrics.rs`](/Users/murphy/workspace/iacai0/foxtail/src/metrics.rs)
+  - [`src/serve.rs`](../src/serve.rs)
+  - [`src/metrics.rs`](../src/metrics.rs)
 - Related components:
   - CloudWatch Query/XML `GetMetricStatistics`
   - shared metric lookup path used by `GetMetricData`
@@ -128,4 +128,4 @@ Implemented repo-local option 2: the `GetMetricStatistics` path now fetches one 
 ## Resources
 
 - Review target: `9e5f59a`
-- Existing related work: [`todos/058-complete-p2-scale-dashboard-and-metric-query-paths.md`](/Users/murphy/workspace/iacai0/foxtail/todos/058-complete-p2-scale-dashboard-and-metric-query-paths.md)
+- Existing related work: [`todos/058-complete-p2-scale-dashboard-and-metric-query-paths.md`](todos/058-complete-p2-scale-dashboard-and-metric-query-paths.md)

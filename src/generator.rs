@@ -3,9 +3,11 @@ use aws_config::BehaviorVersion;
 use aws_sdk_cloudwatch::config::Credentials;
 use aws_sdk_cloudwatch::config::Region;
 use aws_sdk_ec2::Client as Ec2Client;
+use aws_sdk_elasticache::Client as ElastiCacheClient;
 use aws_sdk_elasticloadbalancingv2::Client as ElbClient;
 use aws_sdk_rds::Client as RdsClient;
 use aws_sdk_s3::Client as S3Client;
+use aws_smithy_http_client::Builder as HttpClientBuilder;
 use serde_json::json;
 use sqlx::{Row, SqlitePool};
 use tracing::info;
@@ -170,6 +172,26 @@ fn metric_shape(namespace: &str, metric_name: &str) -> MetricShape {
             noise_ratio: 0.02,
             long_wave_ratio: 0.50,
         },
+        ("AWS/ElastiCache", "CPUUtilization") => MetricShape {
+            baseline: 16.0,
+            spike: 70.0,
+            idle_heavy: 5.0,
+            min_value: 0.0,
+            max_value: 100.0,
+            wave_ratio: 0.24,
+            noise_ratio: 0.04,
+            long_wave_ratio: 0.36,
+        },
+        ("AWS/ElastiCache", "CurrConnections") => MetricShape {
+            baseline: 85.0,
+            spike: 420.0,
+            idle_heavy: 9.0,
+            min_value: 0.0,
+            max_value: 2000.0,
+            wave_ratio: 0.31,
+            noise_ratio: 0.05,
+            long_wave_ratio: 0.34,
+        },
         ("AWS/S3", "BucketSizeBytes") => MetricShape {
             baseline: 240_000_000_000.0,
             spike: 340_000_000_000.0,
@@ -254,17 +276,22 @@ pub async fn run(
         endpoint_url, region, scenario, prune
     );
 
-    let config = aws_config::defaults(BehaviorVersion::latest())
+    let mut config_loader = aws_config::defaults(BehaviorVersion::latest())
         .region(Region::new(region.clone()))
         .endpoint_url(&endpoint_url)
-        .credentials_provider(Credentials::new("test", "test", None, None, "static"))
-        .load()
-        .await;
+        .credentials_provider(Credentials::new("test", "test", None, None, "static"));
+
+    if endpoint_url.starts_with("http://") {
+        config_loader = config_loader.http_client(HttpClientBuilder::new().build_http());
+    }
+
+    let config = config_loader.load().await;
 
     let ec2_client = Ec2Client::new(&config);
     let rds_client = RdsClient::new(&config);
     let s3_client = S3Client::new(&config);
     let elb_client = ElbClient::new(&config);
+    let elasticache_client = ElastiCacheClient::new(&config);
 
     let mut discovered_ids = Vec::new();
     let mut stats = json!({
@@ -272,6 +299,7 @@ pub async fn run(
         "rds": 0,
         "s3": 0,
         "elb": 0,
+        "elasticache": 0,
     });
 
     let mut tx = pool.begin().await?;
@@ -404,6 +432,35 @@ pub async fn run(
         }
     }
 
+    // 5. Discover ElastiCache clusters
+    info!("Discovering ElastiCache clusters...");
+    if let Ok(clusters) = elasticache_client.describe_cache_clusters().send().await {
+        for cluster in clusters.cache_clusters() {
+            let id = cluster.cache_cluster_id().unwrap_or_default().to_string();
+            if id.is_empty() {
+                continue;
+            }
+
+            discovered_ids.push(id.clone());
+            stats["elasticache"] = json!(stats["elasticache"].as_i64().unwrap_or_default() + 1);
+
+            sqlx::query(
+                "INSERT INTO resources (id, resource_type, region, scenario)
+                 VALUES (?, 'elasticache', ?, ?)
+                 ON CONFLICT(id) DO UPDATE SET resource_type='elasticache', region=?, scenario=?",
+            )
+            .bind(&id)
+            .bind(&region)
+            .bind(scenario.to_string())
+            .bind(&region)
+            .bind(scenario.to_string())
+            .execute(&mut *tx)
+            .await?;
+
+            regenerate_resource_data_tx(&mut tx, &id, "elasticache", scenario).await?;
+        }
+    }
+
     if prune {
         info!("Pruning resources no longer in LocalStack...");
         if !discovered_ids.is_empty() {
@@ -511,6 +568,15 @@ async fn regenerate_resource_data_tx(
                 ("AWS/RDS", "ReadIOPS"),
                 ("AWS/RDS", "WriteIOPS"),
                 ("AWS/RDS", "FreeableMemory"),
+            ] {
+                generate_metric_series_tx(tx, resource_id, namespace, metric_name, scenario)
+                    .await?;
+            }
+        }
+        "elasticache" => {
+            for (namespace, metric_name) in [
+                ("AWS/ElastiCache", "CPUUtilization"),
+                ("AWS/ElastiCache", "CurrConnections"),
             ] {
                 generate_metric_series_tx(tx, resource_id, namespace, metric_name, scenario)
                     .await?;
