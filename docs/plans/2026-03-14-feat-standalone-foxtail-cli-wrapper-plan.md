@@ -26,7 +26,7 @@ Current friction:
 - LocalStack remains the default local target for general AWS workflows.
 - Foxtail provides higher-fidelity support for cost, pricing, optimization, tagging, CUR, and CloudWatch metric workflows that LocalStack either does not expose or does not model well.
 - The current UX requires humans to know which commands are “Foxtail commands” and to remember the correct endpoint override.
-- The compatibility work completed in [docs/plans/2026-03-11-fix-aws-cli-api-interoperability-plan.md](/Users/murphy/workspace/iacai0/foxtail/docs/plans/2026-03-11-fix-aws-cli-api-interoperability-plan.md) improved the public API surface, but it still leaves command selection and endpoint targeting on the caller.
+- The compatibility work completed in [docs/plans/2026-03-11-fix-aws-cli-api-interoperability-plan.md](2026-03-11-fix-aws-cli-api-interoperability-plan.md) improved the public API surface, but it still leaves command selection and endpoint targeting on the caller.
 
 This wrapper removes that endpoint-selection burden and makes Foxtail the automatic backend for the FinOps command set the repo already supports.
 
@@ -34,11 +34,11 @@ This wrapper removes that endpoint-selection burden and makes Foxtail the automa
 
 ### Internal Repo Findings
 
-- The current Rust binary exposes only `gen` and `serve`; there is no wrapper tool today: [src/cli.rs](/Users/murphy/workspace/iacai0/foxtail/src/cli.rs), [src/main.rs](/Users/murphy/workspace/iacai0/foxtail/src/main.rs).
-- The README already documents the supported public AWS-compatible commands and is the clearest current inventory for wrapper routing: [README.md](/Users/murphy/workspace/iacai0/foxtail/README.md).
-- The CLI interoperability smoke script provides a concrete, executable command matrix for the current supported FinOps surface: [scripts/verify_cli_interop.sh](/Users/murphy/workspace/iacai0/foxtail/scripts/verify_cli_interop.sh).
-- The Makefile already treats CLI interoperability as a first-class verification step, which makes it a good place to hang wrapper verification too: [Makefile](/Users/murphy/workspace/iacai0/foxtail/Makefile).
-- The recent interoperability plan established that the public Foxtail surface is now reachable through real AWS CLI commands for Cost Explorer, CloudWatch, Pricing, CUR, Compute Optimizer, and Resource Groups Tagging API: [docs/plans/2026-03-11-fix-aws-cli-api-interoperability-plan.md](/Users/murphy/workspace/iacai0/foxtail/docs/plans/2026-03-11-fix-aws-cli-api-interoperability-plan.md).
+- The current Rust binary exposes only `gen` and `serve`; there is no wrapper tool today: [src/cli.rs](../../src/cli.rs), [src/main.rs](../../src/main.rs).
+- The README already documents the supported public AWS-compatible commands and is the clearest current inventory for wrapper routing: [README.md](../../README.md).
+- The CLI interoperability smoke script provides a concrete, executable command matrix for the current supported FinOps surface: [scripts/verify_cli_interop.sh](../../scripts/verify_cli_interop.sh).
+- The Makefile already treats CLI interoperability as a first-class verification step, which makes it a good place to hang wrapper verification too: [Makefile](../../Makefile).
+- The recent interoperability plan established that the public Foxtail surface is now reachable through real AWS CLI commands for Cost Explorer, CloudWatch, Pricing, CUR, Compute Optimizer, and Resource Groups Tagging API: [docs/plans/2026-03-11-fix-aws-cli-api-interoperability-plan.md](2026-03-11-fix-aws-cli-api-interoperability-plan.md).
 
 ### Institutional Learnings
 
@@ -200,7 +200,7 @@ Recommended verification layers:
 - **Interaction graph**: wrapper CLI decides backend, then launches either `awslocal` or `aws --endpoint-url <foxtail>`, which then calls either LocalStack or Foxtail’s public AWS-compatible surface.
 - **Error propagation**: subprocess exit codes and stderr must pass through unchanged so users still see authentic AWS CLI failures.
 - **State lifecycle risks**: routing the wrong command to Foxtail could create confusing “unsupported” errors; routing the wrong command to LocalStack could silently bypass Foxtail fidelity. Exact command matching is therefore part of the core correctness contract.
-- **API surface parity**: the wrapper command matrix must stay aligned with [README.md](/Users/murphy/workspace/iacai0/foxtail/README.md) and [scripts/verify_cli_interop.sh](/Users/murphy/workspace/iacai0/foxtail/scripts/verify_cli_interop.sh), otherwise docs and runtime behavior will drift.
+- **API surface parity**: the wrapper command matrix must stay aligned with [README.md](../../README.md) and [scripts/verify_cli_interop.sh](../../scripts/verify_cli_interop.sh), otherwise docs and runtime behavior will drift.
 - **Integration test scenarios**: real subprocess checks must cover both routed and passthrough paths, explicit endpoint overrides, and exit-code propagation.
 
 ## SpecFlow Analysis
@@ -250,10 +250,10 @@ flowchart LR
 
 ### Phase 1: Define Command Contract
 
-- [x] Create routing inventory doc or code table from [README.md](/Users/murphy/workspace/iacai0/foxtail/README.md) and [scripts/verify_cli_interop.sh](/Users/murphy/workspace/iacai0/foxtail/scripts/verify_cli_interop.sh)
+- [x] Create routing inventory doc or code table from [README.md](../../README.md) and [scripts/verify_cli_interop.sh](../../scripts/verify_cli_interop.sh)
 - [x] Decide final binary name and help text in `src/bin/foxtail.rs`
 - [x] Define wrapper-only flags and environment-variable precedence
-- [x] Document unsupported/ambiguous cases explicitly in [README.md](/Users/murphy/workspace/iacai0/foxtail/README.md)
+- [x] Document unsupported/ambiguous cases explicitly in [README.md](../../README.md)
 
 ### Phase 2: Implement Routing Core
 
@@ -289,7 +289,7 @@ flowchart LR
 - Implemented a table-driven routing matrix for the currently supported FinOps command set and a shallow AWS CLI classifier that skips common global flags before identifying `service` and `operation`.
 - Added `tests/foxtail_wrapper.rs` with subprocess-backed integration checks using fake `aws` and `awslocal` executables.
 - Added `scripts/verify_wrapper_routing.sh` and `make verify-wrapper-routing` for repeatable end-to-end routing verification.
-- Updated [README.md](/Users/murphy/workspace/iacai0/foxtail/README.md) to document the wrapper command surface, wrapper-specific flags, and the routed command matrix.
+- Updated [README.md](../../README.md) to document the wrapper command surface, wrapper-specific flags, and the routed command matrix.
 
 ## Verification
 
@@ -349,9 +349,9 @@ This is too broad. For example, `cloudwatch` contains both currently supported a
 
 ## Sources & References
 
-- Current binary CLI surface: [src/cli.rs](/Users/murphy/workspace/iacai0/foxtail/src/cli.rs)
-- Binary entrypoint: [src/main.rs](/Users/murphy/workspace/iacai0/foxtail/src/main.rs)
-- Supported public AWS-compatible command inventory: [README.md](/Users/murphy/workspace/iacai0/foxtail/README.md)
-- Executable interoperability matrix: [scripts/verify_cli_interop.sh](/Users/murphy/workspace/iacai0/foxtail/scripts/verify_cli_interop.sh)
-- Existing local developer task surface: [Makefile](/Users/murphy/workspace/iacai0/foxtail/Makefile)
-- Prior CLI interoperability plan: [docs/plans/2026-03-11-fix-aws-cli-api-interoperability-plan.md](/Users/murphy/workspace/iacai0/foxtail/docs/plans/2026-03-11-fix-aws-cli-api-interoperability-plan.md)
+- Current binary CLI surface: [src/cli.rs](../../src/cli.rs)
+- Binary entrypoint: [src/main.rs](../../src/main.rs)
+- Supported public AWS-compatible command inventory: [README.md](../../README.md)
+- Executable interoperability matrix: [scripts/verify_cli_interop.sh](../../scripts/verify_cli_interop.sh)
+- Existing local developer task surface: [Makefile](../../Makefile)
+- Prior CLI interoperability plan: [docs/plans/2026-03-11-fix-aws-cli-api-interoperability-plan.md](2026-03-11-fix-aws-cli-api-interoperability-plan.md)

@@ -25,9 +25,9 @@ This plan now explicitly treats the full standard `Statistics` set as in scope:
 
 The current implementation has three connected issues:
 
-- The Query/XML request model for CloudWatch does not capture any `Statistics.member.N` or `ExtendedStatistics.member.N` inputs, so the handler has no record of which statistics the caller requested: [src/serve.rs](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs#L64).
-- The `GetMetricStatistics` handler queries raw metric rows and serializes every datapoint as `<Average>...`, regardless of request intent or bucket size: [src/serve.rs](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs#L5085).
-- The XML response model hardcodes `Average` as the only supported datapoint field, which makes `Maximum`, `Minimum`, `Sum`, and `SampleCount` impossible to emit even if the handler computed them: [src/handlers/cloudwatch.rs](/Users/murphy/workspace/iacai0/foxtail/src/handlers/cloudwatch.rs#L47).
+- The Query/XML request model for CloudWatch does not capture any `Statistics.member.N` or `ExtendedStatistics.member.N` inputs, so the handler has no record of which statistics the caller requested: [src/serve.rs](../../src/serve.rs#L64).
+- The `GetMetricStatistics` handler queries raw metric rows and serializes every datapoint as `<Average>...`, regardless of request intent or bucket size: [src/serve.rs](../../src/serve.rs#L5085).
+- The XML response model hardcodes `Average` as the only supported datapoint field, which makes `Maximum`, `Minimum`, `Sum`, and `SampleCount` impossible to emit even if the handler computed them: [src/handlers/cloudwatch.rs](../../src/handlers/cloudwatch.rs#L47).
 
 The result is that a command like the following can never round-trip correctly today:
 
@@ -46,12 +46,12 @@ aws --endpoint-url http://127.0.0.1:8080 cloudwatch get-metric-statistics \
 
 ### Internal Repo Findings
 
-- The request model used by the CloudWatch Query/XML router includes action, metric identity, period, pagination, and two dimensions, but no statistic-selection fields: [src/serve.rs](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs#L64).
-- `handle_get_metric_statistics` builds `MetricQueryParams`, fetches rows from SQLite, and maps each point directly to a `cw::Datapoint` with `average: p.value`; the requested `Period` is only validated for presence, not used to aggregate output: [src/serve.rs](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs#L5085).
-- `GetMetricData` already has a shared aggregation path that buckets by period and computes `Average`, `Sum`, `Minimum`, and `Maximum`, which is the obvious reuse point rather than adding a second stats implementation; this fix should extend that path or wrap it so `SampleCount` is derived from the same period buckets: [src/serve.rs](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs#L1122), [src/serve.rs](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs#L1942).
-- Existing XML coverage for `GetMetricStatistics` only asserts that the response contains `GetMetricStatisticsResponse` and `CPUUtilization`; it does not assert requested-stat fidelity, aggregation semantics, or XML field names: [src/serve.rs](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs#L6420).
-- The CLI smoke script covers only `--statistics Average` for `NetworkIn`, so the `Maximum` regression had no runtime guardrail: [scripts/verify_cli_interop.sh](/Users/murphy/workspace/iacai0/foxtail/scripts/verify_cli_interop.sh#L282).
-- The README documents `cloudwatch get-metric-statistics` as a public interface and broadly notes supported stats under the CloudWatch section, but does not reflect that the current XML implementation is still effectively `Average`-only: [README.md](/Users/murphy/workspace/iacai0/foxtail/README.md#L79), [README.md](/Users/murphy/workspace/iacai0/foxtail/README.md#L160).
+- The request model used by the CloudWatch Query/XML router includes action, metric identity, period, pagination, and two dimensions, but no statistic-selection fields: [src/serve.rs](../../src/serve.rs#L64).
+- `handle_get_metric_statistics` builds `MetricQueryParams`, fetches rows from SQLite, and maps each point directly to a `cw::Datapoint` with `average: p.value`; the requested `Period` is only validated for presence, not used to aggregate output: [src/serve.rs](../../src/serve.rs#L5085).
+- `GetMetricData` already has a shared aggregation path that buckets by period and computes `Average`, `Sum`, `Minimum`, and `Maximum`, which is the obvious reuse point rather than adding a second stats implementation; this fix should extend that path or wrap it so `SampleCount` is derived from the same period buckets: [src/serve.rs](../../src/serve.rs#L1122), [src/serve.rs](../../src/serve.rs#L1942).
+- Existing XML coverage for `GetMetricStatistics` only asserts that the response contains `GetMetricStatisticsResponse` and `CPUUtilization`; it does not assert requested-stat fidelity, aggregation semantics, or XML field names: [src/serve.rs](../../src/serve.rs#L6420).
+- The CLI smoke script covers only `--statistics Average` for `NetworkIn`, so the `Maximum` regression had no runtime guardrail: [scripts/verify_cli_interop.sh](../../scripts/verify_cli_interop.sh#L282).
+- The README documents `cloudwatch get-metric-statistics` as a public interface and broadly notes supported stats under the CloudWatch section, but does not reflect that the current XML implementation is still effectively `Average`-only: [README.md](../../README.md#L79), [README.md](../../README.md#L160).
 
 ### Institutional Learnings
 
@@ -79,7 +79,7 @@ External research is required because this is an AWS API contract bug on a publi
 
 ### 2. Reuse the shared aggregation path instead of duplicating stat logic
 
-- Route `GetMetricStatistics` through the existing period/stat aggregation helper used by `GetMetricData`: [src/serve.rs](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs#L1942).
+- Route `GetMetricStatistics` through the existing period/stat aggregation helper used by `GetMetricData`: [src/serve.rs](../../src/serve.rs#L1942).
 - Extend that helper, or add a thin wrapper around it, so `GetMetricStatistics` can compute all requested standard statistics from one bucket pass.
 - Support the standard non-percentile statistics in this fix:
   - `SampleCount`
@@ -116,7 +116,7 @@ External research is required because this is an AWS API contract bug on a publi
 
 ### Interaction Graph
 
-`POST /` CloudWatch Query/XML request -> form parsing in [src/serve.rs](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs#L4821) -> `GetMetricStatistics` request validation -> SQLite metric lookup through [src/metrics.rs](/Users/murphy/workspace/iacai0/foxtail/src/metrics.rs) -> shared stat aggregation helper in [src/serve.rs](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs#L1942) -> XML serialization via [src/handlers/cloudwatch.rs](/Users/murphy/workspace/iacai0/foxtail/src/handlers/cloudwatch.rs) -> AWS CLI XML parsing into JSON output for the user.
+`POST /` CloudWatch Query/XML request -> form parsing in [src/serve.rs](../../src/serve.rs#L4821) -> `GetMetricStatistics` request validation -> SQLite metric lookup through [src/metrics.rs](../../src/metrics.rs) -> shared stat aggregation helper in [src/serve.rs](../../src/serve.rs#L1942) -> XML serialization via [src/handlers/cloudwatch.rs](../../src/handlers/cloudwatch.rs) -> AWS CLI XML parsing into JSON output for the user.
 
 ### Error Propagation
 
@@ -132,7 +132,7 @@ External research is required because this is an AWS API contract bug on a publi
 ### API Surface Parity
 
 - Affects the public CloudWatch Query/XML path used by `aws cloudwatch get-metric-statistics`.
-- Indirectly affects the `foxtail` wrapper because it routes CloudWatch CLI calls to this same endpoint: [src/wrapper.rs](/Users/murphy/workspace/iacai0/foxtail/src/wrapper.rs#L346).
+- Indirectly affects the `foxtail` wrapper because it routes CloudWatch CLI calls to this same endpoint: [src/wrapper.rs](../../src/wrapper.rs#L346).
 - Should not change `GetMetricData`, but the plan intentionally reuses its aggregation helper to reduce future parity drift.
 
 ### Integration Test Scenarios
@@ -254,13 +254,13 @@ aws --endpoint-url http://127.0.0.1:8080 cloudwatch get-metric-statistics \
 
 ## Sources & References
 
-- Request parsing gap: [src/serve.rs](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs#L64)
-- Current `GetMetricStatistics` handler: [src/serve.rs](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs#L5085)
-- Shared aggregation helper: [src/serve.rs](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs#L1942)
-- Current XML response model: [src/handlers/cloudwatch.rs](/Users/murphy/workspace/iacai0/foxtail/src/handlers/cloudwatch.rs#L23)
-- Existing XML test coverage gap: [src/serve.rs](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs#L6420)
-- Existing CLI smoke coverage gap: [scripts/verify_cli_interop.sh](/Users/murphy/workspace/iacai0/foxtail/scripts/verify_cli_interop.sh#L282)
-- README public contract references: [README.md](/Users/murphy/workspace/iacai0/foxtail/README.md#L79), [README.md](/Users/murphy/workspace/iacai0/foxtail/README.md#L160)
+- Request parsing gap: [src/serve.rs](../../src/serve.rs#L64)
+- Current `GetMetricStatistics` handler: [src/serve.rs](../../src/serve.rs#L5085)
+- Shared aggregation helper: [src/serve.rs](../../src/serve.rs#L1942)
+- Current XML response model: [src/handlers/cloudwatch.rs](../../src/handlers/cloudwatch.rs#L23)
+- Existing XML test coverage gap: [src/serve.rs](../../src/serve.rs#L6420)
+- Existing CLI smoke coverage gap: [scripts/verify_cli_interop.sh](../../scripts/verify_cli_interop.sh#L282)
+- README public contract references: [README.md](../../README.md#L79), [README.md](../../README.md#L160)
 - AWS CLI `get-metric-statistics`: https://docs.aws.amazon.com/cli/latest/reference/cloudwatch/get-metric-statistics.html
 - AWS CloudWatch `GetMetricStatistics` API reference: https://docs.aws.amazon.com/AmazonCloudWatch/latest/APIReference/API_GetMetricStatistics.html
 - AWS CPUUtilization `Maximum` example: https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/US_SingleMetricPerInstance.html

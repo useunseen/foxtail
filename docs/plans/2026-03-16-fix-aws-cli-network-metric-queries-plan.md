@@ -17,10 +17,10 @@ The reported user-visible bug is simple: when running the command used to inspec
 
 Local repo evidence suggests the underlying data is already present:
 
-- The generator seeds both `AWS/EC2` `NetworkIn` and `NetworkOut` with non-zero scenario-dependent values: [src/generator.rs](/Users/murphy/workspace/iacai0/foxtail/src/generator.rs#L53), [src/generator.rs](/Users/murphy/workspace/iacai0/foxtail/src/generator.rs#L63), [src/generator.rs](/Users/murphy/workspace/iacai0/foxtail/src/generator.rs#L495)
-- Prior scenario verification recorded non-zero EC2 `NetworkIn` values across scenarios: [tasks/todo.md](/Users/murphy/workspace/iacai0/foxtail/tasks/todo.md#L90)
-- The README still documents that the AWS CLI Query/XML path for `cloudwatch get-metric-data` only supports one `MetricDataQueries.member.1` query, while the JSON path supports up to 50: [README.md](/Users/murphy/workspace/iacai0/foxtail/README.md#L290)
-- The actual `CloudWatchQuery` struct is hard-coded to `MetricDataQueries.member.1.*` fields only: [src/serve.rs](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs#L66)
+- The generator seeds both `AWS/EC2` `NetworkIn` and `NetworkOut` with non-zero scenario-dependent values: [src/generator.rs](../../src/generator.rs#L53), [src/generator.rs](../../src/generator.rs#L63), [src/generator.rs](../../src/generator.rs#L495)
+- Prior scenario verification recorded non-zero EC2 `NetworkIn` values across scenarios: [tasks/todo.md](../../tasks/todo.md#L90)
+- The README still documents that the AWS CLI Query/XML path for `cloudwatch get-metric-data` only supports one `MetricDataQueries.member.1` query, while the JSON path supports up to 50: [README.md](../../README.md#L290)
+- The actual `CloudWatchQuery` struct is hard-coded to `MetricDataQueries.member.1.*` fields only: [src/serve.rs](../../src/serve.rs#L66)
 
 That combination strongly suggests the network check command is hitting a partial implementation on the AWS CLI path, especially if it requests both `NetworkIn` and `NetworkOut` in one call.
 
@@ -39,12 +39,12 @@ The intended fix is:
 
 ### Internal Repo Findings
 
-- `NetworkIn` and `NetworkOut` are seeded for EC2 as byte-valued metrics with baseline, spike, and idle-heavy shapes: [src/generator.rs](/Users/murphy/workspace/iacai0/foxtail/src/generator.rs#L53), [src/generator.rs](/Users/murphy/workspace/iacai0/foxtail/src/generator.rs#L63)
-- EC2 resource regeneration inserts both network metrics alongside CPU and disk series: [src/generator.rs](/Users/murphy/workspace/iacai0/foxtail/src/generator.rs#L492)
-- CloudWatch units already map `NetworkIn` and `NetworkOut` to `Bytes`, so the serving layer is aware of these metrics: [src/serve.rs](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs#L1691)
-- The AWS CLI Query/XML contract layer only models one metric-data query member today: [src/serve.rs](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs#L85)
-- The README explicitly documents this limitation, which aligns with the likely failure mode for a dual-series network command: [README.md](/Users/murphy/workspace/iacai0/foxtail/README.md#L356)
-- Existing interoperability verification does not explicitly assert `NetworkIn` plus `NetworkOut` in the same `get-metric-data` request: [scripts/verify_cli_interop.sh](/Users/murphy/workspace/iacai0/foxtail/scripts/verify_cli_interop.sh#L315)
+- `NetworkIn` and `NetworkOut` are seeded for EC2 as byte-valued metrics with baseline, spike, and idle-heavy shapes: [src/generator.rs](../../src/generator.rs#L53), [src/generator.rs](../../src/generator.rs#L63)
+- EC2 resource regeneration inserts both network metrics alongside CPU and disk series: [src/generator.rs](../../src/generator.rs#L492)
+- CloudWatch units already map `NetworkIn` and `NetworkOut` to `Bytes`, so the serving layer is aware of these metrics: [src/serve.rs](../../src/serve.rs#L1691)
+- The AWS CLI Query/XML contract layer only models one metric-data query member today: [src/serve.rs](../../src/serve.rs#L85)
+- The README explicitly documents this limitation, which aligns with the likely failure mode for a dual-series network command: [README.md](../../README.md#L356)
+- Existing interoperability verification does not explicitly assert `NetworkIn` plus `NetworkOut` in the same `get-metric-data` request: [scripts/verify_cli_interop.sh](../../scripts/verify_cli_interop.sh#L315)
 
 ### Institutional Learnings
 
@@ -90,7 +90,7 @@ Resolution for planning: yes, as a secondary regression check, but the main bug 
 
 ## System-Wide Impact
 
-- **Interaction graph**: `aws cloudwatch get-metric-data` hits the Query/XML handler in [src/serve.rs](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs), which parses request fields, builds metric queries, reads seeded SQLite rows, then serializes CloudWatch XML output through the handler structs in [src/handlers/cloudwatch.rs](/Users/murphy/workspace/iacai0/foxtail/src/handlers/cloudwatch.rs).
+- **Interaction graph**: `aws cloudwatch get-metric-data` hits the Query/XML handler in [src/serve.rs](../../src/serve.rs), which parses request fields, builds metric queries, reads seeded SQLite rows, then serializes CloudWatch XML output through the handler structs in [src/handlers/cloudwatch.rs](../../src/handlers/cloudwatch.rs).
 - **Error propagation**: malformed `MetricDataQueries.member.N` input should continue to return AWS-style validation errors instead of silently defaulting to zero-like output.
 - **State lifecycle risks**: none expected; this is a read-path fix over existing seeded data.
 - **API surface parity**: JSON `GetMetricData` already supports multi-query requests, so the AWS CLI Query/XML path should reach parity for this core use case.
@@ -154,8 +154,8 @@ aws --endpoint-url http://127.0.0.1:8080 cloudwatch get-metric-data \
 
 ## Sources & References
 
-- Similar implementations: [src/serve.rs](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs#L4991)
-- Current Query/XML limitation: [src/serve.rs](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs#L66)
-- Seeded network metrics: [src/generator.rs](/Users/murphy/workspace/iacai0/foxtail/src/generator.rs#L53)
-- CLI interoperability smoke suite: [scripts/verify_cli_interop.sh](/Users/murphy/workspace/iacai0/foxtail/scripts/verify_cli_interop.sh#L315)
-- Current public contract note: [README.md](/Users/murphy/workspace/iacai0/foxtail/README.md#L290)
+- Similar implementations: [src/serve.rs](../../src/serve.rs#L4991)
+- Current Query/XML limitation: [src/serve.rs](../../src/serve.rs#L66)
+- Seeded network metrics: [src/generator.rs](../../src/generator.rs#L53)
+- CLI interoperability smoke suite: [scripts/verify_cli_interop.sh](../../scripts/verify_cli_interop.sh#L315)
+- Current public contract note: [README.md](../../README.md#L290)

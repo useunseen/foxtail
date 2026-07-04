@@ -12,20 +12,20 @@ Restore the public AWS-compatible surface so a FinOps or DevOps workflow can use
 ## Problem Statement
 The mock currently has enough seeded data to support useful cost and metric analysis, but the public compatibility layer is incomplete:
 
-- Cost Explorer dispatch accepts both `AWSCostExplorer.*` and `AWSInsightsIndexService.*` prefixes at the router level, but only `GetCostAndUsage` is actually aliased in the operation match. Current CLI calls for `GetDimensionValues` and `GetAnomalies` use `AWSInsightsIndexService.*` and fail as `UnsupportedAction`: [src/serve.rs](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs#L869), [src/serve.rs](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs#L1645).
-- `GetCostAndUsage` returns `GroupDefinitions` but always leaves `ResultsByTime[0].Groups` empty, which blocks CLI-driven service or resource breakdowns: [src/serve.rs](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs#L1900).
+- Cost Explorer dispatch accepts both `AWSCostExplorer.*` and `AWSInsightsIndexService.*` prefixes at the router level, but only `GetCostAndUsage` is actually aliased in the operation match. Current CLI calls for `GetDimensionValues` and `GetAnomalies` use `AWSInsightsIndexService.*` and fail as `UnsupportedAction`: [src/serve.rs](../../src/serve.rs#L869), [src/serve.rs](../../src/serve.rs#L1645).
+- `GetCostAndUsage` returns `GroupDefinitions` but always leaves `ResultsByTime[0].Groups` empty, which blocks CLI-driven service or resource breakdowns: [src/serve.rs](../../src/serve.rs#L1900).
 - CloudWatch supports `GetMetricData` and `GetMetricStatistics`, but not `ListMetrics`, so CLI-only users cannot discover metric namespaces, names, or dimensions from the public surface.
-- Capability metadata still advertises only the `AWSCostExplorer.*` target for most CE operations, which does not reflect how the CLI actually talks to the service: [src/serve.rs](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs#L1248).
+- Capability metadata still advertises only the `AWSCostExplorer.*` target for most CE operations, which does not reflect how the CLI actually talks to the service: [src/serve.rs](../../src/serve.rs#L1248).
 - Current tests cover direct handler behavior but do not prove real CLI interoperability for the failing paths.
 
 ## Research Consolidation
 
 ### Internal Repo Findings
-- Target routing treats any `AWSInsightsIndexService.*` request as Cost Explorer traffic, so the main gap is operation-level alias coverage rather than top-level routing: [src/serve.rs](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs#L869).
-- Only `GetCostAndUsage` currently supports the `AWSInsightsIndexService.*` alias in `handle_cost_explorer`; all other CE operations are keyed only on `AWSCostExplorer.*`: [src/serve.rs](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs#L1645).
-- `GetDimensionValues`, `GetCostForecast`, `GetRightsizingRecommendation`, `GetAnomalies`, `GetAnomalyMonitors`, and `GetAnomalySubscriptions` all exist as handlers already; most interoperability work is wiring and contract alignment, not greenfield feature creation: [src/serve.rs](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs#L1931), [src/serve.rs](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs#L1986), [src/serve.rs](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs#L2344), [src/serve.rs](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs#L2437), [src/serve.rs](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs#L2488), [src/serve.rs](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs#L2523).
-- Existing route-level tests cover the direct `AWSCostExplorer.GetDimensionValues` target, but there is no alias coverage and no end-to-end CLI proof: [src/serve.rs](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs#L3094).
-- Prior parity planning already identified grouped CE output and CloudWatch `ListMetrics` as important gaps, so this plan should focus on finishing the public contract rather than inventing new APIs: [docs/plans/2026-02-18-test-aws-mock-service-parity-plan.md](/Users/murphy/workspace/iacai0/foxtail/docs/plans/2026-02-18-test-aws-mock-service-parity-plan.md), [docs/plans/2026-02-19-test-comprehensive-aws-api-parity-suite-plan.md](/Users/murphy/workspace/iacai0/foxtail/docs/plans/2026-02-19-test-comprehensive-aws-api-parity-suite-plan.md).
+- Target routing treats any `AWSInsightsIndexService.*` request as Cost Explorer traffic, so the main gap is operation-level alias coverage rather than top-level routing: [src/serve.rs](../../src/serve.rs#L869).
+- Only `GetCostAndUsage` currently supports the `AWSInsightsIndexService.*` alias in `handle_cost_explorer`; all other CE operations are keyed only on `AWSCostExplorer.*`: [src/serve.rs](../../src/serve.rs#L1645).
+- `GetDimensionValues`, `GetCostForecast`, `GetRightsizingRecommendation`, `GetAnomalies`, `GetAnomalyMonitors`, and `GetAnomalySubscriptions` all exist as handlers already; most interoperability work is wiring and contract alignment, not greenfield feature creation: [src/serve.rs](../../src/serve.rs#L1931), [src/serve.rs](../../src/serve.rs#L1986), [src/serve.rs](../../src/serve.rs#L2344), [src/serve.rs](../../src/serve.rs#L2437), [src/serve.rs](../../src/serve.rs#L2488), [src/serve.rs](../../src/serve.rs#L2523).
+- Existing route-level tests cover the direct `AWSCostExplorer.GetDimensionValues` target, but there is no alias coverage and no end-to-end CLI proof: [src/serve.rs](../../src/serve.rs#L3094).
+- Prior parity planning already identified grouped CE output and CloudWatch `ListMetrics` as important gaps, so this plan should focus on finishing the public contract rather than inventing new APIs: [docs/plans/2026-02-18-test-aws-mock-service-parity-plan.md](2026-02-18-test-aws-mock-service-parity-plan.md), [docs/plans/2026-02-19-test-comprehensive-aws-api-parity-suite-plan.md](2026-02-19-test-comprehensive-aws-api-parity-suite-plan.md).
 
 ### Institutional Learnings
 - No relevant `docs/solutions/` entries currently exist in this checkout.
@@ -145,7 +145,7 @@ Resolution: `ListMetrics` derives strictly from seeded metric rows and resource-
 - Keep unsupported operations returning AWS-style error envelopes, but move currently supported operations out of the `UnsupportedAction` path.
 
 ### 5. Add Verification Harnesses
-- Expand route tests in [src/serve.rs](/Users/murphy/workspace/iacai0/foxtail/src/serve.rs) to cover:
+- Expand route tests in [src/serve.rs](../../src/serve.rs) to cover:
   - `AWSInsightsIndexService.GetDimensionValues`
   - `AWSInsightsIndexService.GetAnomalies`
   - grouped `GetCostAndUsage`
