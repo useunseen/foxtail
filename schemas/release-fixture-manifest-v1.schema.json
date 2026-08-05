@@ -1,0 +1,190 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://useunseen.dev/foxtail/schemas/release-fixture-manifest-v1.schema.json",
+  "title": "Foxtail release qualification Fixture Manifest v1",
+  "type": "object",
+  "required": [
+    "schema",
+    "definition",
+    "generator",
+    "environment",
+    "clock",
+    "generation",
+    "resources",
+    "evidence_declarations",
+    "control_catalogue",
+    "fault_profiles",
+    "mutation_generation",
+    "digest"
+  ],
+  "properties": {
+    "schema": {"const": "foxtail.release-fixture-manifest/v1"},
+    "definition": {
+      "type": "object",
+      "required": ["name", "revision", "digest"],
+      "properties": {
+        "name": {"const": "release-qualification-v1"},
+        "revision": {"const": "1.0.0"},
+        "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "generator": {
+      "type": "object",
+      "required": ["foxtail_version", "source_revision", "fixture_contract"],
+      "properties": {
+        "foxtail_version": {"type": "string"},
+        "source_revision": {"type": "string"},
+        "fixture_contract": {"const": "release-qualification-v1"}
+      },
+      "additionalProperties": false
+    },
+    "environment": {
+      "type": "object",
+      "required": [
+        "account_id",
+        "region",
+        "aws_endpoint_url",
+        "localstack_version",
+        "read_only_estate_fingerprint",
+        "estate_fingerprint",
+        "complete_resource_count"
+      ],
+      "properties": {
+        "account_id": {"type": "string"},
+        "region": {"type": "string"},
+        "aws_endpoint_url": {"type": "string"},
+        "localstack_version": {"type": "string"},
+        "read_only_estate_fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "estate_fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "complete_resource_count": {"type": "integer", "minimum": 5}
+      },
+      "additionalProperties": false
+    },
+    "clock": {
+      "type": "object",
+      "required": ["anchor", "bucket", "required_history_days", "reusable_until"],
+      "properties": {
+        "anchor": {"type": "string", "format": "date-time"},
+        "bucket": {"const": "complete-utc-day"},
+        "required_history_days": {"type": "integer", "minimum": 1},
+        "reusable_until": {"type": "string", "format": "date-time"}
+      },
+      "additionalProperties": false
+    },
+    "generation": {"type": "integer", "minimum": 1},
+    "mutation_generation": {"type": "integer", "minimum": 0},
+    "resources": {
+      "type": "array",
+      "minItems": 5,
+      "items": {
+        "type": "object",
+        "required": [
+          "control_id",
+          "role",
+          "resource_id",
+          "resource_type",
+          "aws_identity",
+          "scenario",
+          "evidence",
+          "observed"
+        ],
+        "properties": {
+          "control_id": {"type": "string"},
+          "role": {"enum": ["positive", "negative", "degraded", "mutation"]},
+          "resource_id": {"type": "string"},
+          "resource_type": {"const": "ec2"},
+          "aws_identity": {"type": "string"},
+          "scenario": {"type": "string"},
+          "evidence": {
+            "type": "object",
+            "patternProperties": {
+              "^(Required|Stretch|required|stretch|expected_finding|expected_findings|authoritative_expected_finding|finding)$": false
+            }
+          },
+          "observed": {
+            "type": "object",
+            "patternProperties": {
+              "^(Required|Stretch|required|stretch|expected_finding|expected_findings|authoritative_expected_finding|finding)$": false
+            }
+          }
+        },
+        "patternProperties": {
+          "^(Required|Stretch|required|stretch|expected_finding|expected_findings|authoritative_expected_finding|finding)$": false
+        },
+        "not": {
+          "anyOf": [
+            {"required": ["Required"]},
+            {"required": ["Stretch"]},
+            {"required": ["required"]},
+            {"required": ["stretch"]},
+            {"required": ["expected_finding"]},
+            {"required": ["expected_findings"]},
+            {"required": ["finding"]}
+          ]
+        },
+        "additionalProperties": true
+      }
+    },
+    "evidence_declarations": {
+      "type": "array",
+      "minItems": 5,
+      "items": {
+        "type": "object",
+        "patternProperties": {
+          "^(Required|Stretch|required|stretch|expected_finding|expected_findings|authoritative_expected_finding|finding)$": false
+        }
+      }
+    },
+    "control_catalogue": {
+      "type": "array",
+      "minItems": 7,
+      "items": {
+        "type": "object",
+        "required": ["control_id", "role"],
+        "properties": {
+          "control_id": {"type": "string"},
+          "role": {"enum": ["positive", "negative", "degraded", "mutation"]}
+        },
+        "patternProperties": {
+          "^(Required|Stretch|required|stretch|expected_finding|expected_findings|authoritative_expected_finding|finding)$": false
+        },
+        "not": {
+          "anyOf": [
+            {"required": ["Required"]},
+            {"required": ["Stretch"]},
+            {"required": ["required"]},
+            {"required": ["stretch"]},
+            {"required": ["expected_finding"]},
+            {"required": ["expected_findings"]},
+            {"required": ["finding"]}
+          ]
+        },
+        "additionalProperties": true
+      }
+    },
+    "fault_profiles": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "patternProperties": {
+          "^(Required|Stretch|required|stretch|expected_finding|expected_findings|authoritative_expected_finding|finding)$": false
+        }
+      }
+    },
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+  },
+  "not": {
+    "anyOf": [
+      {"required": ["Required"]},
+      {"required": ["Stretch"]},
+      {"required": ["required"]},
+      {"required": ["stretch"]},
+      {"required": ["expected_finding"]},
+      {"required": ["expected_findings"]},
+      {"required": ["authoritative_expected_finding"]},
+      {"required": ["finding"]}
+    ]
+  },
+  "additionalProperties": false
+}

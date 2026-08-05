@@ -1,5 +1,34 @@
 # Cost Explorer USAGE_TYPE Grouping Work
 
+# Release Qualification Fixture v1
+
+- [x] Add canonical fixture definition/manifest model, serializer, SHA-256 digest boundary, schemas, and checked-in goldens.
+- [x] Add atomic persisted realization state derived from the current EC2 estate, with deterministic five-control catalogue and public evidence declarations.
+- [x] Add shared CLI and HTTP definition/realize/status/manifest/identities flows with fail-closed version/input handling and byte/digest parity.
+- [x] Add focused unit/integration/schema/golden tests plus AWS CLI observation smoke coverage; update README and script docs.
+- [x] Run formatting, full tests, clippy, and feasible interoperability checks; record review evidence and residual environment gaps.
+
+## Release Qualification Fixture v1 Results
+
+- The v1 definition and manifest are canonical compact UTF-8 JSON with recursively sorted object keys and SHA-256 digests that exclude only the document's own top-level digest.
+- Realization persists exact definition/manifest bytes in a singleton SQLite row, binds the manifest to the active definition digest and generation, and publishes five deterministic EC2 control identities with materialized public evidence plus two deferred mutation declarations.
+- The canonical `fixture` CLI command and `/_mock/fixture/*` routes return the same bytes for definition, realization, status, manifest, and identities; unknown versions, malformed JSON, and unknown request fields fail closed.
+
+## Release Qualification Fixture v1 Repair Results
+
+- [x] Materialize five deterministic EC2 controls from empty rows, reload the actual metric/cost rows, validate positive/negative/degraded/resize predicates, and fingerprint the observed evidence.
+- [x] Protect fixture realization with the same admin-token guard as the scenario mutation route; remove speculative CLI and HTTP aliases.
+- [x] Make schema validation executable with pinned `scripts/requirements.txt` (`jsonschema==4.26.0`), Draft 2020-12 validation, recursive forbidden-policy checks, negative checks, and Rust generated-manifest golden parity.
+- [x] Make the CLI smoke mandatory: seed five EC2 rows in its isolated migrated copy and assert identity-matched CloudWatch history, Cost Explorer resource groups, and Compute Optimizer findings without a skip path.
+- Verification completed with `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets --all-features -- -D warnings`, `bash -n scripts/verify_cli_interop.sh`, the pinned Draft 2020-12 validator, and the mandatory isolated AWS CLI smoke. A live LocalStack deployment is not available in this checkout; that remains an environment gap separate from the local proof.
+
+## Release Qualification Fixture v1 Second Frozen Review Results
+
+- [x] Publish implementation-owned assignment, materialization profiles, history offsets, network formulas, CPU predicates, and required resource rules through `generation_rules`; regenerate definition/manifest goldens and digest-sensitive tests.
+- [x] Resolve fixture account scope from the same authoritative public account identity; reject explicit mismatches before any materialization transaction and verify default/explicit matching parity against public Compute Optimizer identities.
+- [x] Extend the mandatory CLI smoke to query Resource Groups Tagging for every realized manifest ARN and assert exact ARN identity plus the deterministic `Name` tag.
+- Verification completed with `cargo fmt --all -- --check`, `cargo test` (69 tests plus integration suites), `cargo clippy --all-targets --all-features -- -D warnings`, the pinned Draft 2020-12 validator, `bash -n scripts/verify_cli_interop.sh`, `git diff --check`, and the mandatory isolated AWS CLI smoke. The smoke passed exact Resource Groups Tagging ARN/Name checks for all five realized controls. A live LocalStack deployment remains an environment gap.
+
 - [x] Diagnose why AWS CLI `ce get-cost-and-usage --group-by Type=DIMENSION,Key=USAGE_TYPE` fails validation.
 - [x] Add `USAGE_TYPE` as a supported Cost Explorer grouping dimension.
 - [x] Return AWS-style mock usage type keys and `UsageQuantity` metrics for grouped cost responses.

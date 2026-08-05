@@ -63,4 +63,47 @@ pub enum Commands {
         #[arg(short, long, default_value = "127.0.0.1")]
         address: String,
     },
+    /// Publish and inspect the versioned release-qualification fixture.
+    #[command(name = "fixture")]
+    Fixture {
+        #[command(subcommand)]
+        command: FixtureCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum FixtureCommands {
+    /// Print the canonical release-qualification Fixture Definition.
+    Definition {
+        /// Fixture version.
+        #[arg(long, default_value = "release-qualification-v1")]
+        version: String,
+    },
+    /// Realize one fixture against the discovered EC2 estate.
+    Realize {
+        /// Fixture version.
+        #[arg(long, default_value = "release-qualification-v1")]
+        version: String,
+        /// RFC3339 UTC anchor for deterministic evidence windows.
+        #[arg(long)]
+        clock_anchor: Option<String>,
+        /// AWS account scope; must match the public mock account identity.
+        #[arg(long)]
+        account_id: Option<String>,
+        /// AWS region; must match the discovered EC2 estate.
+        #[arg(long)]
+        region: Option<String>,
+        /// LocalStack endpoint provenance to publish in the manifest.
+        #[arg(long)]
+        endpoint_url: Option<String>,
+        /// LocalStack version provenance to publish in the manifest.
+        #[arg(long)]
+        localstack_version: Option<String>,
+    },
+    /// Print the persisted fixture status and digests.
+    Status,
+    /// Print the exact persisted canonical Fixture Manifest.
+    Manifest,
+    /// Print realized control identities and their manifest digest.
+    Identities,
 }

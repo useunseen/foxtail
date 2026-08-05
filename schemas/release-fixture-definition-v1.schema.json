@@ -1,0 +1,199 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://useunseen.dev/foxtail/schemas/release-fixture-definition-v1.schema.json",
+  "title": "Foxtail release qualification Fixture Definition v1",
+  "type": "object",
+  "required": [
+    "schema",
+    "name",
+    "revision",
+    "namespace",
+    "clock_contract",
+    "generation_rules",
+    "control_ids",
+    "controls",
+    "digest"
+  ],
+  "properties": {
+    "schema": {"const": "foxtail.release-fixture-definition/v1"},
+    "name": {"const": "release-qualification-v1"},
+    "revision": {"type": "string", "const": "1.0.0"},
+    "namespace": {"type": "string"},
+    "clock_contract": {
+      "type": "object",
+      "required": ["timezone", "bucket", "required_history_days", "reuse_ttl_hours"],
+      "properties": {
+        "timezone": {"const": "UTC"},
+        "bucket": {"const": "complete-utc-day"},
+        "required_history_days": {"type": "integer", "minimum": 1},
+        "reuse_ttl_hours": {"type": "integer", "minimum": 1}
+      },
+      "additionalProperties": false
+    },
+    "generation_rules": {
+      "type": "object",
+      "required": [
+        "resource_source",
+        "resource_order",
+        "metric_surface",
+        "cost_surface",
+        "recommendation_surface",
+        "history_days",
+        "assignment",
+        "history",
+        "evidence_profiles",
+        "network_profile",
+        "cpu_predicates",
+        "required_ec2_resources"
+      ],
+      "properties": {
+        "resource_source": {"type": "string"},
+        "resource_order": {"type": "string"},
+        "assignment": {
+          "type": "object",
+          "required": ["selection", "control_order", "mapping"],
+          "properties": {
+            "selection": {"type": "string"},
+            "control_order": {
+              "type": "array",
+              "minItems": 5,
+              "uniqueItems": true,
+              "items": {"type": "string"}
+            },
+            "mapping": {"type": "string"}
+          },
+          "additionalProperties": false
+        },
+        "metric_surface": {"type": "array", "items": {"type": "string"}},
+        "cost_surface": {"type": "array", "items": {"type": "string"}},
+        "recommendation_surface": {"type": "array", "items": {"type": "string"}},
+        "history_days": {"type": "integer", "minimum": 1},
+        "history": {
+          "type": "object",
+          "required": ["days", "offset_formula", "offset_seconds"],
+          "properties": {
+            "days": {"type": "integer", "minimum": 1},
+            "offset_formula": {"type": "string"},
+            "offset_seconds": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {"type": "integer"}
+            }
+          },
+          "additionalProperties": false
+        },
+        "evidence_profiles": {
+          "type": "array",
+          "minItems": 5,
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "required": ["control_id", "cpu_value", "cost_amount", "missing_cpu_day"],
+            "properties": {
+              "control_id": {"type": "string"},
+              "cpu_value": {"type": "number", "minimum": 0},
+              "cost_amount": {"type": "number", "exclusiveMinimum": 0},
+              "missing_cpu_day": {
+                "anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "network_profile": {
+          "type": "object",
+          "required": ["network_in_base", "network_out_base", "per_day_increment"],
+          "properties": {
+            "network_in_base": {"type": "number", "minimum": 0},
+            "network_out_base": {"type": "number", "minimum": 0},
+            "per_day_increment": {"type": "number", "minimum": 0}
+          },
+          "additionalProperties": false
+        },
+        "cpu_predicates": {
+          "type": "object",
+          "required": [
+            "low_max_exclusive",
+            "busy_min_exclusive",
+            "optimized_min_inclusive",
+            "optimized_max_inclusive"
+          ],
+          "properties": {
+            "low_max_exclusive": {"type": "number", "minimum": 0},
+            "busy_min_exclusive": {"type": "number", "minimum": 0},
+            "optimized_min_inclusive": {"type": "number", "minimum": 0},
+            "optimized_max_inclusive": {"type": "number", "minimum": 0}
+          },
+          "additionalProperties": false
+        },
+        "required_ec2_resources": {"type": "integer", "minimum": 5}
+      },
+      "additionalProperties": false
+    },
+    "control_ids": {
+      "type": "array",
+      "minItems": 7,
+      "uniqueItems": true,
+      "items": {"type": "string"}
+    },
+    "controls": {
+      "type": "array",
+      "minItems": 7,
+      "items": {
+        "type": "object",
+        "required": [
+          "control_id",
+          "role",
+          "service",
+          "scenario_intent",
+          "realization_intent",
+          "evidence"
+        ],
+        "properties": {
+          "control_id": {"type": "string"},
+          "role": {"enum": ["positive", "negative", "degraded", "mutation"]},
+          "service": {"const": "ec2"},
+          "scenario_intent": {"type": "string"},
+          "realization_intent": {"type": "string"},
+          "evidence": {
+            "type": "object",
+            "patternProperties": {
+              "^(Required|Stretch|required|stretch|expected_finding|expected_findings|authoritative_expected_finding|finding)$": false
+            }
+          }
+        },
+        "patternProperties": {
+          "^(Required|Stretch|required|stretch|expected_finding|expected_findings|authoritative_expected_finding|finding)$": false
+        },
+        "not": {
+          "anyOf": [
+            {"required": ["Required"]},
+            {"required": ["Stretch"]},
+            {"required": ["required"]},
+            {"required": ["stretch"]},
+            {"required": ["expected_finding"]},
+            {"required": ["expected_findings"]},
+            {"required": ["authoritative_expected_finding"]},
+            {"required": ["finding"]}
+          ]
+        },
+        "additionalProperties": true
+      }
+    },
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+  },
+  "not": {
+    "anyOf": [
+      {"required": ["Required"]},
+      {"required": ["Stretch"]},
+      {"required": ["required"]},
+      {"required": ["stretch"]},
+      {"required": ["expected_finding"]},
+      {"required": ["expected_findings"]},
+      {"required": ["authoritative_expected_finding"]},
+      {"required": ["finding"]}
+    ]
+  },
+  "additionalProperties": false
+}

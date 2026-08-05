@@ -48,6 +48,24 @@ log_step "Building debug binary"
 cargo build >/dev/null
 log_step "Backing up seed database to isolated temp file"
 sqlite3 "$SOURCE_DB" ".backup '$TMP_DB'" >/dev/null
+DATABASE_URL="sqlite:$TMP_DB" "$BIN" fixture status >/dev/null
+
+FIXTURE_SEED_IDS=(
+  "i-foxtail-fixture-0"
+  "i-foxtail-fixture-1"
+  "i-foxtail-fixture-2"
+  "i-foxtail-fixture-3"
+  "i-foxtail-fixture-4"
+)
+for fixture_id in "${FIXTURE_SEED_IDS[@]}"; do
+  sqlite3 "$TMP_DB" "INSERT OR IGNORE INTO resources (id, resource_type, region, scenario, tags) VALUES ('$fixture_id', 'ec2', 'us-east-1', 'Baseline', '{\"Name\":\"$fixture_id\"}');"
+done
+sqlite3 "$TMP_DB" "UPDATE resources SET tags = '{\"Name\":' || char(34) || id || char(34) || '}' WHERE resource_type = 'ec2';"
+FIXTURE_EC2_COUNT="$(sqlite3 "$TMP_DB" "SELECT COUNT(*) FROM resources WHERE resource_type = 'ec2';")"
+if [[ "$FIXTURE_EC2_COUNT" -lt 5 ]]; then
+  echo "fixture seed did not produce five EC2 resources" >&2
+  exit 1
+fi
 
 log_step "Starting temporary mock server on http://127.0.0.1:$PORT"
 DATABASE_URL="sqlite:$TMP_DB" "$BIN" serve --port "$PORT" >"$SERVER_LOG" 2>&1 &
@@ -79,16 +97,273 @@ print((now.date() - timedelta(days=10)).isoformat())
 print(now.date().isoformat())
 print((now - timedelta(hours=12)).isoformat().replace("+00:00", "Z"))
 print(now.isoformat().replace("+00:00", "Z"))
+print((now - timedelta(days=15)).isoformat().replace("+00:00", "Z"))
 PY
 )
 CE_START_DAY="${VERIFY_DATES[0]}"
 CE_END_DAY="${VERIFY_DATES[1]}"
 CW_START_TIME="${VERIFY_DATES[2]}"
 CW_END_TIME="${VERIFY_DATES[3]}"
+FIXTURE_CW_START_TIME="${VERIFY_DATES[4]}"
+FIXTURE_CW_END_TIME="${VERIFY_DATES[3]}"
+FIXTURE_CE_START_DAY="${VERIFY_DATES[4]%%T*}"
+FIXTURE_CE_END_DAY="${VERIFY_DATES[1]}"
 
 aws_json() {
   aws --output json --endpoint-url "$ENDPOINT" "$@"
 }
+
+python3 "$ROOT_DIR/scripts/validate_release_fixture.py" --negative
+
+FIXTURE_DEFINITION="$(curl -fsS "$ENDPOINT/_mock/fixture/definition?version=release-qualification-v1")"
+FIXTURE_STATUS="$(curl -fsS "$ENDPOINT/_mock/fixture/status")"
+CLI_FIXTURE_DEFINITION="$("$BIN" --database-url "sqlite:$TMP_DB" fixture definition)"
+CLI_FIXTURE_STATUS="$("$BIN" --database-url "sqlite:$TMP_DB" fixture status)"
+if [[ "$CLI_FIXTURE_DEFINITION" != "$FIXTURE_DEFINITION" ]]; then
+  echo "fixture definition CLI/HTTP bytes differ" >&2
+  exit 1
+fi
+if [[ "$CLI_FIXTURE_STATUS" != "$FIXTURE_STATUS" ]]; then
+  echo "fixture status CLI/HTTP bytes differ" >&2
+  exit 1
+fi
+FIXTURE_DEFINITION="$FIXTURE_DEFINITION" FIXTURE_STATUS="$FIXTURE_STATUS" python3 - <<'PY'
+import json
+import os
+
+definition = json.loads(os.environ["FIXTURE_DEFINITION"])
+status = json.loads(os.environ["FIXTURE_STATUS"])
+if definition.get("schema") != "foxtail.release-fixture-definition/v1":
+    raise SystemExit("fixture definition schema mismatch")
+if not definition.get("digest", "").startswith("sha256:"):
+    raise SystemExit("fixture definition digest missing")
+if status.get("status") != "ABSENT":
+    raise SystemExit("fresh fixture state should be ABSENT")
+PY
+log_step "Verified release fixture: definition and pre-realization status"
+
+FIXTURE_ANCHOR="2026-08-05T00:00:00Z"
+CLI_DB="$TMP_DIR/cli-fixture.db"
+sqlite3 "$TMP_DB" ".backup '$CLI_DB'" >/dev/null
+FIXTURE_REALIZATION="$(curl -fsS -X POST "$ENDPOINT/_mock/fixture/realize" \
+  -H 'content-type: application/json' \
+  -d "{\"version\":\"release-qualification-v1\",\"clock_anchor\":\"$FIXTURE_ANCHOR\"}")"
+CLI_REALIZATION="$("$BIN" --database-url "sqlite:$CLI_DB" fixture realize \
+  --clock-anchor "$FIXTURE_ANCHOR")"
+if [[ "$CLI_REALIZATION" != "$FIXTURE_REALIZATION" ]]; then
+  echo "fixture realization CLI/HTTP bytes differ" >&2
+  exit 1
+fi
+FIXTURE_REALIZATION="$FIXTURE_REALIZATION" python3 - <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ["FIXTURE_REALIZATION"])
+manifest = payload.get("manifest", {})
+if manifest.get("schema") != "foxtail.release-fixture-manifest/v1":
+    raise SystemExit("fixture manifest schema mismatch")
+if payload.get("manifest_digest") != manifest.get("digest"):
+    raise SystemExit("fixture manifest digest mismatch")
+resources = manifest.get("resources", [])
+if len(resources) != 5:
+    raise SystemExit("fixture realization did not publish five realized controls")
+expected = {
+    "ec2-idle-positive-001",
+    "ec2-idle-negative-001",
+    "ec2-idle-degraded-001",
+    "ec2-resize-positive-001",
+    "ec2-resize-negative-001",
+}
+if {resource.get("control_id") for resource in resources} != expected:
+    raise SystemExit("fixture realization published an unexpected control set")
+if len({resource.get("resource_id") for resource in resources}) != 5:
+    raise SystemExit("fixture realization published duplicate resource identities")
+for resource in resources:
+    observed = resource.get("observed", {})
+    if observed.get("metric_count", 0) <= 0 or observed.get("cost_record_count", 0) != 14:
+        raise SystemExit("fixture realization did not publish observed metric and cost rows")
+    if resource.get("evidence", {}).get("cost_complete_days") != 14:
+        raise SystemExit("fixture realization did not publish complete cost history")
+degraded = next(resource for resource in resources if resource["control_id"] == "ec2-idle-degraded-001")
+if degraded["evidence"].get("cloudwatch_complete_days") != 13:
+    raise SystemExit("degraded fixture control did not expose one missing CPU history day")
+if len(degraded["evidence"].get("cloudwatch_missing_offsets", [])) != 1:
+    raise SystemExit("degraded fixture control did not expose exactly one missing CPU offset")
+PY
+log_step "Verified release fixture: realization manifest, digest, identities, and observed evidence"
+FIXTURE_STATUS_REALIZED="$(curl -fsS "$ENDPOINT/_mock/fixture/status")"
+FIXTURE_MANIFEST="$(curl -fsS "$ENDPOINT/_mock/fixture/manifest")"
+FIXTURE_IDENTITIES="$(curl -fsS "$ENDPOINT/_mock/fixture/identities")"
+CLI_FIXTURE_STATUS_REALIZED="$("$BIN" --database-url "sqlite:$TMP_DB" fixture status)"
+CLI_FIXTURE_MANIFEST="$("$BIN" --database-url "sqlite:$TMP_DB" fixture manifest)"
+CLI_FIXTURE_IDENTITIES="$("$BIN" --database-url "sqlite:$TMP_DB" fixture identities)"
+if [[ "$CLI_FIXTURE_STATUS_REALIZED" != "$FIXTURE_STATUS_REALIZED" \
+  || "$CLI_FIXTURE_MANIFEST" != "$FIXTURE_MANIFEST" \
+  || "$CLI_FIXTURE_IDENTITIES" != "$FIXTURE_IDENTITIES" ]]; then
+  echo "fixture persisted document CLI/HTTP bytes differ" >&2
+  exit 1
+fi
+printf '%s\n' "$FIXTURE_DEFINITION" >"$TMP_DIR/fixture-definition.json"
+printf '%s\n' "$FIXTURE_MANIFEST" >"$TMP_DIR/fixture-manifest.json"
+printf '%s\n' "$FIXTURE_IDENTITIES" >"$TMP_DIR/fixture-identities.json"
+python3 "$ROOT_DIR/scripts/validate_release_fixture.py" \
+  --definition "$TMP_DIR/fixture-definition.json" \
+  --manifest "$TMP_DIR/fixture-manifest.json" \
+  --negative
+log_step "Verified release fixture: persisted CLI/HTTP parity and executable Draft 2020-12 schema policy"
+FIXTURE_IDS="$(FIXTURE_REALIZATION="$FIXTURE_REALIZATION" python3 - <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ["FIXTURE_REALIZATION"])
+for resource in payload["manifest"]["resources"]:
+    print(f'{resource["resource_id"]}\t{resource["control_id"]}')
+PY
+)"
+FIXTURE_ARNS="$(FIXTURE_REALIZATION="$FIXTURE_REALIZATION" python3 - <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ["FIXTURE_REALIZATION"])
+for resource in payload["manifest"]["resources"]:
+    print(f'{resource["resource_id"]}\t{resource["aws_identity"]}')
+PY
+)"
+
+while IFS=$'\t' read -r fixture_id fixture_arn; do
+  [[ -z "$fixture_id" ]] && continue
+  TAGGED_FIXTURE="$(aws_json resourcegroupstaggingapi get-resources \
+    --resource-arn-list "$fixture_arn")"
+  TAGGED_FIXTURE="$TAGGED_FIXTURE" FIXTURE_ID="$fixture_id" FIXTURE_ARN="$fixture_arn" python3 - <<'PY'
+import json
+import os
+
+fixture_id = os.environ["FIXTURE_ID"]
+fixture_arn = os.environ["FIXTURE_ARN"]
+mappings = json.loads(os.environ["TAGGED_FIXTURE"]).get("ResourceTagMappingList", [])
+if len(mappings) != 1 or mappings[0].get("ResourceARN") != fixture_arn:
+    raise SystemExit(f"tagging inventory did not return exact identity {fixture_id}")
+tags = {
+    tag.get("Key"): tag.get("Value")
+    for tag in mappings[0].get("Tags", [])
+}
+if tags.get("Name") != fixture_id:
+    raise SystemExit(f"tagging inventory returned the wrong Name tag for {fixture_id}")
+PY
+done <<<"$FIXTURE_ARNS"
+log_step "Verified release fixture: identity- and tag-matched Resource Groups inventory"
+
+while IFS=$'\t' read -r fixture_id control_id; do
+  [[ -z "$fixture_id" ]] && continue
+  METRICS_OUTPUT="$(aws_json cloudwatch list-metrics \
+    --namespace AWS/EC2 \
+    --metric-name CPUUtilization \
+    --dimensions "Name=InstanceId,Value=$fixture_id")"
+  METRICS_OUTPUT="$METRICS_OUTPUT" FIXTURE_ID="$fixture_id" python3 - <<'PY'
+import json
+import os
+
+fixture_id = os.environ["FIXTURE_ID"]
+metrics = json.loads(os.environ["METRICS_OUTPUT"]).get("Metrics", [])
+if not any(
+    metric.get("Namespace") == "AWS/EC2"
+    and metric.get("MetricName") == "CPUUtilization"
+    and any(
+        dimension.get("Name") == "InstanceId"
+        and dimension.get("Value") == fixture_id
+        for dimension in metric.get("Dimensions", [])
+    )
+    for metric in metrics
+):
+    raise SystemExit(f"CloudWatch list-metrics did not return identity {fixture_id}")
+PY
+
+  CPU_HISTORY="$(aws_json cloudwatch get-metric-statistics \
+    --namespace AWS/EC2 \
+    --metric-name CPUUtilization \
+    --statistics Average \
+    --period 3600 \
+    --start-time "$FIXTURE_CW_START_TIME" \
+    --end-time "$FIXTURE_CW_END_TIME" \
+    --dimensions "Name=InstanceId,Value=$fixture_id")"
+  CPU_HISTORY="$CPU_HISTORY" CONTROL_ID="$control_id" python3 - <<'PY'
+import json
+import os
+
+control_id = os.environ["CONTROL_ID"]
+datapoints = json.loads(os.environ["CPU_HISTORY"]).get("Datapoints", [])
+expected = 13 if control_id == "ec2-idle-degraded-001" else 14
+if len(datapoints) != expected:
+    raise SystemExit(
+        f"{control_id} expected {expected} CPU history points, found {len(datapoints)}"
+    )
+if not all(point.get("Average", 0) > 0 for point in datapoints):
+    raise SystemExit(f"{control_id} returned a non-positive CPU history point")
+PY
+done <<<"$FIXTURE_IDS"
+log_step "Verified release fixture: identity-matched CloudWatch metrics and scoped history gaps"
+
+FIXTURE_COSTS="$(aws_json ce get-cost-and-usage \
+  --time-period "Start=$FIXTURE_CE_START_DAY,End=$FIXTURE_CE_END_DAY" \
+  --granularity DAILY \
+  --metrics UnblendedCost \
+  --group-by Type=DIMENSION,Key=RESOURCE_ID)"
+FIXTURE_COSTS="$FIXTURE_COSTS" FIXTURE_REALIZATION="$FIXTURE_REALIZATION" python3 - <<'PY'
+import json
+import os
+
+manifest = json.loads(os.environ["FIXTURE_REALIZATION"])["manifest"]
+ids = {resource["resource_id"] for resource in manifest["resources"]}
+observed = {resource_id: 0.0 for resource_id in ids}
+for bucket in json.loads(os.environ["FIXTURE_COSTS"]).get("ResultsByTime", []):
+    for group in bucket.get("Groups", []):
+        keys = group.get("Keys", [])
+        if len(keys) != 1 or keys[0] not in observed:
+            continue
+        amount = float(group.get("Metrics", {}).get("UnblendedCost", {}).get("Amount", 0))
+        observed[keys[0]] += amount
+if any(amount <= 0 for amount in observed.values()):
+    raise SystemExit(f"missing positive resource cost evidence: {observed}")
+PY
+log_step "Verified release fixture: identity-matched Cost Explorer resource groups"
+
+FIXTURE_RECOMMENDATIONS="$(aws_json compute-optimizer get-ec2-instance-recommendations)"
+FIXTURE_RECOMMENDATIONS="$FIXTURE_RECOMMENDATIONS" FIXTURE_REALIZATION="$FIXTURE_REALIZATION" python3 - <<'PY'
+import json
+import os
+
+manifest = json.loads(os.environ["FIXTURE_REALIZATION"])["manifest"]
+expected = {
+    resource["resource_id"]: (
+        "OVER_PROVISIONED"
+        if resource["control_id"] in {
+            "ec2-idle-positive-001",
+            "ec2-idle-degraded-001",
+            "ec2-resize-positive-001",
+        }
+        else "OPTIMIZED"
+        if resource["control_id"] == "ec2-resize-negative-001"
+        else "UNDER_PROVISIONED"
+    )
+    for resource in manifest["resources"]
+}
+recommendations = {}
+for recommendation in json.loads(os.environ["FIXTURE_RECOMMENDATIONS"]).get(
+    "instanceRecommendations", []
+):
+    arn = recommendation.get("instanceArn", "")
+    resource_id = arn.rsplit("/", 1)[-1]
+    if resource_id in expected:
+        recommendations[resource_id] = recommendation.get("finding")
+if set(recommendations) != set(expected):
+    raise SystemExit(f"missing Compute Optimizer identities: {set(expected) - set(recommendations)}")
+for resource_id, finding in expected.items():
+    if recommendations[resource_id] != finding:
+        raise SystemExit(
+            f"{resource_id} expected Compute Optimizer finding {finding}, got {recommendations[resource_id]}"
+        )
+PY
+log_step "Verified release fixture: identity-matched Compute Optimizer findings"
 
 SERVICE_DIMENSIONS="$(aws_json ce get-dimension-values \
   --time-period "Start=$CE_START_DAY,End=$CE_END_DAY" \
