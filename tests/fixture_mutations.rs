@@ -281,6 +281,13 @@ async fn mock_backend_reconciles_all_four_scenarios_and_public_absence() {
         )
         .unwrap();
         assert_eq!(destroy["public_inventory_absence"]["all_absent"], true);
+        let external_termination = destroy["external_ec2_termination"].as_array().unwrap();
+        assert_eq!(external_termination.len(), mutation::CATALOGUE.len());
+        assert!(
+            external_termination
+                .iter()
+                .all(|target| target["state"] == "not-found")
+        );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM resources WHERE scenario = 'QualificationMutation'"
@@ -349,7 +356,7 @@ async fn setup_failure_records_current_returned_id_and_proves_cleanup() {
         .await
         .unwrap_err()
         .to_string();
-        assert!(error.contains("public_absence_proven"));
+        assert!(error.contains("external_ec2_termination_proven"));
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM fixture_mutation_intents WHERE status = 'FAILED'",
@@ -371,11 +378,12 @@ async fn setup_failure_records_current_returned_id_and_proves_cleanup() {
                 .await
                 .unwrap();
         for target_kind in mutation::TargetKind::ALL {
-            assert!(
+            assert_eq!(
                 backend
-                    .verify_absent(&mutation::resource_id_hint(1, target_kind))
+                    .verify_destroyed(&mutation::resource_id_hint(1, target_kind))
                     .await
-                    .unwrap()
+                    .unwrap(),
+                Some(mutation::ExternalTerminationState::NotFound)
             );
         }
         pool.close().await;
@@ -587,11 +595,12 @@ async fn post_provision_database_failure_compensates_public_targets() {
                 .await
                 .unwrap();
         for target_kind in mutation::TargetKind::ALL {
-            assert!(
+            assert_eq!(
                 backend
-                    .verify_absent(&mutation::resource_id_hint(1, target_kind))
+                    .verify_destroyed(&mutation::resource_id_hint(1, target_kind))
                     .await
-                    .unwrap()
+                    .unwrap(),
+                Some(mutation::ExternalTerminationState::NotFound)
             );
         }
         pool.close().await;
@@ -1473,6 +1482,13 @@ async fn native_cli_dispatch_covers_mutation_lifecycle_and_stale_failure() {
             "foxtail.release-fixture-recreate-receipt/v1"
         );
         assert_eq!(recreated["status"], "RECREATED");
+        assert_eq!(
+            recreated["prior"]["external_ec2_termination"]
+                .as_array()
+                .unwrap()
+                .len(),
+            mutation::CATALOGUE.len()
+        );
         validate_emitted_schema("receipt", &recreated);
 
         let current_authority = authority_from_state(&fixture::read_state(&pool).await.unwrap());
@@ -1493,6 +1509,13 @@ async fn native_cli_dispatch_covers_mutation_lifecycle_and_stale_failure() {
         );
         assert_eq!(destroyed["status"], "DESTROYED");
         assert_eq!(destroyed["public_inventory_absence"]["all_absent"], true);
+        assert_eq!(
+            destroyed["external_ec2_termination"]
+                .as_array()
+                .unwrap()
+                .len(),
+            mutation::CATALOGUE.len()
+        );
         validate_emitted_schema("receipt", &destroyed);
 
         let absent: Value = serde_json::from_slice(

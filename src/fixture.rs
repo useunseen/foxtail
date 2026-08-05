@@ -1014,44 +1014,9 @@ async fn compensate_realization_failure(
         .map(|(_, observed)| observed.resource_id.clone())
         .collect::<Vec<_>>();
     let cleanup_result = backend.terminate_all(&ids).await;
-    let mut absence_error = None;
-    if cleanup_result.is_ok() {
-        for id in &ids {
-            match backend.verify_absent(id).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    absence_error = Some(anyhow!("public target {id} remains visible"));
-                    break;
-                }
-                Err(error) => {
-                    absence_error = Some(error);
-                    break;
-                }
-            }
-        }
-    }
     if let Err(cleanup_error) = cleanup_result {
         let error = format!(
             "post-provision finalization ambiguous; returned_ids={ids:?}; original_error={original_error}; cleanup_error={cleanup_error}"
-        );
-        let quarantine = quarantine_provisioned_generation(pool, context, &ids, &error).await;
-        let intent_error = match quarantine {
-            Ok(()) => error,
-            Err(quarantine_error) => format!("{error}; quarantine_error={quarantine_error}"),
-        };
-        let _ = update_mutation_intent(
-            pool,
-            intent_id,
-            "AMBIGUOUS",
-            Some(&intent_error),
-            &now_rfc3339(),
-        )
-        .await;
-        return;
-    }
-    if let Some(absence_error) = absence_error {
-        let error = format!(
-            "post-provision finalization ambiguous; returned_ids={ids:?}; original_error={original_error}; absence_error={absence_error}"
         );
         let quarantine = quarantine_provisioned_generation(pool, context, &ids, &error).await;
         let intent_error = match quarantine {
@@ -2606,7 +2571,9 @@ pub async fn recreate(pool: &SqlitePool, request: RecreateRequest) -> Result<Vec
         .collect::<Vec<_>>();
     let old_backend =
         mutation_backend_for_generation(pool, old_mutation_generation, &old_generation_id).await?;
-        if let Err(error) = old_backend.terminate_all(&old_ids).await {
+    let external_ec2_termination = match old_backend.terminate_all(&old_ids).await {
+        Ok(evidence) => evidence,
+        Err(error) => {
             let error = anyhow!(
                 "recreate cleanup ambiguous; returned_ids={old_ids:?}; {error}"
             );
@@ -2615,6 +2582,7 @@ pub async fn recreate(pool: &SqlitePool, request: RecreateRequest) -> Result<Vec
             finalize_intent_ambiguous(pool, &intent_id, &error).await;
             return Err(error);
         }
+    };
     let receipt_id = receipt_id("recreate");
     let receipt = json!({
         "schema": "foxtail.release-fixture-recreate-receipt/v1",
@@ -2625,7 +2593,8 @@ pub async fn recreate(pool: &SqlitePool, request: RecreateRequest) -> Result<Vec
             "manifest_digest": old_manifest_digest,
             "mutation_generation": old_mutation_generation,
             "mutation_generation_id": old_generation_id,
-            "targets": old_targets
+            "targets": old_targets,
+            "external_ec2_termination": external_ec2_termination
         },
         "terminal": {
             "manifest_digest": snapshot.manifest_digest,
@@ -2923,20 +2892,9 @@ pub async fn destroy(pool: &SqlitePool, request: DestroyRequest) -> Result<Vec<u
         });
         reset_receipts.push(reset_receipt);
     }
-    if let Err(error) = backend.terminate_all(&target_ids).await {
-        let _ = update_mutation_intent(
-            pool,
-            &intent_id,
-            "AMBIGUOUS",
-            Some(&error.to_string()),
-            &now_rfc3339(),
-        )
-        .await;
-        return Err(error);
-    }
-    for target_id in &target_ids {
-        if !backend.verify_absent(target_id).await? {
-            let error = anyhow!("public EC2 still returns retired identity {target_id}");
+    let external_ec2_termination = match backend.terminate_all(&target_ids).await {
+        Ok(evidence) => evidence,
+        Err(error) => {
             let _ = update_mutation_intent(
                 pool,
                 &intent_id,
@@ -2947,7 +2905,7 @@ pub async fn destroy(pool: &SqlitePool, request: DestroyRequest) -> Result<Vec<u
             .await;
             return Err(error);
         }
-    }
+    };
     let mut tx = pool.begin().await?;
     for fault in &active_faults {
         let fault_receipt_id: String = fault.try_get("receipt_id")?;
@@ -3050,7 +3008,7 @@ pub async fn destroy(pool: &SqlitePool, request: DestroyRequest) -> Result<Vec<u
         .await?
     };
     if absent_count != 0 {
-        bail!("destroy could not prove all mutation identities absent")
+        bail!("destroy could not prove all mutation identities absent from public inventory")
     }
     sqlx::query(
         "UPDATE fixture_mutation_generations SET state = 'DESTROYED', external_status = 'DESTROYED',
@@ -3078,6 +3036,7 @@ pub async fn destroy(pool: &SqlitePool, request: DestroyRequest) -> Result<Vec<u
         "mutation_generation_id": generation_id,
         "faults_reset": reset_receipts,
         "targets_destroyed": target_records,
+        "external_ec2_termination": external_ec2_termination,
         "public_inventory_absence": {
             "checked": true,
             "all_absent": true,

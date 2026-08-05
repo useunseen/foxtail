@@ -198,6 +198,19 @@ pub struct ObservedInstance {
     pub availability_zone: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExternalTerminationState {
+    Terminated,
+    NotFound,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExternalTerminationEvidence {
+    pub resource_id: String,
+    pub state: ExternalTerminationState,
+}
+
 #[derive(Debug)]
 pub struct ProvisionFailure {
     pub returned_ids: Vec<String>,
@@ -641,24 +654,9 @@ impl Ec2MutationBackend {
                 cause: format!("setup_error={error}; cleanup_error={cleanup_error}"),
             }));
         }
-        for id in ids {
-            match self.verify_absent(id).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    return Err(anyhow::Error::new(ProvisionFailure {
-                        returned_ids: ids.to_vec(),
-                        cause: format!("target {id} remains publicly visible"),
-                    }));
-                }
-                Err(absence_error) => {
-                    return Err(anyhow::Error::new(ProvisionFailure {
-                        returned_ids: ids.to_vec(),
-                        cause: format!("absence_error={absence_error}"),
-                    }));
-                }
-            }
-        }
-        Ok(error.context(format!("returned_ids={ids:?}; public_absence_proven")))
+        Ok(error.context(format!(
+            "returned_ids={ids:?}; external_ec2_termination_proven"
+        )))
     }
 
     pub async fn apply_setup_fault(
@@ -837,17 +835,28 @@ impl Ec2MutationBackend {
             .ok_or_else(|| anyhow!("public EC2 describe returned no target '{target_id}'"))
     }
 
-    pub async fn verify_absent(&self, target_id: &str) -> Result<bool> {
+    pub async fn verify_destroyed(
+        &self,
+        target_id: &str,
+    ) -> Result<Option<ExternalTerminationState>> {
         match self.describe_instance(target_id).await {
-            Ok(_) => Ok(false),
-            Err(error) if is_not_found_error(&error) => Ok(true),
+            Ok(observed) if is_terminal_instance_state(&observed.instance_state) => {
+                Ok(Some(ExternalTerminationState::Terminated))
+            }
+            Ok(_) => Ok(None),
+            Err(error) if is_not_found_error(&error) => {
+                Ok(Some(ExternalTerminationState::NotFound))
+            }
             Err(error) => Err(error),
         }
     }
 
-    pub async fn terminate_all(&self, target_ids: &[String]) -> Result<()> {
+    pub async fn terminate_all(
+        &self,
+        target_ids: &[String],
+    ) -> Result<Vec<ExternalTerminationEvidence>> {
         if target_ids.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         if let BackendKind::Mock(state) = self.backend.as_ref() {
             let cleanup_delay_ms = {
@@ -865,7 +874,13 @@ impl Ec2MutationBackend {
             if let Some(delay_ms) = cleanup_delay_ms {
                 sleep(StdDuration::from_millis(delay_ms)).await;
             }
-            return Ok(());
+            return Ok(target_ids
+                .iter()
+                .map(|resource_id| ExternalTerminationEvidence {
+                    resource_id: resource_id.clone(),
+                    state: ExternalTerminationState::NotFound,
+                })
+                .collect());
         }
         self.aws_client()
             .terminate_instances()
@@ -875,19 +890,22 @@ impl Ec2MutationBackend {
             .context("terminate disposable mutation targets")?;
         let deadline = Utc::now() + Duration::seconds(30);
         loop {
-            let mut absent = true;
+            let mut evidence = Vec::with_capacity(target_ids.len());
             for target_id in target_ids {
-                match self.describe_instance(target_id).await {
-                    Ok(_) => absent = false,
-                    Err(error) if is_not_found_error(&error) => {}
-                    Err(error) => return Err(error),
+                if let Some(state) = self.verify_destroyed(target_id).await? {
+                    evidence.push(ExternalTerminationEvidence {
+                        resource_id: target_id.clone(),
+                        state,
+                    });
                 }
             }
-            if absent {
-                return Ok(());
+            if evidence.len() == target_ids.len() {
+                return Ok(evidence);
             }
             if Utc::now() >= deadline {
-                bail!("timed out waiting for mutation targets to terminate")
+                bail!(
+                    "timed out waiting for mutation targets to reach terminated or not-found state"
+                )
             }
             sleep(StdDuration::from_millis(200)).await;
         }
@@ -959,6 +977,10 @@ fn is_not_found_error(error: &anyhow::Error) -> bool {
         || message.contains("does not exist")
 }
 
+fn is_terminal_instance_state(state: &str) -> bool {
+    state == "terminated"
+}
+
 fn definitely_pre_dispatch_error(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     message.contains("connection refused")
@@ -966,4 +988,17 @@ fn definitely_pre_dispatch_error(message: &str) -> bool {
         || message.contains("failed to resolve")
         || message.contains("name or service not known")
         || message.contains("no such host")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_terminal_instance_state;
+
+    #[test]
+    fn only_terminated_is_external_destruction_proof() {
+        assert!(is_terminal_instance_state("terminated"));
+        for state in ["running", "stopped", "shutting-down", "unknown"] {
+            assert!(!is_terminal_instance_state(state), "state={state}");
+        }
+    }
 }

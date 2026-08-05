@@ -214,8 +214,11 @@ target/debug/foxtail fixture fault \
 The target ID in a live generation is the ID returned by EC2 and copied from
 the current manifest; the example ID is only the deterministic `mock://` test
 backend form. After `fault` or `reset`, verify the state/type with public EC2
-`DescribeInstances`; after `destroy`, verify every retired ID is absent from
-both `DescribeInstances` and Resource Groups Tagging.
+`DescribeInstances`; after `destroy`, verify every retired ID is either
+service-level not-found or exactly `terminated` in EC2, and is absent from
+Resource Groups Tagging. AWS may retain terminated instances in
+`DescribeInstances` for approximately one hour; see the official
+[TerminateInstances documentation](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_TerminateInstances.html).
 
 ## Supported AWS-Compatible Commands
 

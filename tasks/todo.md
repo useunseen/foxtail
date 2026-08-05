@@ -12,9 +12,9 @@ Invariant: qualification mutations can affect only fresh, manifest-bound, one-us
 - [x] Fault receipts: fault application binds exact manifest digest, mutation control, target/scope, setup fault kind, application time, and one-use reset token; public EC2 state/type is reconciled before commit.
 - [x] Reset/cleanup receipts: reset and destruction enumerate exact faults/targets acted on plus their prior and terminal state; targeted reset is guarded by the recorded terminal state.
 - [x] Isolation gate: every mutating fixture operation requires an explicit isolated-qualification environment signal in addition to existing HTTP admin authentication; ordinary realization remains declared-only and read-only.
-- [x] Destruction proof: cleanup removes generation-owned resources and evidence, resets every active fault, terminates public targets, verifies public absence, and records the absence receipt.
+- [x] Destruction proof: cleanup removes generation-owned resources and evidence, resets every active fault, records exact EC2 termination evidence, proves old identities are absent from Foxtail's public inventory, and records the absence receipt.
 - [x] Fail closed: duplicate, stale-generation, wrong-manifest, wrong-control/target, malformed, unknown-field, and ambiguous external operations are rejected without private-state repair or scope expansion.
-- [ ] Full proof: focused Rust unit/integration tests cover the lifecycle and deterministic mock boundary; the real LocalStack smoke remains an environment-dependent gate and must be run with a valid mutation AMI/endpoint.
+- [x] Full proof: focused Rust unit/integration tests cover the lifecycle and deterministic mock boundary, and the complete LocalStack smoke passes with a valid mutation AMI/endpoint.
 
 ## Execution Plan
 
@@ -32,7 +32,7 @@ Invariant: qualification mutations can affect only fresh, manifest-bound, one-us
 
 - Added a typed canonical mutation catalogue and a single EC2 boundary. Isolated generations use the AWS SDK against the configured endpoint and reconcile returned IDs, states, and instance types; a deterministic `mock://` backend exercises the same lifecycle in tests.
 - Ordinary `fixture realize` with an unset or invalid qualification value keeps mutation controls declared-only, writes no mutation ledger, and performs no external dispatch. Mutation operations persist an intent before dispatch and finalize only after public reconciliation and affected-row guards.
-- Fault, reset, recreate, and destroy now dispatch through the external boundary. Recreate terminates and verifies every prior target before retiring its ledger; destroy resets active faults, terminates targets, and verifies public absence.
+- Fault, reset, recreate, and destroy now dispatch through the external boundary. Recreate records exact `terminated`/service-level not-found evidence for every prior target before retiring its ledger; destroy resets active faults, records the same external evidence, and proves public Resource Groups inventory absence.
 - Verification completed with `cargo fmt --all -- --check`, `cargo test -q` (71 unit, 2 API-contract, 14 mutation integration, 3 wrapper tests), `cargo clippy --all-targets --all-features -- -D warnings`, the pinned Draft 2020-12 validator, `bash -n scripts/verify_cli_interop.sh`, and `git diff --check`. Real LocalStack/EC2 smoke remains pending a live endpoint and valid `FOXTAIL_MUTATION_AMI_ID`.
 
 ## Issue #5 Second Frozen Repair Results
@@ -40,16 +40,16 @@ Invariant: qualification mutations can affect only fresh, manifest-bound, one-us
 - [x] Serialize all lifecycle operations per generation with a partial unique index and fail-closed validation; reject every subsequent isolated `realize` until authority-bound `recreate` is used.
 - [x] Record every launched public target before setup, include the current and earlier IDs in cleanup/quarantine, compensate post-provision persistence failures, and add deterministic setup/cleanup/database failure-injection tests.
 - [x] Quarantine pre-boundary `UNKNOWN`/default-endpoint generations during migration and require an active generation with exactly four canonical, non-retired, externally verified targets before dispatch.
-- [x] Reconcile destroy/reset against externally observed state, treat terminated identities as present until Describe stops returning them, classify not-found errors through the SDK error chain, and emit strict public-absence receipts.
-- [x] Make the CLI smoke use one database/generation, alternate CLI/HTTP fault/reset channels across all four targets, recreate and destroy both generations, verify EC2/Tagging absence, and validate every mutation status/receipt with executable Draft 2020-12 schemas.
-- Verification completed with `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test -q` (71 unit, 2 API-contract, 14 mutation integration, 3 wrapper tests), `python3 scripts/validate_release_fixture.py --negative`, `bash -n scripts/verify_cli_interop.sh`, and `git diff --check`. Live LocalStack smoke remains an environment-dependent gate; the strict absence path requires Describe to return a service-level not-found response.
+- [x] Reconcile destroy/reset against externally observed state, accept only exact `terminated` or service-level not-found as irreversible EC2 cleanup, classify not-found errors through the SDK error chain, and keep public-inventory absence separate from EC2 termination evidence.
+- [x] Make the CLI smoke use one database/generation, alternate CLI/HTTP fault/reset channels across all four targets, recreate and destroy both generations, verify EC2 terminal cleanup plus Tagging absence, and validate every mutation status/receipt with executable Draft 2020-12 schemas.
+- Verification completed with `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test -q` (71 unit, 2 API-contract, 14 mutation integration, 3 wrapper tests), `python3 scripts/validate_release_fixture.py --negative`, `bash -n scripts/verify_cli_interop.sh`, and `git diff --check`. AWS `TerminateInstances` may keep terminated instances visible in `DescribeInstances` for approximately one hour, so EC2 termination and Foxtail public-inventory absence are recorded as separate proofs; see the [official API documentation](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_TerminateInstances.html).
 
 ## Issue #5 Final Live Repair Results
 
 - [x] Make the deterministic failed-realize test inject a pre-dispatch EC2 failure through the mock boundary instead of depending on an unavailable localhost port.
 - [x] Poll only the EC2 state while stopping a running resize target, retain strict final state/type reconciliation, and send the documented `InstanceType` modify field without the duplicate `Attribute` field that makes LocalStack clear the type.
-- Verification completed with `cargo fmt --all`, the focused pre-dispatch, four-scenario mock, and mutation lifecycle tests, and a live LocalStack 4.14.0 run using `AWS_ENDPOINT_URL=http://127.0.0.1:4566`, `FOXTAIL_MUTATION_AMI_ID=ami-760aaa0f`, test credentials, and `us-east-1`. The live run passed realization, all four fault/reset cycles, and public state/type checks. It then stopped at authority-bound recreate because LocalStack continues returning the four terminated old identities instead of a service-level not-found response; the existing strict absence contract therefore remains unverified in that environment.
-- [ ] Full proof: rerun the complete live smoke against an EC2-compatible endpoint that removes terminated identities from public Describe results, then record the successful recreate/destroy absence receipt.
+- Verification completed with `cargo fmt --all`, the focused pre-dispatch, four-scenario mock, and mutation lifecycle tests, and the complete LocalStack 4.14.0 smoke using `AWS_ENDPOINT_URL=http://127.0.0.1:4566`, `FOXTAIL_MUTATION_AMI_ID=ami-760aaa0f`, test credentials, and `us-east-1`. The run passed realization, all four fault/reset cycles, recreate, destroy, exact `terminated`/not-found EC2 cleanup checks, zero Foxtail Resource Groups Tagging mappings for retired ARNs, and every downstream CLI interoperability check.
+- [x] Full proof: complete live smoke passed with EC2 termination evidence and separate Foxtail public-inventory absence proof.
 
 ## Issue #5 Implementation Results
 

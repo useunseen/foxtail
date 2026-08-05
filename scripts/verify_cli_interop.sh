@@ -425,13 +425,18 @@ while IFS= read -r old_arn; do
     exit 1
   fi
   old_id="${old_arn##*/}"
-  if localstack_json ec2 describe-instances --instance-ids "$old_id" >/dev/null 2>&1; then
-    echo "destroyed mutation identity remains visible in LocalStack EC2: $old_id" >&2
+  old_public="$(localstack_json ec2 describe-instances --instance-ids "$old_id" 2>/dev/null || true)"
+  old_instance_count="$(echo "$old_public" | jq '[.Reservations[]?.Instances[]?] | length' 2>/dev/null || echo 0)"
+  if [[ "$old_instance_count" == "0" ]]; then
+    continue
+  fi
+  if [[ "$old_instance_count" != "1" || "$(echo "$old_public" | jq -r '[.Reservations[]?.Instances[]?][0].State.Name // empty')" != "terminated" ]]; then
+    echo "destroyed mutation identity was not terminal in LocalStack EC2: $old_id" >&2
     exit 1
   fi
 done <<<"$OLD_MUTATION_ARNS
 $NEW_MUTATION_ARNS"
-log_step "Verified qualification mutation lifecycle: status, fault, reset, recreate, destroy, and public absence"
+log_step "Verified qualification mutation lifecycle: status, fault, reset, recreate, destroy, EC2 terminal cleanup, and public inventory absence"
 
 FIXTURE_IDS="$(FIXTURE_REALIZATION="$FIXTURE_REALIZATION" python3 - <<'PY'
 import json

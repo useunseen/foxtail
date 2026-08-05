@@ -31,6 +31,7 @@
     "terminal": {"$ref": "#/$defs/generation"},
     "faults_reset": {"type": "array", "items": {"$ref": "#/$defs/reset_receipt"}},
     "targets_destroyed": {"type": "array", "items": {"$ref": "#/$defs/destroyed_target"}},
+    "external_ec2_termination": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"$ref": "#/$defs/external_termination"}},
     "public_inventory_absence": {"$ref": "#/$defs/public_absence"},
     "destroyed_at": {"type": "string", "format": "date-time"}
   },
@@ -74,7 +75,7 @@
         "operation": {"const": "destroy"},
         "status": {"const": "DESTROYED"}
       },
-      "required": ["faults_reset", "targets_destroyed", "public_inventory_absence", "destroyed_at"]
+      "required": ["faults_reset", "targets_destroyed", "external_ec2_termination", "public_inventory_absence", "destroyed_at"]
     }
   ],
   "$defs": {
@@ -85,7 +86,8 @@
         "manifest_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
         "mutation_generation": {"type": "integer", "minimum": 1},
         "mutation_generation_id": {"type": "string", "pattern": "^mg-[0-9]{4,}$"},
-        "targets": {"type": "array", "minItems": 4, "maxItems": 4}
+        "targets": {"type": "array", "minItems": 4, "maxItems": 4},
+        "external_ec2_termination": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"$ref": "#/$defs/external_termination"}}
       },
       "additionalProperties": true
     },
@@ -122,6 +124,15 @@
         "target_kind": {"enum": ["stop", "resize", "stop-recovery", "resize-restoration"]},
         "prior_state": {"type": "string", "pattern": "^(running|stopped):[^:]+$"},
         "terminal_state": {"type": "string", "pattern": "^(running|stopped):[^:]+$"}
+      },
+      "additionalProperties": false
+    },
+    "external_termination": {
+      "type": "object",
+      "required": ["resource_id", "state"],
+      "properties": {
+        "resource_id": {"type": "string", "minLength": 1},
+        "state": {"enum": ["terminated", "not-found"]}
       },
       "additionalProperties": false
     },
