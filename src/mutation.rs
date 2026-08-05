@@ -232,6 +232,7 @@ impl std::error::Error for ProvisionFailure {}
 #[derive(Default)]
 struct MockState {
     instances: BTreeMap<String, ObservedInstance>,
+    describe_error: bool,
     fail_dispatch: bool,
     fail_setup_at: Option<usize>,
     fail_cleanup: bool,
@@ -270,6 +271,7 @@ impl Ec2MutationBackend {
                         .or_else(|| mock_key.strip_prefix("fail-cleanup-setup-"))
                         .and_then(|value| value.parse::<usize>().ok());
                     let fail_dispatch = mock_key == "pre-dispatch";
+                    let describe_error = mock_key == "describe-error";
                     let lost_response_at = mock_key
                         .strip_prefix("lost-response-")
                         .and_then(|value| value.parse::<usize>().ok());
@@ -280,6 +282,7 @@ impl Ec2MutationBackend {
                         .strip_prefix("slow-cleanup-")
                         .and_then(|value| value.parse::<u64>().ok());
                     Arc::new(Mutex::new(MockState {
+                        describe_error,
                         fail_dispatch,
                         fail_setup_at,
                         fail_cleanup: mock_key == "fail-cleanup"
@@ -789,6 +792,9 @@ impl Ec2MutationBackend {
             let state = state
                 .lock()
                 .map_err(|_| anyhow!("mock mutation state lock poisoned"))?;
+            if state.describe_error {
+                bail!("injected EC2 DescribeInstances failure");
+            }
             return state
                 .instances
                 .get(target_id)

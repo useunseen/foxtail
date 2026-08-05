@@ -342,6 +342,60 @@ async fn pre_dispatch_realize_failure_is_durable_and_fail_closed() {
 }
 
 #[tokio::test]
+async fn external_termination_requires_terminal_state_or_not_found() {
+    let endpoint = format!("mock://termination-evidence-{}", uuid::Uuid::new_v4());
+    let backend =
+        mutation::Ec2MutationBackend::connect(&endpoint, DEFAULT_REGION, DEFAULT_ACCOUNT_ID)
+            .await
+            .unwrap();
+    let targets = backend
+        .provision_generation(77, &mutation::generation_id(77))
+        .await
+        .unwrap();
+    let running_id = targets
+        .iter()
+        .find(|(scenario, _)| scenario.target_kind == mutation::TargetKind::Stop)
+        .map(|(_, observed)| observed.resource_id.clone())
+        .unwrap();
+    let stopped_id = targets
+        .iter()
+        .find(|(scenario, _)| scenario.target_kind == mutation::TargetKind::Resize)
+        .map(|(_, observed)| observed.resource_id.clone())
+        .unwrap();
+    assert_eq!(backend.verify_destroyed(&running_id).await.unwrap(), None);
+    assert_eq!(backend.verify_destroyed(&stopped_id).await.unwrap(), None);
+    assert_eq!(
+        backend
+            .verify_destroyed("i-missing-termination-evidence")
+            .await
+            .unwrap(),
+        Some(mutation::ExternalTerminationState::NotFound)
+    );
+    let describe_error = mutation::Ec2MutationBackend::connect(
+        "mock://describe-error",
+        DEFAULT_REGION,
+        DEFAULT_ACCOUNT_ID,
+    )
+    .await
+    .unwrap();
+    assert!(
+        describe_error
+            .verify_destroyed("i-describe-error")
+            .await
+            .is_err()
+    );
+    backend
+        .terminate_all(
+            &targets
+                .iter()
+                .map(|(_, observed)| observed.resource_id.clone())
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn setup_failure_records_current_returned_id_and_proves_cleanup() {
     fixture::with_isolated_qualification(async {
         let pool = seeded_pool().await;
@@ -1490,6 +1544,12 @@ async fn native_cli_dispatch_covers_mutation_lifecycle_and_stale_failure() {
             mutation::CATALOGUE.len()
         );
         validate_emitted_schema("receipt", &recreated);
+        let mut missing_termination_proof = recreated.clone();
+        missing_termination_proof["prior"]
+            .as_object_mut()
+            .unwrap()
+            .remove("external_ec2_termination");
+        assert_schema_rejects("receipt", &missing_termination_proof);
 
         let current_authority = authority_from_state(&fixture::read_state(&pool).await.unwrap());
         let destroyed: Value = serde_json::from_slice(
@@ -1517,6 +1577,21 @@ async fn native_cli_dispatch_covers_mutation_lifecycle_and_stale_failure() {
             mutation::CATALOGUE.len()
         );
         validate_emitted_schema("receipt", &destroyed);
+        let mut duplicate_termination_evidence = destroyed.clone();
+        let termination_evidence = duplicate_termination_evidence["external_ec2_termination"]
+            .as_array()
+            .unwrap()
+            .clone();
+        duplicate_termination_evidence["external_ec2_termination"] = serde_json::json!([
+            termination_evidence[0].clone(),
+            termination_evidence[0].clone(),
+            termination_evidence[2].clone(),
+            termination_evidence[3].clone()
+        ]);
+        assert_schema_rejects("receipt", &duplicate_termination_evidence);
+        let mut contradictory_absence_count = destroyed.clone();
+        contradictory_absence_count["public_inventory_absence"]["absent_count"] = 0.into();
+        assert_schema_rejects("receipt", &contradictory_absence_count);
 
         let absent: Value = serde_json::from_slice(
             &fixture::execute_fixture_cli_command(&pool, FixtureCommands::MutationStatus)

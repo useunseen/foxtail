@@ -425,14 +425,52 @@ while IFS= read -r old_arn; do
     exit 1
   fi
   old_id="${old_arn##*/}"
-  old_public="$(localstack_json ec2 describe-instances --instance-ids "$old_id" 2>/dev/null || true)"
-  old_instance_count="$(echo "$old_public" | jq '[.Reservations[]?.Instances[]?] | length' 2>/dev/null || echo 0)"
-  if [[ "$old_instance_count" == "0" ]]; then
-    continue
-  fi
-  if [[ "$old_instance_count" != "1" || "$(echo "$old_public" | jq -r '[.Reservations[]?.Instances[]?][0].State.Name // empty')" != "terminated" ]]; then
-    echo "destroyed mutation identity was not terminal in LocalStack EC2: $old_id" >&2
-    exit 1
+  old_public_file="$TMP_DIR/old-ec2-$old_id.json"
+  old_error_file="$TMP_DIR/old-ec2-$old_id.err"
+  set +e
+  localstack_json ec2 describe-instances --instance-ids "$old_id" >"$old_public_file" 2>"$old_error_file"
+  old_describe_status=$?
+  set -e
+  if [[ "$old_describe_status" -eq 0 ]]; then
+    if ! OLD_ID="$old_id" python3 - "$old_public_file" <<'PY'
+import json
+import os
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    payload = json.load(handle)
+instances = [
+    instance
+    for reservation in payload.get("Reservations", [])
+    for instance in reservation.get("Instances", [])
+]
+if len(instances) != 1 or instances[0].get("InstanceId") != os.environ["OLD_ID"]:
+    raise SystemExit("successful EC2 DescribeInstances response did not contain exactly the requested identity")
+if instances[0].get("State", {}).get("Name") != "terminated":
+    raise SystemExit("successful EC2 DescribeInstances response did not prove terminated state")
+PY
+    then
+      echo "destroyed mutation identity was not terminal in LocalStack EC2: $old_id" >&2
+      exit 1
+    fi
+  else
+    if [[ -s "$old_public_file" ]] || ! python3 - "$old_error_file" <<'PY'
+import re
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    error = handle.read()
+if not re.search(
+    r"An error occurred \(InvalidInstanceID\.NotFound\) when calling the DescribeInstances operation:",
+    error,
+):
+    raise SystemExit("EC2 DescribeInstances failed without the explicit InvalidInstanceID.NotFound service error")
+PY
+    then
+      echo "LocalStack EC2 absence check failed for $old_id" >&2
+      cat "$old_error_file" >&2
+      exit 1
+    fi
   fi
 done <<<"$OLD_MUTATION_ARNS
 $NEW_MUTATION_ARNS"

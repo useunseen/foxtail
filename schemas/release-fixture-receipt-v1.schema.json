@@ -27,11 +27,11 @@
     "terminal_state": {"type": "string", "pattern": "^(running|stopped):[^:]+$"},
     "created_at": {"type": "string", "format": "date-time"},
     "identities_replaced": {"const": true},
-    "prior": {"$ref": "#/$defs/generation"},
+    "prior": {"$ref": "#/$defs/retired_generation"},
     "terminal": {"$ref": "#/$defs/generation"},
     "faults_reset": {"type": "array", "items": {"$ref": "#/$defs/reset_receipt"}},
     "targets_destroyed": {"type": "array", "items": {"$ref": "#/$defs/destroyed_target"}},
-    "external_ec2_termination": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"$ref": "#/$defs/external_termination"}},
+    "external_ec2_termination": {"$ref": "#/$defs/external_termination_evidence"},
     "public_inventory_absence": {"$ref": "#/$defs/public_absence"},
     "destroyed_at": {"type": "string", "format": "date-time"}
   },
@@ -86,8 +86,19 @@
         "manifest_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
         "mutation_generation": {"type": "integer", "minimum": 1},
         "mutation_generation_id": {"type": "string", "pattern": "^mg-[0-9]{4,}$"},
+        "targets": {"type": "array", "minItems": 4, "maxItems": 4}
+      },
+      "additionalProperties": true
+    },
+    "retired_generation": {
+      "type": "object",
+      "required": ["manifest_digest", "mutation_generation", "mutation_generation_id", "targets", "external_ec2_termination"],
+      "properties": {
+        "manifest_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "mutation_generation": {"type": "integer", "minimum": 1},
+        "mutation_generation_id": {"type": "string", "pattern": "^mg-[0-9]{4,}$"},
         "targets": {"type": "array", "minItems": 4, "maxItems": 4},
-        "external_ec2_termination": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"$ref": "#/$defs/external_termination"}}
+        "external_ec2_termination": {"$ref": "#/$defs/external_termination_evidence"}
       },
       "additionalProperties": true
     },
@@ -136,13 +147,20 @@
       },
       "additionalProperties": false
     },
+    "external_termination_evidence": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/external_termination"}
+    },
     "public_absence": {
       "type": "object",
       "required": ["checked", "all_absent", "absent_count", "resource_ids"],
       "properties": {
         "checked": {"const": true},
         "all_absent": {"const": true},
-        "absent_count": {"type": "integer", "minimum": 0},
+        "absent_count": {"const": 4},
         "resource_ids": {"type": "array", "minItems": 4, "maxItems": 4, "uniqueItems": true}
       },
       "additionalProperties": false

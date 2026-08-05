@@ -2543,127 +2543,133 @@ pub async fn recreate(pool: &SqlitePool, request: RecreateRequest) -> Result<Vec
                 return Err(error);
             }
         };
-    let new_manifest: Value = serde_json::from_slice(&snapshot.manifest_bytes)?;
-    let new_targets = new_manifest
-        .get("mutation_resources")
-        .cloned()
-        .unwrap_or_else(|| json!([]));
-    let new_mutation_generation = new_manifest
-        .get("mutation_generation")
-        .and_then(Value::as_i64)
-        .ok_or_else(|| anyhow!("recreate did not produce an isolated mutation generation"))?;
-    let new_generation_id = new_manifest
-        .get("mutation_generation_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("recreate did not produce a mutation generation id"))?;
+        let new_manifest: Value = serde_json::from_slice(&snapshot.manifest_bytes)?;
+        let new_targets = new_manifest
+            .get("mutation_resources")
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        let new_mutation_generation = new_manifest
+            .get("mutation_generation")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| anyhow!("recreate did not produce an isolated mutation generation"))?;
+        let new_generation_id = new_manifest
+            .get("mutation_generation_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("recreate did not produce a mutation generation id"))?;
         new_identity = Some((new_mutation_generation, new_generation_id.to_string()));
         if new_mutation_generation != predicted_mutation_generation
             || new_generation_id != predicted_generation_id
         {
-            let error = anyhow!("concurrent realization changed the mutation generation allocation");
+            let error =
+                anyhow!("concurrent realization changed the mutation generation allocation");
             finalize_intent_ambiguous(pool, &intent_id, &error).await;
             return Err(error);
         }
-    let old_ids = old_targets
-        .iter()
-        .filter_map(|target| target.get("resource_id").and_then(Value::as_str))
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    let old_backend =
-        mutation_backend_for_generation(pool, old_mutation_generation, &old_generation_id).await?;
-    let external_ec2_termination = match old_backend.terminate_all(&old_ids).await {
-        Ok(evidence) => evidence,
-        Err(error) => {
-            let error = anyhow!(
-                "recreate cleanup ambiguous; returned_ids={old_ids:?}; {error}"
-            );
-            mark_generation_ambiguous(pool, old_mutation_generation, &old_generation_id).await;
-            mark_generation_ambiguous(pool, new_mutation_generation, new_generation_id).await;
-            finalize_intent_ambiguous(pool, &intent_id, &error).await;
-            return Err(error);
-        }
-    };
-    let receipt_id = receipt_id("recreate");
-    let receipt = json!({
-        "schema": "foxtail.release-fixture-recreate-receipt/v1",
-        "operation": "recreate",
-        "status": "RECREATED",
-        "receipt_id": receipt_id,
-        "prior": {
-            "manifest_digest": old_manifest_digest,
-            "mutation_generation": old_mutation_generation,
-            "mutation_generation_id": old_generation_id,
-            "targets": old_targets,
-            "external_ec2_termination": external_ec2_termination
-        },
-        "terminal": {
-            "manifest_digest": snapshot.manifest_digest,
-            "mutation_generation": new_manifest.get("mutation_generation"),
-            "mutation_generation_id": new_manifest.get("mutation_generation_id"),
-            "targets": new_targets
-        },
-        "created_at": created_at,
-        "identities_replaced": true
-    });
+        let old_ids = old_targets
+            .iter()
+            .filter_map(|target| target.get("resource_id").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let old_backend =
+            mutation_backend_for_generation(pool, old_mutation_generation, &old_generation_id)
+                .await?;
+        let external_ec2_termination = match old_backend.terminate_all(&old_ids).await {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                let error =
+                    anyhow!("recreate cleanup ambiguous; returned_ids={old_ids:?}; {error}");
+                mark_generation_ambiguous(pool, old_mutation_generation, &old_generation_id).await;
+                mark_generation_ambiguous(pool, new_mutation_generation, new_generation_id).await;
+                finalize_intent_ambiguous(pool, &intent_id, &error).await;
+                return Err(error);
+            }
+        };
+        let receipt_id = receipt_id("recreate");
+        let receipt = json!({
+            "schema": "foxtail.release-fixture-recreate-receipt/v1",
+            "operation": "recreate",
+            "status": "RECREATED",
+            "receipt_id": receipt_id,
+            "prior": {
+                "manifest_digest": old_manifest_digest,
+                "mutation_generation": old_mutation_generation,
+                "mutation_generation_id": old_generation_id,
+                "targets": old_targets,
+                "external_ec2_termination": external_ec2_termination
+            },
+            "terminal": {
+                "manifest_digest": snapshot.manifest_digest,
+                "mutation_generation": new_manifest.get("mutation_generation"),
+                "mutation_generation_id": new_manifest.get("mutation_generation_id"),
+                "targets": new_targets
+            },
+            "created_at": created_at,
+            "identities_replaced": true
+        });
         let receipt_bytes = canonical_receipt(receipt)?;
         let mut tx = pool.begin().await?;
         let old_retired = sqlx::query(
-        "UPDATE fixture_mutation_resources SET retired_at = ?, external_status = 'DESTROYED'
+            "UPDATE fixture_mutation_resources SET retired_at = ?, external_status = 'DESTROYED'
          WHERE mutation_generation = ? AND generation_id = ? AND retired_at IS NULL",
-    )
-    .bind(&created_at)
-    .bind(old_mutation_generation)
-    .bind(&old_generation_id)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
+        )
+        .bind(&created_at)
+        .bind(old_mutation_generation)
+        .bind(&old_generation_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
         if old_retired != old_ids.len() as u64 {
             let error = anyhow!("recreate lost an old mutation target row during retirement");
             finalize_intent_ambiguous(pool, &intent_id, &error).await;
             return Err(error);
         }
         for id in &old_ids {
-        sqlx::query("DELETE FROM metrics WHERE resource_id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM cost_records WHERE resource_id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM resources WHERE id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-    }
+            sqlx::query("DELETE FROM metrics WHERE resource_id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM cost_records WHERE resource_id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM resources WHERE id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
         sqlx::query(
         "UPDATE fixture_mutation_generations SET state = 'DESTROYED', external_status = 'DESTROYED',
                 public_absence = ?, destroyed_at = ?
          WHERE mutation_generation = ? AND generation_id = ? AND state = 'ACTIVE'",
     )
-    .bind(serde_json::to_string(&json!({"checked_at": created_at, "resource_ids": old_ids, "all_absent": true}))?)
+    .bind(serde_json::to_string(&json!({
+        "checked_at": created_at,
+        "resource_ids": &old_ids,
+        "all_absent": true,
+        "absent_count": old_ids.len()
+    }))?)
     .bind(&created_at)
     .bind(old_mutation_generation)
     .bind(&old_generation_id)
     .execute(&mut *tx)
     .await?;
         persist_receipt(
-        &mut tx,
-        "recreate",
-        &receipt_id,
-        ReceiptContext {
-            mutation_generation: new_manifest
-                .get("mutation_generation")
-                .and_then(Value::as_i64),
-            generation_id: new_manifest
-                .get("mutation_generation_id")
-                .and_then(Value::as_str),
-            manifest_digest: Some(snapshot.manifest_digest.as_str()),
-        },
-        &receipt_bytes,
-        &created_at,
-    )
-    .await?;
+            &mut tx,
+            "recreate",
+            &receipt_id,
+            ReceiptContext {
+                mutation_generation: new_manifest
+                    .get("mutation_generation")
+                    .and_then(Value::as_i64),
+                generation_id: new_manifest
+                    .get("mutation_generation_id")
+                    .and_then(Value::as_str),
+                manifest_digest: Some(snapshot.manifest_digest.as_str()),
+            },
+            &receipt_bytes,
+            &created_at,
+        )
+        .await?;
         tx.commit().await?;
         Ok::<Vec<u8>, anyhow::Error>(receipt_bytes)
     }
@@ -2997,7 +3003,7 @@ pub async fn destroy(pool: &SqlitePool, request: DestroyRequest) -> Result<Vec<u
     .execute(&mut *tx)
     .await?
     .rows_affected();
-    let absent_count: i64 = if target_ids.is_empty() {
+    let remaining_inventory_count: i64 = if target_ids.is_empty() {
         0
     } else {
         sqlx::query_scalar(
@@ -3007,9 +3013,10 @@ pub async fn destroy(pool: &SqlitePool, request: DestroyRequest) -> Result<Vec<u
         .fetch_one(&mut *tx)
         .await?
     };
-    if absent_count != 0 {
+    if remaining_inventory_count != 0 {
         bail!("destroy could not prove all mutation identities absent from public inventory")
     }
+    let absent_count = target_ids.len();
     sqlx::query(
         "UPDATE fixture_mutation_generations SET state = 'DESTROYED', external_status = 'DESTROYED',
                 public_absence = ?, destroyed_at = ?
@@ -3017,8 +3024,9 @@ pub async fn destroy(pool: &SqlitePool, request: DestroyRequest) -> Result<Vec<u
     )
     .bind(serde_json::to_string(&json!({
         "checked_at": destroyed_at,
-        "resource_ids": target_ids,
-        "all_absent": true
+        "resource_ids": &target_ids,
+        "all_absent": true,
+        "absent_count": target_ids.len()
     }))?)
     .bind(&destroyed_at)
     .bind(mutation_generation)

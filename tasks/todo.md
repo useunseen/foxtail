@@ -51,6 +51,12 @@ Invariant: qualification mutations can affect only fresh, manifest-bound, one-us
 - Verification completed with `cargo fmt --all`, the focused pre-dispatch, four-scenario mock, and mutation lifecycle tests, and the complete LocalStack 4.14.0 smoke using `AWS_ENDPOINT_URL=http://127.0.0.1:4566`, `FOXTAIL_MUTATION_AMI_ID=ami-760aaa0f`, test credentials, and `us-east-1`. The run passed realization, all four fault/reset cycles, recreate, destroy, exact `terminated`/not-found EC2 cleanup checks, zero Foxtail Resource Groups Tagging mappings for retired ARNs, and every downstream CLI interoperability check.
 - [x] Full proof: complete live smoke passed with EC2 termination evidence and separate Foxtail public-inventory absence proof.
 
+## Issue #5 Standards Repair Results
+
+- [x] Require prior-generation EC2 termination evidence, unique evidence entries, and a truthful four-identity public-inventory absence count in the receipt schema; add negative coverage for missing proof, duplicate evidence, and contradictory counts.
+- [x] Make the LocalStack EC2 terminal check fail closed on transport, authentication, malformed JSON, wrong identity/state, and non-`InvalidInstanceID.NotFound` service errors; add backend coverage for running/stopped/error observations.
+- Deterministic verification completed with `cargo test -q` (72 unit, 2 API-contract, 18 mutation integration, 3 wrapper tests), `cargo clippy --all-targets --all-features -- -D warnings`, `cargo fmt --all -- --check`, `python3 scripts/validate_release_fixture.py --negative`, `bash -n scripts/verify_cli_interop.sh`, and `git diff --check`. A fresh smoke rerun was attempted but LocalStack was unavailable at `http://127.0.0.1:4566`; the complete smoke passed on the preceding c6cc41e implementation before this fail-closed check tightening.
+
 ## Issue #5 Implementation Results
 
 - Added a migration-backed disposable mutation ledger with four generation-owned EC2 targets (stop, resize, stop-recovery, and resize-restoration), manifest/status/identity exposure, complete-estate fingerprinting, and canonical persisted operation receipts.
