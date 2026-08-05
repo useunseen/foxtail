@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://useunseen.dev/foxtail/schemas/release-fixture-mutation-status-v1.schema.json",
+  "title": "Foxtail release qualification mutation status v1",
+  "type": "object",
+  "required": [
+    "schema",
+    "status",
+    "fixture_generation",
+    "mutation_generation",
+    "mutation_generation_id",
+    "manifest_digest",
+    "targets",
+    "active_faults"
+  ],
+  "properties": {
+    "schema": {"const": "foxtail.release-fixture-mutation-status/v1"},
+    "status": {"enum": ["ACTIVE", "ABSENT"]},
+    "fixture_generation": {"type": ["integer", "null"], "minimum": 1},
+    "mutation_generation": {"type": ["integer", "null"], "minimum": 1},
+    "mutation_generation_id": {"type": ["string", "null"]},
+    "manifest_digest": {"type": ["string", "null"]},
+    "targets": {"type": "array", "maxItems": 4},
+    "active_faults": {"type": "array"}
+  },
+  "additionalProperties": false
+}

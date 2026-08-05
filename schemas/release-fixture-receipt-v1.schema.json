@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://useunseen.dev/foxtail/schemas/release-fixture-receipt-v1.schema.json",
+  "title": "Foxtail release qualification mutation receipt v1",
+  "type": "object",
+  "required": ["schema", "operation", "status", "receipt_id"],
+  "properties": {
+    "schema": {"enum": [
+      "foxtail.release-fixture-fault-receipt/v1",
+      "foxtail.release-fixture-reset-receipt/v1",
+      "foxtail.release-fixture-recreate-receipt/v1",
+      "foxtail.release-fixture-destroy-receipt/v1"
+    ]},
+    "operation": {"enum": ["fault", "reset", "recreate", "destroy"]},
+    "status": {"enum": ["APPLIED", "RESET", "RECREATED", "DESTROYED"]},
+    "receipt_id": {"type": "string", "minLength": 8},
+    "manifest_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "mutation_generation": {"type": "integer", "minimum": 1},
+    "mutation_generation_id": {"type": "string", "pattern": "^mg-[0-9]{4,}$"},
+    "control_id": {"type": "string"},
+    "target_id": {"type": "string"},
+    "scope": {"const": "target"},
+    "fault_kind": {"enum": ["stop", "resize"]},
+    "applied_at": {"type": "string", "format": "date-time"},
+    "reset_token": {"type": "string", "minLength": 8},
+    "reset_token_use": {"const": "one-use"}
+  },
+  "additionalProperties": true,
+  "not": {
+    "anyOf": [
+      {"required": ["Required"]},
+      {"required": ["Stretch"]},
+      {"required": ["required"]},
+      {"required": ["stretch"]},
+      {"required": ["expected_finding"]},
+      {"required": ["expected_findings"]},
+      {"required": ["authoritative_expected_finding"]},
+      {"required": ["finding"]}
+    ]
+  }
+}

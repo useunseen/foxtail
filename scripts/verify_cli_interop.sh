@@ -67,6 +67,7 @@ if [[ "$FIXTURE_EC2_COUNT" -lt 5 ]]; then
   exit 1
 fi
 
+export FOXTAIL_QUALIFICATION_ENV=isolated
 log_step "Starting temporary mock server on http://127.0.0.1:$PORT"
 DATABASE_URL="sqlite:$TMP_DB" "$BIN" serve --port "$PORT" >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
@@ -190,6 +191,8 @@ if degraded["evidence"].get("cloudwatch_complete_days") != 13:
 if len(degraded["evidence"].get("cloudwatch_missing_offsets", [])) != 1:
     raise SystemExit("degraded fixture control did not expose exactly one missing CPU offset")
 PY
+FIXTURE_REALIZATION_FILE="$TMP_DIR/fixture-realization.json"
+printf '%s\n' "$FIXTURE_REALIZATION" >"$FIXTURE_REALIZATION_FILE"
 log_step "Verified release fixture: realization manifest, digest, identities, and observed evidence"
 FIXTURE_STATUS_REALIZED="$(curl -fsS "$ENDPOINT/_mock/fixture/status")"
 FIXTURE_MANIFEST="$(curl -fsS "$ENDPOINT/_mock/fixture/manifest")"
@@ -211,6 +214,68 @@ python3 "$ROOT_DIR/scripts/validate_release_fixture.py" \
   --manifest "$TMP_DIR/fixture-manifest.json" \
   --negative
 log_step "Verified release fixture: persisted CLI/HTTP parity and executable Draft 2020-12 schema policy"
+
+MUTATION_STATUS="$(curl -fsS "$ENDPOINT/_mock/fixture/mutation/status")"
+CLI_MUTATION_STATUS="$("$BIN" --database-url "sqlite:$TMP_DB" fixture mutation-status)"
+if [[ "$CLI_MUTATION_STATUS" != "$MUTATION_STATUS" ]]; then
+  echo "mutation status CLI/HTTP bytes differ" >&2
+  exit 1
+fi
+AUTHORITY="$(FIXTURE_REALIZATION="$FIXTURE_REALIZATION" python3 -c '
+import json, os
+m = json.loads(os.environ["FIXTURE_REALIZATION"])["manifest"]
+t = next(item for item in m["mutation_resources"] if item["target_kind"] == "stop")
+print(json.dumps({
+  "version": "release-qualification-v1",
+  "generation": m["generation"],
+  "manifest_digest": m["digest"],
+  "mutation_generation": m["mutation_generation"],
+  "mutation_generation_id": m["mutation_generation_id"],
+  "control_id": t["control_id"],
+  "target_id": t["resource_id"],
+  "scope": "target",
+  "fault_kind": "stop",
+  "application_time": "2026-08-05T00:00:00Z",
+}))
+')"
+FAULT_RECEIPT="$(curl -fsS -X POST "$ENDPOINT/_mock/fixture/fault" -H 'content-type: application/json' -d "$AUTHORITY")"
+RESET_REQUEST="$(FAULT_RECEIPT="$FAULT_RECEIPT" AUTHORITY="$AUTHORITY" python3 -c '
+import json, os
+a = json.loads(os.environ["AUTHORITY"])
+r = json.loads(os.environ["FAULT_RECEIPT"])
+out = {key: a[key] for key in ("version", "generation", "manifest_digest", "mutation_generation", "mutation_generation_id")}
+out.update(receipt_id=r["receipt_id"], reset_token=r["reset_token"])
+print(json.dumps(out))
+')"
+RESET_RECEIPT="$(curl -fsS -X POST "$ENDPOINT/_mock/fixture/reset" -H 'content-type: application/json' -d "$RESET_REQUEST")"
+if [[ "$(echo "$RESET_RECEIPT" | jq -r .status)" != "RESET" ]]; then
+  echo "fixture reset receipt did not report RESET" >&2
+  exit 1
+fi
+RECREATE_AUTHORITY="$(echo "$AUTHORITY" | jq -c 'del(.control_id, .target_id, .scope, .fault_kind, .application_time)')"
+RECREATE_RECEIPT="$(curl -fsS -X POST "$ENDPOINT/_mock/fixture/recreate" -H 'content-type: application/json' -d "$RECREATE_AUTHORITY")"
+if [[ "$(echo "$RECREATE_RECEIPT" | jq -r .status)" != "RECREATED" ]]; then
+  echo "fixture recreate receipt did not report RECREATED" >&2
+  exit 1
+fi
+NEW_AUTHORITY="$(curl -fsS "$ENDPOINT/_mock/fixture/manifest" | jq -c '{version:"release-qualification-v1", generation, manifest_digest:.digest, mutation_generation, mutation_generation_id}')"
+OLD_STOP_ARN="$(FIXTURE_REALIZATION="$FIXTURE_REALIZATION" AUTHORITY="$AUTHORITY" python3 -c '
+import json, os
+a = json.loads(os.environ["AUTHORITY"])
+m = json.loads(os.environ["FIXTURE_REALIZATION"])["manifest"]
+print(next(item["aws_identity"] for item in m["mutation_resources"] if item["resource_id"] == a["target_id"]))
+')"
+DESTROY_RECEIPT="$(curl -fsS -X POST "$ENDPOINT/_mock/fixture/destroy" -H 'content-type: application/json' -d "$NEW_AUTHORITY")"
+if [[ "$(echo "$DESTROY_RECEIPT" | jq -r '.public_inventory_absence.all_absent')" != "true" ]]; then
+  echo "fixture destroy did not prove public identity absence" >&2
+  exit 1
+fi
+if [[ "$(aws_json resourcegroupstaggingapi get-resources --resource-arn-list "$OLD_STOP_ARN" | jq '.ResourceTagMappingList | length')" != "0" ]]; then
+  echo "destroyed mutation identity remains visible in public inventory" >&2
+  exit 1
+fi
+log_step "Verified qualification mutation lifecycle: status, fault, reset, recreate, destroy, and public absence"
+
 FIXTURE_IDS="$(FIXTURE_REALIZATION="$FIXTURE_REALIZATION" python3 - <<'PY'
 import json
 import os
@@ -308,14 +373,19 @@ FIXTURE_COSTS="$(aws_json ce get-cost-and-usage \
   --granularity DAILY \
   --metrics UnblendedCost \
   --group-by Type=DIMENSION,Key=RESOURCE_ID)"
-FIXTURE_COSTS="$FIXTURE_COSTS" FIXTURE_REALIZATION="$FIXTURE_REALIZATION" python3 - <<'PY'
+FIXTURE_COSTS_FILE="$TMP_DIR/fixture-costs.json"
+printf '%s\n' "$FIXTURE_COSTS" >"$FIXTURE_COSTS_FILE"
+python3 - "$FIXTURE_COSTS_FILE" "$FIXTURE_REALIZATION_FILE" <<'PY'
 import json
-import os
+import sys
 
-manifest = json.loads(os.environ["FIXTURE_REALIZATION"])["manifest"]
+with open(sys.argv[2], encoding="utf-8") as handle:
+    manifest = json.load(handle)["manifest"]
 ids = {resource["resource_id"] for resource in manifest["resources"]}
 observed = {resource_id: 0.0 for resource_id in ids}
-for bucket in json.loads(os.environ["FIXTURE_COSTS"]).get("ResultsByTime", []):
+with open(sys.argv[1], encoding="utf-8") as handle:
+    costs = json.load(handle)
+for bucket in costs.get("ResultsByTime", []):
     for group in bucket.get("Groups", []):
         keys = group.get("Keys", [])
         if len(keys) != 1 or keys[0] not in observed:
@@ -328,11 +398,14 @@ PY
 log_step "Verified release fixture: identity-matched Cost Explorer resource groups"
 
 FIXTURE_RECOMMENDATIONS="$(aws_json compute-optimizer get-ec2-instance-recommendations)"
-FIXTURE_RECOMMENDATIONS="$FIXTURE_RECOMMENDATIONS" FIXTURE_REALIZATION="$FIXTURE_REALIZATION" python3 - <<'PY'
+FIXTURE_RECOMMENDATIONS_FILE="$TMP_DIR/fixture-recommendations.json"
+printf '%s\n' "$FIXTURE_RECOMMENDATIONS" >"$FIXTURE_RECOMMENDATIONS_FILE"
+python3 - "$FIXTURE_RECOMMENDATIONS_FILE" "$FIXTURE_REALIZATION_FILE" <<'PY'
 import json
-import os
+import sys
 
-manifest = json.loads(os.environ["FIXTURE_REALIZATION"])["manifest"]
+with open(sys.argv[2], encoding="utf-8") as handle:
+    manifest = json.load(handle)["manifest"]
 expected = {
     resource["resource_id"]: (
         "OVER_PROVISIONED"
@@ -347,10 +420,10 @@ expected = {
     )
     for resource in manifest["resources"]
 }
+with open(sys.argv[1], encoding="utf-8") as handle:
+    recommendations_payload = json.load(handle)
 recommendations = {}
-for recommendation in json.loads(os.environ["FIXTURE_RECOMMENDATIONS"]).get(
-    "instanceRecommendations", []
-):
+for recommendation in recommendations_payload.get("instanceRecommendations", []):
     arn = recommendation.get("instanceArn", "")
     resource_id = arn.rsplit("/", 1)[-1]
     if resource_id in expected:

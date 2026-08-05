@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use foxtail::cli::{Commands, FixtureCommands, NativeCli};
+use foxtail::cli::{Commands, FixtureCommands, FixtureMutationAuthorityArgs, NativeCli};
 use foxtail::wrapper::{
     RunMode, build_invocation, help_text, parse_cli_args, render_debug_line, version_text,
 };
@@ -123,7 +123,76 @@ async fn run_fixture_command(pool: sqlx::SqlitePool, command: FixtureCommands) -
             .manifest_bytes
             .ok_or_else(|| anyhow::anyhow!("fixture has not been realized"))?,
         FixtureCommands::Identities => foxtail::fixture::read_state(&pool).await?.identities_bytes,
+        FixtureCommands::MutationStatus => foxtail::fixture::mutation_status(&pool).await?,
+        FixtureCommands::Fault {
+            authority,
+            control_id,
+            target_id,
+            scope,
+            fault_kind,
+            application_time,
+        } => {
+            foxtail::fixture::apply_fault(
+                &pool,
+                foxtail::fixture::FaultRequest {
+                    authority: mutation_authority(authority),
+                    control_id,
+                    target_id,
+                    scope,
+                    fault_kind,
+                    application_time,
+                },
+            )
+            .await?
+        }
+        FixtureCommands::Reset {
+            authority,
+            receipt_id,
+            reset_token,
+        } => {
+            foxtail::fixture::reset_fault(
+                &pool,
+                foxtail::fixture::ResetRequest {
+                    authority: mutation_authority(authority),
+                    receipt_id,
+                    reset_token,
+                },
+            )
+            .await?
+        }
+        FixtureCommands::Recreate {
+            authority,
+            clock_anchor,
+        } => {
+            foxtail::fixture::recreate(
+                &pool,
+                foxtail::fixture::RecreateRequest {
+                    authority: mutation_authority(authority),
+                    clock_anchor,
+                },
+            )
+            .await?
+        }
+        FixtureCommands::Destroy { authority } => {
+            foxtail::fixture::destroy(
+                &pool,
+                foxtail::fixture::DestroyRequest {
+                    authority: mutation_authority(authority),
+                },
+            )
+            .await?
+        }
     };
     print!("{}", foxtail::fixture::cli_bytes_to_string(&bytes)?);
     Ok(())
+}
+
+fn mutation_authority(args: FixtureMutationAuthorityArgs) -> foxtail::fixture::MutationAuthority {
+    foxtail::fixture::MutationAuthority {
+        version: Some(args.version),
+        generation: Some(args.generation),
+        manifest_digest: Some(args.manifest_digest),
+        mutation_generation: Some(args.mutation_generation),
+        mutation_generation_id: Some(args.mutation_generation_id),
+    }
 }

@@ -133,13 +133,13 @@
     },
     "control_ids": {
       "type": "array",
-      "minItems": 7,
+      "minItems": 9,
       "uniqueItems": true,
       "items": {"type": "string"}
     },
     "controls": {
       "type": "array",
-      "minItems": 7,
+      "minItems": 9,
       "items": {
         "type": "object",
         "required": [

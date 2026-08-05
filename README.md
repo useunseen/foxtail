@@ -131,6 +131,11 @@ These are for local debugging and control, not AWS parity:
 - `GET /_mock/fixture/status`
 - `GET /_mock/fixture/manifest`
 - `GET /_mock/fixture/identities`
+- `GET /_mock/fixture/mutation/status`
+- `POST /_mock/fixture/fault`
+- `POST /_mock/fixture/reset`
+- `POST /_mock/fixture/recreate`
+- `POST /_mock/fixture/destroy`
 - `GET /_mock/dashboard/data`
 - `GET /_mock/dashboard/resources`
 - `GET /_mock/dashboard/trends/cloudwatch`
@@ -164,12 +169,37 @@ curl -X POST http://127.0.0.1:8080/_mock/fixture/realize \
 ~~~~
 
 The manifest binds the definition digest, generator and LocalStack provenance,
-clock anchor, AWS account/region scope, realized identities, public evidence
-declarations, and the two deferred mutation controls. The ordinary AWS-compatible
+clock anchor, AWS account/region scope, realized read-only identities, four
+fresh generation-owned mutation identities (stop, resize, recovery, and
+restoration), and public evidence declarations. The ordinary AWS-compatible
 inventory, CloudWatch, Cost Explorer, and Compute Optimizer routes remain the
 authoritative evidence surfaces. The default public account scope is
 `123456789012`; an explicit fixture `account_id` must match it so manifest ARNs
 and public identities cannot diverge.
+
+Mutation controls are qualification-only. Set `FOXTAIL_QUALIFICATION_ENV=isolated`
+in the disposable process, and send `x-mock-admin-token` when
+`AWS_MOCK_ADMIN_TOKEN` is configured. Every mutation request must repeat the
+current generation, mutation-generation id, and exact manifest digest. Fault
+receipts return one-use reset tokens; stale, duplicate, malformed, or
+ambiguous requests fail without changing state. The `destroy` receipt proves
+all generation-owned identities are absent from public Resource Groups
+inventory and all active faults have been reset.
+
+Example authority-bound lifecycle (values come from `fixture manifest`):
+
+```bash
+export FOXTAIL_QUALIFICATION_ENV=isolated
+target/debug/foxtail fixture mutation-status
+target/debug/foxtail fixture fault \
+  --generation 1 \
+  --manifest-digest sha256:... \
+  --mutation-generation 1 \
+  --mutation-generation-id mg-0001 \
+  --control-id ec2-mutation-stop-001 \
+  --target-id i-foxtail-mutation-g0001-stop \
+  --scope target --fault-kind stop
+```
 
 ## Supported AWS-Compatible Commands
 

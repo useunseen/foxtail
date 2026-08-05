@@ -44,6 +44,14 @@ pub fn build_app(pool: SqlitePool) -> Router {
         .route("/_mock/fixture/status", get(fixture_status_handler))
         .route("/_mock/fixture/manifest", get(fixture_manifest_handler))
         .route("/_mock/fixture/identities", get(fixture_identities_handler))
+        .route(
+            "/_mock/fixture/mutation/status",
+            get(fixture_mutation_status_handler),
+        )
+        .route("/_mock/fixture/fault", post(fixture_fault_handler))
+        .route("/_mock/fixture/reset", post(fixture_reset_handler))
+        .route("/_mock/fixture/recreate", post(fixture_recreate_handler))
+        .route("/_mock/fixture/destroy", post(fixture_destroy_handler))
         .route("/_mock/dashboard/data", get(dashboard_data_handler))
         .route(
             "/_mock/dashboard/resources",
@@ -2825,6 +2833,91 @@ async fn fixture_identities_handler(State(pool): State<SqlitePool>) -> axum::res
     match fixture::read_state(&pool).await {
         Ok(state) => fixture_document_response(StatusCode::OK, state.identities_bytes),
         Err(error) => fixture_error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
+}
+
+async fn fixture_mutation_status_handler(
+    State(pool): State<SqlitePool>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if let Err(response) = ensure_admin_authorized(&headers) {
+        return *response;
+    }
+    match fixture::mutation_status(&pool).await {
+        Ok(bytes) => fixture_document_response(StatusCode::OK, bytes),
+        Err(error) => fixture_error_response(StatusCode::UNPROCESSABLE_ENTITY, error.to_string()),
+    }
+}
+
+async fn fixture_fault_handler(
+    State(pool): State<SqlitePool>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> axum::response::Response {
+    if let Err(response) = ensure_admin_authorized(&headers) {
+        return *response;
+    }
+    let request = match fixture::parse_fault_request(&body) {
+        Ok(request) => request,
+        Err(error) => return fixture_error_response(StatusCode::BAD_REQUEST, error.to_string()),
+    };
+    match fixture::apply_fault(&pool, request).await {
+        Ok(bytes) => fixture_document_response(StatusCode::OK, bytes),
+        Err(error) => fixture_error_response(StatusCode::UNPROCESSABLE_ENTITY, error.to_string()),
+    }
+}
+
+async fn fixture_reset_handler(
+    State(pool): State<SqlitePool>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> axum::response::Response {
+    if let Err(response) = ensure_admin_authorized(&headers) {
+        return *response;
+    }
+    let request = match fixture::parse_reset_request(&body) {
+        Ok(request) => request,
+        Err(error) => return fixture_error_response(StatusCode::BAD_REQUEST, error.to_string()),
+    };
+    match fixture::reset_fault(&pool, request).await {
+        Ok(bytes) => fixture_document_response(StatusCode::OK, bytes),
+        Err(error) => fixture_error_response(StatusCode::UNPROCESSABLE_ENTITY, error.to_string()),
+    }
+}
+
+async fn fixture_recreate_handler(
+    State(pool): State<SqlitePool>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> axum::response::Response {
+    if let Err(response) = ensure_admin_authorized(&headers) {
+        return *response;
+    }
+    let request = match fixture::parse_recreate_request(&body) {
+        Ok(request) => request,
+        Err(error) => return fixture_error_response(StatusCode::BAD_REQUEST, error.to_string()),
+    };
+    match fixture::recreate(&pool, request).await {
+        Ok(bytes) => fixture_document_response(StatusCode::OK, bytes),
+        Err(error) => fixture_error_response(StatusCode::UNPROCESSABLE_ENTITY, error.to_string()),
+    }
+}
+
+async fn fixture_destroy_handler(
+    State(pool): State<SqlitePool>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> axum::response::Response {
+    if let Err(response) = ensure_admin_authorized(&headers) {
+        return *response;
+    }
+    let request = match fixture::parse_destroy_request(&body) {
+        Ok(request) => request,
+        Err(error) => return fixture_error_response(StatusCode::BAD_REQUEST, error.to_string()),
+    };
+    match fixture::destroy(&pool, request).await {
+        Ok(bytes) => fixture_document_response(StatusCode::OK, bytes),
+        Err(error) => fixture_error_response(StatusCode::UNPROCESSABLE_ENTITY, error.to_string()),
     }
 }
 

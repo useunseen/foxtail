@@ -15,6 +15,8 @@
     "control_catalogue",
     "fault_profiles",
     "mutation_generation",
+    "mutation_generation_id",
+    "mutation_resources",
     "digest"
   ],
   "properties": {
@@ -73,7 +75,8 @@
       "additionalProperties": false
     },
     "generation": {"type": "integer", "minimum": 1},
-    "mutation_generation": {"type": "integer", "minimum": 0},
+    "mutation_generation": {"type": "integer", "minimum": 1},
+    "mutation_generation_id": {"type": "string", "pattern": "^mg-[0-9]{4,}$"},
     "resources": {
       "type": "array",
       "minItems": 5,
@@ -126,6 +129,44 @@
         "additionalProperties": true
       }
     },
+    "mutation_resources": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "required": [
+          "control_id",
+          "target_kind",
+          "resource_id",
+          "aws_identity",
+          "instance_state",
+          "instance_type",
+          "initial_state",
+          "initial_type",
+          "terminal_state",
+          "terminal_type",
+          "restored_state",
+          "restored_type"
+        ],
+        "properties": {
+          "control_id": {"type": "string"},
+          "target_kind": {"enum": ["stop", "resize", "recovery", "restoration"]},
+          "resource_id": {"type": "string"},
+          "aws_identity": {"type": "string"},
+          "instance_state": {"enum": ["running", "stopped"]},
+          "instance_type": {"type": "string"},
+          "initial_state": {"enum": ["running", "stopped"]},
+          "initial_type": {"type": "string"},
+          "terminal_state": {"enum": ["running", "stopped"]},
+          "terminal_type": {"type": "string"},
+          "restored_state": {"enum": ["running", "stopped"]},
+          "restored_type": {"type": "string"}
+        },
+        "additionalProperties": false
+      }
+    },
     "evidence_declarations": {
       "type": "array",
       "minItems": 5,
@@ -138,7 +179,7 @@
     },
     "control_catalogue": {
       "type": "array",
-      "minItems": 7,
+      "minItems": 9,
       "items": {
         "type": "object",
         "required": ["control_id", "role"],

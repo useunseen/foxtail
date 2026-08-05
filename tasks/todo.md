@@ -1,3 +1,40 @@
+# Issue #5: Disposable Mutation Generations
+
+Pinned base: `b524be1d738d12e816b584ea0238113545118cf8`
+
+Invariant: qualification mutations can affect only fresh, manifest-bound, one-use EC2 targets inside an explicitly isolated qualification environment; every transition is auditable, stale or ambiguous authority fails closed, and destruction is complete only after public inventory proves old identities absent and no injected fault remains.
+
+## Acceptance Map
+
+- [ ] Distinct targets: fixture lifecycle/persistence owns separate stop, resize, recovery, and restoration targets; manifest/status and public inventory consume their identities; existing read-only controls remain compatible; prove four unique mutation identities with no reuse or read-only overlap.
+- [ ] Recreation identity: atomic recreation owns a new mutation-generation identity, new resource IDs, updated complete-estate fingerprint, and regenerated manifest digest while preserving definition/read-only identity; prove two consecutive generations differ at every required boundary.
+- [ ] Supported controls: CLI parsing/execution and HTTP routes expose status, fault, reset, recreate, and destroy through the same fixture domain operations; prove CLI/HTTP canonical response parity and error parity.
+- [ ] Fault receipts: fault application binds exact manifest digest, mutation control, target/scope, enumerated fault kind, application time, and one-use reset token; prove canonical auditable receipt content and persisted active-fault state.
+- [ ] Reset/cleanup receipts: reset and destruction enumerate exact faults/targets acted on plus their prior and terminal state; prove targeted reset does not broaden scope and cleanup reports complete evidence.
+- [ ] Isolation gate: every mutating fixture operation requires an explicit isolated-qualification environment signal in addition to existing HTTP admin authentication; prove unset/invalid environments deny without state changes.
+- [ ] Destruction proof: cleanup removes all generation-owned resources and evidence, resets every active fault, and records public-inventory absence for every prior identity; prove old identities cannot be observed through AWS-compatible inventory after success.
+- [ ] Fail closed: duplicate, stale-generation, wrong-manifest, wrong-control/target, malformed, unknown-field, and ambiguous requests are rejected atomically without repair or scope expansion; prove state and public evidence remain unchanged on each rejection.
+- [ ] Full proof: focused Rust unit and HTTP/CLI integration tests cover the lifecycle; the interoperability smoke covers realize, recreate, fault, reset, destroy, and absence against the available Foxtail/LocalStack-compatible surface; record any genuinely unavailable external environment separately.
+
+## Execution Plan
+
+- [x] Give one Luna worker ownership of the coherent fixture lifecycle slice, schemas/goldens, migration, CLI/HTTP surfaces, documentation, tests, and commits.
+- [ ] Inspect the Luna handoff and frozen committed diff against every acceptance criterion.
+- [ ] Run frozen-head code review against the pinned base and return validated repair findings to the same Luna worker.
+- [ ] Run broad formatting, test, clippy, schema, and interoperability verification once on the repair candidate.
+- [ ] Record review evidence, residual gaps, commit IDs, and final acceptance outcome below.
+
+## Issue #5 Review
+
+- Implementation complete; frozen-head review remains with the parent agent.
+
+## Issue #5 Implementation Results
+
+- Added a migration-backed disposable mutation ledger with four generation-owned EC2 targets (stop, resize, recovery, and restoration), manifest/status/identity exposure, complete-estate fingerprinting, and canonical persisted operation receipts.
+- Added isolated-environment and existing admin-token gates for mutation status, fault, reset, recreate, and destroy; authority binds version, fixture generation, mutation generation/id, and exact manifest digest, with one-use reset tokens and fail-closed stale/duplicate/unknown-field handling.
+- Added CLI and HTTP lifecycle surfaces, recreation identity replacement, destruction cleanup with public-inventory absence proof, updated schemas/goldens/docs, focused lifecycle and parser tests, and smoke-script coverage. The smoke script keeps large AWS responses in temporary files to avoid shell argument-size limits.
+- Verification completed successfully with `cargo fmt --all -- --check`, `cargo test -q` (71 unit, 2 API-contract, 3 wrapper tests), `cargo clippy --all-targets --all-features -- -D warnings`, `python3 scripts/validate_release_fixture.py --definition tests/fixtures/release-qualification-v1.definition.json --manifest tests/fixtures/release-qualification-v1.manifest.json --negative`, `bash -n scripts/verify_cli_interop.sh`, `git diff --check`, and `bash scripts/verify_cli_interop.sh` (localhost access required and granted).
+
 # Cost Explorer USAGE_TYPE Grouping Work
 
 # Release Qualification Fixture v1
