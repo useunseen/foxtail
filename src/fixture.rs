@@ -12,6 +12,9 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
+
+use crate::mutation;
 
 const HISTORY_DAYS: i64 = 14;
 const DAY_SECONDS: i64 = 86_400;
@@ -55,8 +58,8 @@ pub const CONTROL_IDS: [&str; 9] = [
     "ec2-resize-negative-001",
     "ec2-mutation-stop-001",
     "ec2-mutation-resize-001",
-    "ec2-mutation-recovery-001",
-    "ec2-mutation-restoration-001",
+    "ec2-mutation-stop-recovery-001",
+    "ec2-mutation-resize-restoration-001",
 ];
 pub const REALIZED_CONTROL_IDS: [&str; 5] = [
     "ec2-idle-positive-001",
@@ -68,11 +71,12 @@ pub const REALIZED_CONTROL_IDS: [&str; 5] = [
 pub const MUTATION_CONTROL_IDS: [&str; 4] = [
     "ec2-mutation-stop-001",
     "ec2-mutation-resize-001",
-    "ec2-mutation-recovery-001",
-    "ec2-mutation-restoration-001",
+    "ec2-mutation-stop-recovery-001",
+    "ec2-mutation-resize-restoration-001",
 ];
 
-pub const MUTATION_TARGET_KINDS: [&str; 4] = ["stop", "resize", "recovery", "restoration"];
+pub const MUTATION_TARGET_KINDS: [&str; 4] =
+    ["stop", "resize", "stop-recovery", "resize-restoration"];
 
 #[derive(Debug, Clone, Copy)]
 struct MaterializationProfile {
@@ -131,6 +135,10 @@ pub struct RealizeRequest {
     pub endpoint_url: Option<String>,
     #[serde(alias = "LocalStackVersion", alias = "LocalstackVersion")]
     pub localstack_version: Option<String>,
+    /// Internal lifecycle control used by `recreate`; it is never accepted
+    /// from serialized CLI/HTTP input.
+    #[serde(skip)]
+    pub force_new: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -364,36 +372,45 @@ pub fn definition_value() -> Value {
             "disposable resize target is provisioned per isolated mutation generation",
             json!({
                 "lifecycle": "qualification-only",
+                "setup_fault_kind": "resize",
                 "allowed_operation": "resize_instance",
+                "initial_state": "stopped",
                 "initial_type": "m6i.large",
+                "terminal_state": "stopped",
                 "terminal_type": "m6i.medium",
+                "restored_state": "stopped",
                 "restored_type": "m6i.large"
             }),
         ),
         control_definition(
-            "ec2-mutation-recovery-001",
+            "ec2-mutation-stop-recovery-001",
             "mutation",
-            "ec2.mutation.disposable-recovery",
-            "disposable recovery target is provisioned per isolated mutation generation",
+            "ec2.mutation.disposable-stop-recovery",
+            "disposable stop-recovery target is provisioned per isolated mutation generation",
             json!({
                 "lifecycle": "qualification-only",
+                "setup_fault_kind": "stop",
                 "allowed_operation": "recover_instance",
-                "initial_state": "stopped",
-                "terminal_state": "running",
-                "restored_state": "stopped"
+                "initial_state": "running",
+                "terminal_state": "stopped",
+                "restored_state": "running"
             }),
         ),
         control_definition(
-            "ec2-mutation-restoration-001",
+            "ec2-mutation-resize-restoration-001",
             "mutation",
-            "ec2.mutation.disposable-restoration",
-            "disposable restoration target is provisioned per isolated mutation generation",
+            "ec2.mutation.disposable-resize-restoration",
+            "disposable resize-restoration target is provisioned per isolated mutation generation",
             json!({
                 "lifecycle": "qualification-only",
+                "setup_fault_kind": "resize",
                 "allowed_operation": "restore_instance",
                 "initial_state": "stopped",
-                "terminal_state": "running",
-                "restored_state": "stopped"
+                "initial_type": "m6i.medium",
+                "terminal_state": "stopped",
+                "terminal_type": "m6i.large",
+                "restored_state": "stopped",
+                "restored_type": "m6i.medium"
             }),
         ),
     ];
@@ -530,78 +547,39 @@ pub fn validate_version(version: Option<&str>) -> Result<()> {
 /// environment explicitly; HTTP callers still pass through the admin-token
 /// guard in `serve.rs` as a separate authorization boundary.
 pub fn ensure_isolated_qualification() -> Result<()> {
-    let primary = std::env::var(ISOLATED_QUALIFICATION_ENV)
-        .ok()
-        .map(|value| value.trim().to_ascii_lowercase());
-    if primary.as_deref() != Some(ISOLATED_QUALIFICATION_VALUE) {
+    if !is_isolated_qualification() {
         bail!("fixture mutation requires {ISOLATED_QUALIFICATION_ENV}=isolated")
     }
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-struct MutationTargetSpec {
-    control_id: &'static str,
-    target_kind: &'static str,
-    initial_state: &'static str,
-    initial_type: &'static str,
-    terminal_state: &'static str,
-    terminal_type: &'static str,
-    restored_state: &'static str,
-    restored_type: &'static str,
+/// Whether this process explicitly opted into disposable external mutation.
+/// Any value other than the exact opt-in is treated as ordinary read-only
+/// fixture realization. Mutation endpoints still call
+/// [`ensure_isolated_qualification`] and fail closed.
+pub fn is_isolated_qualification() -> bool {
+    if let Ok(value) = ISOLATED_QUALIFICATION_OVERRIDE.try_with(|value| *value) {
+        return value;
+    }
+    std::env::var(ISOLATED_QUALIFICATION_ENV).ok().as_deref() == Some(ISOLATED_QUALIFICATION_VALUE)
 }
 
-fn mutation_target_specs() -> [MutationTargetSpec; 4] {
-    [
-        MutationTargetSpec {
-            control_id: "ec2-mutation-stop-001",
-            target_kind: "stop",
-            initial_state: "running",
-            initial_type: "m6i.large",
-            terminal_state: "stopped",
-            terminal_type: "m6i.large",
-            restored_state: "running",
-            restored_type: "m6i.large",
-        },
-        MutationTargetSpec {
-            control_id: "ec2-mutation-resize-001",
-            target_kind: "resize",
-            initial_state: "running",
-            initial_type: "m6i.large",
-            terminal_state: "running",
-            terminal_type: "m6i.medium",
-            restored_state: "running",
-            restored_type: "m6i.large",
-        },
-        MutationTargetSpec {
-            control_id: "ec2-mutation-recovery-001",
-            target_kind: "recovery",
-            initial_state: "stopped",
-            initial_type: "m6i.large",
-            terminal_state: "running",
-            terminal_type: "m6i.large",
-            restored_state: "stopped",
-            restored_type: "m6i.large",
-        },
-        MutationTargetSpec {
-            control_id: "ec2-mutation-restoration-001",
-            target_kind: "restoration",
-            initial_state: "stopped",
-            initial_type: "m6i.medium",
-            terminal_state: "running",
-            terminal_type: "m6i.large",
-            restored_state: "stopped",
-            restored_type: "m6i.medium",
-        },
-    ]
+tokio::task_local! {
+    static ISOLATED_QUALIFICATION_OVERRIDE: bool;
 }
 
-fn mutation_resource_id(mutation_generation: i64, target_kind: &str) -> String {
-    format!("i-foxtail-mutation-g{mutation_generation:04}-{target_kind}")
+/// Test/embedded-runner hook that scopes qualification mode to one async task
+/// without mutating the process environment. Production callers must use the
+/// explicit environment gate above.
+pub async fn with_isolated_qualification<F>(future: F) -> F::Output
+where
+    F: Future,
+{
+    ISOLATED_QUALIFICATION_OVERRIDE.scope(true, future).await
 }
 
 fn mutation_generation_id(mutation_generation: i64) -> String {
-    format!("mg-{mutation_generation:04}")
+    mutation::generation_id(mutation_generation)
 }
 
 fn now_rfc3339() -> String {
@@ -662,6 +640,18 @@ async fn validate_mutation_authority(
     if active != Some(mutation_generation) {
         bail!("mutation generation is not active")
     }
+    let ambiguous: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fixture_mutation_intents
+         WHERE mutation_generation = ? AND status = 'AMBIGUOUS'",
+    )
+    .bind(mutation_generation)
+    .fetch_one(pool)
+    .await?;
+    if ambiguous != 0 {
+        bail!(
+            "mutation generation has an ambiguous external operation; reconcile it before retrying"
+        )
+    }
     Ok((
         generation,
         manifest_digest,
@@ -672,9 +662,11 @@ async fn validate_mutation_authority(
 
 async fn mutation_target_values(pool: &SqlitePool, mutation_generation: i64) -> Result<Vec<Value>> {
     let rows = sqlx::query(
-        "SELECT m.resource_id, m.control_id, m.target_kind, m.instance_state, m.instance_type,
+        "SELECT m.resource_id, m.control_id, m.target_kind, m.setup_fault_kind,
+                m.instance_state, m.instance_type,
                 initial_state, initial_type, terminal_state, terminal_type,
-                restored_state, restored_type, r.region
+                restored_state, restored_type, r.region, m.external_status,
+                m.external_identity_verified
          FROM fixture_mutation_resources m
          JOIN resources r ON r.id = m.resource_id
          WHERE m.mutation_generation = ?
@@ -691,6 +683,7 @@ async fn mutation_target_values(pool: &SqlitePool, mutation_generation: i64) -> 
             Ok(json!({
                 "control_id": row.try_get::<String, _>("control_id")?,
                 "target_kind": target_kind,
+                "setup_fault_kind": row.try_get::<String, _>("setup_fault_kind")?,
                 "resource_id": resource_id,
                 "aws_identity": resource_arn(&region, authoritative_account_id(), &resource_id),
                 "instance_state": row.try_get::<String, _>("instance_state")?,
@@ -700,96 +693,148 @@ async fn mutation_target_values(pool: &SqlitePool, mutation_generation: i64) -> 
                 "terminal_state": row.try_get::<String, _>("terminal_state")?,
                 "terminal_type": row.try_get::<String, _>("terminal_type")?,
                 "restored_state": row.try_get::<String, _>("restored_state")?,
-                "restored_type": row.try_get::<String, _>("restored_type")?
+                "restored_type": row.try_get::<String, _>("restored_type")?,
+                "external_status": row.try_get::<String, _>("external_status")?,
+                "external_identity_verified": row.try_get::<i64, _>("external_identity_verified")? != 0
             }))
         })
         .collect()
 }
 
-async fn create_mutation_generation(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    fixture_generation: i64,
+async fn mutation_backend_for_generation(
+    pool: &SqlitePool,
     mutation_generation: i64,
     generation_id: &str,
-    region: &str,
-    account_id: &str,
-    anchor: &str,
+) -> Result<mutation::Ec2MutationBackend> {
+    let row = sqlx::query(
+        "SELECT endpoint_url, region, account_id, external_status
+         FROM fixture_mutation_generations
+         WHERE mutation_generation = ? AND generation_id = ? AND state = 'ACTIVE'",
+    )
+    .bind(mutation_generation)
+    .bind(generation_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| anyhow!("mutation generation is not active"))?;
+    let endpoint_url: String = row.try_get("endpoint_url")?;
+    let region: String = row.try_get("region")?;
+    let account_id: String = row.try_get("account_id")?;
+    let external_status: String = row.try_get("external_status")?;
+    if external_status == "AMBIGUOUS" {
+        bail!(
+            "mutation generation has an ambiguous external operation; reconcile it before retrying"
+        )
+    }
+    mutation::Ec2MutationBackend::connect(&endpoint_url, &region, &account_id).await
+}
+
+struct MutationGenerationContext<'a> {
+    fixture_generation: i64,
+    mutation_generation: i64,
+    generation_id: &'a str,
+    region: &'a str,
+    account_id: &'a str,
+    endpoint_url: &'a str,
+    anchor: &'a str,
+}
+
+async fn create_mutation_generation(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    context: MutationGenerationContext<'_>,
+    provisioned: &[(mutation::MutationScenario, mutation::ObservedInstance)],
 ) -> Result<Vec<Value>> {
-    let specs = mutation_target_specs();
-    let resource_ids = specs
+    if provisioned.len() != mutation::CATALOGUE.len() {
+        bail!(
+            "mutation generation requires {} provisioned targets; found {}",
+            mutation::CATALOGUE.len(),
+            provisioned.len()
+        );
+    }
+    let resource_ids = provisioned
         .iter()
-        .map(|spec| mutation_resource_id(mutation_generation, spec.target_kind))
+        .map(|(_, observed)| observed.resource_id.clone())
         .collect::<Vec<_>>();
     sqlx::query(
         "INSERT INTO fixture_mutation_generations
          (mutation_generation, generation_id, fixture_generation, manifest_digest,
-          complete_estate_fingerprint, state, resource_ids, created_at)
-         VALUES (?, ?, ?, '', '', 'ACTIVE', ?, ?)",
+          complete_estate_fingerprint, state, resource_ids, public_absence,
+          endpoint_url, region, account_id, external_status, created_at)
+         VALUES (?, ?, ?, '', '', 'ACTIVE', ?, NULL, ?, ?, ?, 'PROVISIONED', ?)",
     )
-    .bind(mutation_generation)
-    .bind(generation_id)
-    .bind(fixture_generation)
+    .bind(context.mutation_generation)
+    .bind(context.generation_id)
+    .bind(context.fixture_generation)
     .bind(serde_json::to_string(&resource_ids)?)
-    .bind(anchor)
+    .bind(context.endpoint_url)
+    .bind(context.region)
+    .bind(context.account_id)
+    .bind(context.anchor)
     .execute(&mut **tx)
     .await?;
 
-    let mut targets = Vec::with_capacity(specs.len());
-    for spec in specs {
-        let resource_id = mutation_resource_id(mutation_generation, spec.target_kind);
+    let mut targets = Vec::with_capacity(provisioned.len());
+    for (scenario, observed) in provisioned {
+        let resource_id = &observed.resource_id;
         let tags = serde_json::to_string(&json!({
             "Name": resource_id,
             "FoxtailFixture": FIXTURE_VERSION,
-            "FoxtailMutationGeneration": mutation_generation,
-            "FoxtailMutationControl": spec.control_id,
-            "FoxtailMutationTarget": spec.target_kind
+            "FoxtailMutationGeneration": context.mutation_generation,
+            "FoxtailMutationGenerationId": context.generation_id,
+            "FoxtailMutationControl": scenario.control_id,
+            "FoxtailMutationTarget": scenario.target_kind.as_str(),
+            "InstanceState": observed.instance_state,
+            "InstanceType": observed.instance_type
         }))?;
         sqlx::query(
             "INSERT INTO resources (id, resource_type, region, scenario, tags)
              VALUES (?, 'ec2', ?, 'QualificationMutation', ?)",
         )
-        .bind(&resource_id)
-        .bind(region)
+        .bind(resource_id)
+        .bind(context.region)
         .bind(tags)
         .execute(&mut **tx)
         .await
         .with_context(|| format!("persist mutation resource {resource_id}"))?;
         sqlx::query(
             "INSERT INTO fixture_mutation_resources
-             (resource_id, mutation_generation, generation_id, control_id, target_kind,
+             (resource_id, mutation_generation, generation_id, control_id, target_kind, setup_fault_kind,
               instance_state, instance_type, initial_state, initial_type,
-              terminal_state, terminal_type, restored_state, restored_type, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              terminal_state, terminal_type, restored_state, restored_type, external_status,
+              external_identity_verified, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PROVISIONED', 1, ?)",
         )
-        .bind(&resource_id)
-        .bind(mutation_generation)
-        .bind(generation_id)
-        .bind(spec.control_id)
-        .bind(spec.target_kind)
-        .bind(spec.initial_state)
-        .bind(spec.initial_type)
-        .bind(spec.initial_state)
-        .bind(spec.initial_type)
-        .bind(spec.terminal_state)
-        .bind(spec.terminal_type)
-        .bind(spec.restored_state)
-        .bind(spec.restored_type)
-        .bind(anchor)
+        .bind(resource_id)
+        .bind(context.mutation_generation)
+        .bind(context.generation_id)
+        .bind(scenario.control_id)
+        .bind(scenario.target_kind.as_str())
+        .bind(scenario.setup_fault_kind.as_str())
+        .bind(&observed.instance_state)
+        .bind(&observed.instance_type)
+        .bind(scenario.initial_state)
+        .bind(scenario.initial_type)
+        .bind(scenario.terminal_state)
+        .bind(scenario.terminal_type)
+        .bind(scenario.restored_state)
+        .bind(scenario.restored_type)
+        .bind(context.anchor)
         .execute(&mut **tx)
         .await?;
         targets.push(json!({
-            "control_id": spec.control_id,
-            "target_kind": spec.target_kind,
+            "control_id": scenario.control_id,
+            "target_kind": scenario.target_kind.as_str(),
+            "setup_fault_kind": scenario.setup_fault_kind.as_str(),
             "resource_id": resource_id,
-            "aws_identity": resource_arn(region, account_id, &resource_id),
-            "instance_state": spec.initial_state,
-            "instance_type": spec.initial_type,
-            "initial_state": spec.initial_state,
-            "initial_type": spec.initial_type,
-            "terminal_state": spec.terminal_state,
-            "terminal_type": spec.terminal_type,
-            "restored_state": spec.restored_state,
-            "restored_type": spec.restored_type
+            "aws_identity": resource_arn(context.region, context.account_id, resource_id),
+            "instance_state": observed.instance_state,
+            "instance_type": observed.instance_type,
+            "initial_state": scenario.initial_state,
+            "initial_type": scenario.initial_type,
+            "terminal_state": scenario.terminal_state,
+            "terminal_type": scenario.terminal_type,
+            "restored_state": scenario.restored_state,
+            "restored_type": scenario.restored_type,
+            "external_identity_verified": true
         }));
     }
     Ok(targets)
@@ -844,6 +889,101 @@ fn reset_token() -> String {
     format!("rt-{}", uuid::Uuid::new_v4())
 }
 
+struct IntentContext<'a> {
+    mutation_generation: Option<i64>,
+    generation_id: Option<&'a str>,
+    fixture_generation: Option<i64>,
+    target_id: Option<&'a str>,
+}
+
+async fn begin_mutation_intent(
+    pool: &SqlitePool,
+    operation: &str,
+    context: IntentContext<'_>,
+    request: &Value,
+    created_at: &str,
+) -> Result<String> {
+    let intent_id = receipt_id("intent");
+    let request_bytes = canonical_bytes(request)?;
+    let mut tx = pool.begin().await?;
+    let active: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fixture_mutation_intents
+         WHERE status IN ('INTENT', 'DISPATCHED') AND operation = ?
+           AND COALESCE(mutation_generation, -1) = COALESCE(?, -1)",
+    )
+    .bind(operation)
+    .bind(context.mutation_generation)
+    .fetch_one(&mut *tx)
+    .await?;
+    if active != 0 {
+        bail!("mutation operation '{operation}' is already in progress")
+    }
+    sqlx::query(
+        "INSERT INTO fixture_mutation_intents
+         (intent_id, operation, mutation_generation, generation_id, fixture_generation,
+          target_id, request_bytes, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'INTENT', ?, ?)",
+    )
+    .bind(&intent_id)
+    .bind(operation)
+    .bind(context.mutation_generation)
+    .bind(context.generation_id)
+    .bind(context.fixture_generation)
+    .bind(context.target_id)
+    .bind(request_bytes)
+    .bind(created_at)
+    .bind(created_at)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(intent_id)
+}
+
+async fn update_mutation_intent(
+    pool: &SqlitePool,
+    intent_id: &str,
+    status: &str,
+    error: Option<&str>,
+    updated_at: &str,
+) -> Result<()> {
+    let affected = sqlx::query(
+        "UPDATE fixture_mutation_intents
+         SET status = ?, error = ?, updated_at = ?
+         WHERE intent_id = ? AND status IN ('INTENT', 'DISPATCHED')",
+    )
+    .bind(status)
+    .bind(error)
+    .bind(updated_at)
+    .bind(intent_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if affected != 1 {
+        bail!("mutation intent {intent_id} was already finalized")
+    }
+    Ok(())
+}
+
+async fn mark_intent_dispatched(
+    pool: &SqlitePool,
+    intent_id: &str,
+    updated_at: &str,
+) -> Result<()> {
+    let affected = sqlx::query(
+        "UPDATE fixture_mutation_intents SET status = 'DISPATCHED', updated_at = ?
+         WHERE intent_id = ? AND status = 'INTENT'",
+    )
+    .bind(updated_at)
+    .bind(intent_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if affected != 1 {
+        bail!("mutation intent {intent_id} is not dispatchable")
+    }
+    Ok(())
+}
+
 fn parse_application_time(raw: Option<&str>) -> Result<String> {
     match raw {
         Some(value) => Ok(DateTime::parse_from_rfc3339(value)
@@ -888,89 +1028,6 @@ async fn persist_receipt(
     .bind(context.manifest_digest)
     .bind(receipt_bytes)
     .bind(created_at)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
-}
-
-async fn retire_active_mutation_generation(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-) -> Result<()> {
-    let Some(current) = sqlx::query_scalar::<_, i64>(
-        "SELECT mutation_generation FROM fixture_mutation_generations
-         WHERE state = 'ACTIVE' ORDER BY mutation_generation DESC LIMIT 1",
-    )
-    .fetch_optional(&mut **tx)
-    .await?
-    else {
-        return Ok(());
-    };
-    let active_faults: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM fixture_faults
-         WHERE mutation_generation = ? AND status = 'ACTIVE'",
-    )
-    .bind(current)
-    .fetch_one(&mut **tx)
-    .await?;
-    if active_faults > 0 {
-        bail!("cannot retire mutation generation while faults are active")
-    }
-    let ids: Vec<String> = sqlx::query_scalar(
-        "SELECT resource_id
-         FROM fixture_mutation_resources
-         WHERE mutation_generation = ? AND retired_at IS NULL ORDER BY resource_id",
-    )
-    .bind(current)
-    .fetch_all(&mut **tx)
-    .await?;
-    for id in &ids {
-        sqlx::query("DELETE FROM metrics WHERE resource_id = ?")
-            .bind(id)
-            .execute(&mut **tx)
-            .await?;
-        sqlx::query("DELETE FROM cost_records WHERE resource_id = ?")
-            .bind(id)
-            .execute(&mut **tx)
-            .await?;
-        sqlx::query("DELETE FROM resources WHERE id = ?")
-            .bind(id)
-            .execute(&mut **tx)
-            .await?;
-    }
-    let retired_at = now_rfc3339();
-    sqlx::query(
-        "UPDATE fixture_mutation_resources SET retired_at = ?
-         WHERE mutation_generation = ? AND retired_at IS NULL",
-    )
-    .bind(&retired_at)
-    .bind(current)
-    .execute(&mut **tx)
-    .await?;
-    let remaining: i64 = if ids.is_empty() {
-        0
-    } else {
-        sqlx::query_scalar(
-            "SELECT COUNT(*) FROM resources WHERE id IN (SELECT resource_id FROM fixture_mutation_resources WHERE mutation_generation = ?)",
-        )
-        .bind(current)
-        .fetch_one(&mut **tx)
-        .await?
-    };
-    if remaining != 0 {
-        bail!("mutation generation public inventory still contains retired identities")
-    }
-    sqlx::query(
-        "UPDATE fixture_mutation_generations
-         SET state = 'DESTROYED', public_absence = ?, destroyed_at = ?
-         WHERE mutation_generation = ? AND state = 'ACTIVE'",
-    )
-    .bind(serde_json::to_string(&json!({
-        "checked_at": retired_at,
-        "resource_ids": ids,
-        "all_absent": true
-    }))?)
-    .bind(&retired_at)
-    .bind(current)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -1073,6 +1130,55 @@ pub async fn realize(pool: &SqlitePool, request: RealizeRequest) -> Result<Fixtu
     validate_version(request.version.as_deref())?;
     let (definition_bytes, definition_digest) = canonical_definition()?;
     let anchor = parse_anchor(request.clock_anchor.as_deref())?;
+    let isolated = is_isolated_qualification();
+    let request_value = serde_json::to_value(&request)?;
+
+    // Realization is a read-only lookup when an authority-bound singleton is
+    // already present and no explicit recreation was requested. This keeps
+    // CLI/HTTP reads byte-identical without provisioning another generation.
+    if !request.force_new
+        && request.clock_anchor.is_none()
+        && request.account_id.is_none()
+        && request.region.is_none()
+        && request.endpoint_url.is_none()
+        && request.localstack_version.is_none()
+        && let Some(row) = sqlx::query(
+            "SELECT manifest_digest, generation, mutation_generation_id
+             FROM fixture_realizations WHERE singleton_id = 1",
+        )
+        .fetch_optional(pool)
+        .await?
+    {
+        let manifest_digest: String = row.try_get("manifest_digest")?;
+        let current_mutation_id: Option<String> = row.try_get("mutation_generation_id")?;
+        if !isolated || current_mutation_id.is_some() {
+            let state = read_state(pool).await?;
+            if let Some(manifest_bytes) = state.manifest_bytes {
+                return Ok(FixtureSnapshot {
+                    definition_bytes: state.definition_bytes,
+                    definition_digest: state.definition_digest,
+                    manifest_bytes,
+                    manifest_digest: state.manifest_digest.unwrap_or(manifest_digest),
+                    status_bytes: state.status_bytes,
+                    identities_bytes: state.identities_bytes,
+                    generation: row.try_get("generation")?,
+                });
+            }
+        }
+    }
+
+    if !isolated {
+        let active_mutations: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM fixture_mutation_generations WHERE state = 'ACTIVE'",
+        )
+        .fetch_one(pool)
+        .await?;
+        if active_mutations != 0 {
+            bail!(
+                "an isolated mutation generation is active; set {ISOLATED_QUALIFICATION_ENV}=isolated to manage it"
+            );
+        }
+    }
 
     let rows = sqlx::query(
         "SELECT id, region, scenario
@@ -1144,6 +1250,94 @@ pub async fn realize(pool: &SqlitePool, request: RealizeRequest) -> Result<Fixtu
     let source_revision =
         std::env::var("FOXTAIL_SOURCE_REVISION").unwrap_or_else(|_| "unknown".to_string());
 
+    let active_faults: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM fixture_faults WHERE status = 'ACTIVE'")
+            .fetch_one(pool)
+            .await?;
+    if active_faults != 0 {
+        bail!("cannot realize or recreate while a mutation fault is active; reset it first");
+    }
+
+    // Allocate identities before dispatch. The intent is committed before any
+    // EC2 call so a crash or ambiguous SDK response cannot be mistaken for a
+    // successful fixture mutation.
+    let generation: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(value), 0) + 1 FROM (
+            SELECT generation AS value FROM fixture_realizations
+            UNION ALL SELECT fixture_generation AS value FROM fixture_mutation_generations
+        )",
+    )
+    .fetch_one(pool)
+    .await?;
+    let mutation_generation: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(mutation_generation), 0) + 1
+         FROM fixture_mutation_generations",
+    )
+    .fetch_one(pool)
+    .await?;
+    let mutation_generation_id = isolated.then(|| mutation_generation_id(mutation_generation));
+    let intent_id = if isolated {
+        let id = begin_mutation_intent(
+            pool,
+            "realize",
+            IntentContext {
+                mutation_generation: Some(mutation_generation),
+                generation_id: mutation_generation_id.as_deref(),
+                fixture_generation: Some(generation),
+                target_id: None,
+            },
+            &request_value,
+            &anchor.to_rfc3339_opts(SecondsFormat::Secs, true),
+        )
+        .await?;
+        mark_intent_dispatched(pool, &id, &now_rfc3339()).await?;
+        Some(id)
+    } else {
+        None
+    };
+
+    let provisioned = if isolated {
+        let backend = mutation::Ec2MutationBackend::connect(&endpoint_url, &region, &account_id)
+            .await
+            .with_context(|| format!("connect to public EC2 endpoint {endpoint_url}"));
+        match backend {
+            Ok(backend) => match backend
+                .provision_generation(generation, mutation_generation_id.as_deref().unwrap())
+                .await
+            {
+                Ok(targets) => Some((backend, targets)),
+                Err(error) => {
+                    if let Some(intent_id) = intent_id.as_deref() {
+                        let _ = update_mutation_intent(
+                            pool,
+                            intent_id,
+                            "FAILED",
+                            Some(&error.to_string()),
+                            &now_rfc3339(),
+                        )
+                        .await;
+                    }
+                    return Err(error);
+                }
+            },
+            Err(error) => {
+                if let Some(intent_id) = intent_id.as_deref() {
+                    let _ = update_mutation_intent(
+                        pool,
+                        intent_id,
+                        "FAILED",
+                        Some(&error.to_string()),
+                        &now_rfc3339(),
+                    )
+                    .await;
+                }
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+
     let mut tx = pool.begin().await?;
     for (control_id, resource) in &assigned {
         materialize_control_evidence(&mut tx, control_id, &resource.id).await?;
@@ -1165,39 +1359,24 @@ pub async fn realize(pool: &SqlitePool, request: RealizeRequest) -> Result<Fixtu
         .collect::<Result<BTreeMap<_, _>>>()?;
     validate_realized_controls(&assigned_observed)?;
 
-    // Keep both counters monotonic even after `destroy` removes the singleton
-    // realization row. The mutation ledger is the durable generation source.
-    let generation = sqlx::query_scalar::<_, i64>(
-        "SELECT COALESCE(MAX(fixture_generation), 0) + 1
-         FROM fixture_mutation_generations",
-    )
-    .fetch_one(&mut *tx)
-    .await?;
-    let mutation_generation = sqlx::query_scalar::<_, i64>(
-        "SELECT COALESCE(MAX(mutation_generation), 0) + 1
-         FROM fixture_mutation_generations",
-    )
-    .fetch_one(&mut *tx)
-    .await?;
-    if sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM fixture_faults WHERE status = 'ACTIVE'")
-        .fetch_one(&mut *tx)
+    let mutation_targets = if let Some((_, provisioned)) = &provisioned {
+        create_mutation_generation(
+            &mut tx,
+            MutationGenerationContext {
+                fixture_generation: generation,
+                mutation_generation,
+                generation_id: mutation_generation_id.as_deref().unwrap(),
+                region: &region,
+                account_id: &account_id,
+                endpoint_url: &endpoint_url,
+                anchor: &anchor.to_rfc3339_opts(SecondsFormat::Secs, true),
+            },
+            provisioned,
+        )
         .await?
-        > 0
-    {
-        bail!("cannot realize or recreate while a mutation fault is active; reset it first")
-    }
-    retire_active_mutation_generation(&mut tx).await?;
-    let mutation_generation_id = mutation_generation_id(mutation_generation);
-    let mutation_targets = create_mutation_generation(
-        &mut tx,
-        generation,
-        mutation_generation,
-        &mutation_generation_id,
-        &region,
-        &account_id,
-        &anchor.to_rfc3339_opts(SecondsFormat::Secs, true),
-    )
-    .await?;
+    } else {
+        Vec::new()
+    };
 
     let read_only_fingerprint = estate_fingerprint(&assigned_observed, &region, &account_id)?;
     let complete_map = observed_resources
@@ -1225,23 +1404,29 @@ pub async fn realize(pool: &SqlitePool, request: RealizeRequest) -> Result<Fixtu
         generation,
         read_only_fingerprint: &read_only_fingerprint,
         complete_fingerprint: &complete_fingerprint,
-        mutation_generation,
-        mutation_generation_id: &mutation_generation_id,
+        mutation_generation: if isolated {
+            Some(mutation_generation)
+        } else {
+            None
+        },
+        mutation_generation_id: mutation_generation_id.as_deref(),
         mutation_targets: &mutation_targets,
     })?;
     let (manifest_bytes, manifest_digest) = with_digest(&manifest_without_digest)?;
 
-    sqlx::query(
-        "UPDATE fixture_mutation_generations
-         SET manifest_digest = ?, complete_estate_fingerprint = ?
-         WHERE mutation_generation = ? AND generation_id = ?",
-    )
-    .bind(&manifest_digest)
-    .bind(&complete_fingerprint)
-    .bind(mutation_generation)
-    .bind(&mutation_generation_id)
-    .execute(&mut *tx)
-    .await?;
+    if isolated {
+        sqlx::query(
+            "UPDATE fixture_mutation_generations
+             SET manifest_digest = ?, complete_estate_fingerprint = ?, external_status = 'ACTIVE'
+             WHERE mutation_generation = ? AND generation_id = ? AND state = 'ACTIVE'",
+        )
+        .bind(&manifest_digest)
+        .bind(&complete_fingerprint)
+        .bind(mutation_generation)
+        .bind(mutation_generation_id.as_deref())
+        .execute(&mut *tx)
+        .await?;
+    }
 
     sqlx::query(
         "INSERT INTO fixture_realizations
@@ -1265,8 +1450,8 @@ pub async fn realize(pool: &SqlitePool, request: RealizeRequest) -> Result<Fixtu
     .bind(&manifest_bytes)
     .bind(&manifest_digest)
     .bind(generation)
-    .bind(mutation_generation)
-    .bind(&mutation_generation_id)
+    .bind(if isolated { mutation_generation } else { 0 })
+    .bind(mutation_generation_id.as_deref())
     .bind(&complete_fingerprint)
     .bind(anchor.to_rfc3339_opts(SecondsFormat::Secs, true))
     .bind(anchor.to_rfc3339_opts(SecondsFormat::Secs, true))
@@ -1274,6 +1459,24 @@ pub async fn realize(pool: &SqlitePool, request: RealizeRequest) -> Result<Fixtu
     .await
     .context("persist fixture realization atomically")?;
     tx.commit().await?;
+
+    if let Some(intent_id) = intent_id.as_deref()
+        && let Err(error) =
+            update_mutation_intent(pool, intent_id, "SUCCEEDED", None, &now_rfc3339()).await
+    {
+        // The external estate and the manifest are already durable. Keep
+        // the intent visibly fail-closed rather than claiming a green
+        // receipt when finalization itself was ambiguous.
+        let _ = update_mutation_intent(
+            pool,
+            intent_id,
+            "AMBIGUOUS",
+            Some(&error.to_string()),
+            &now_rfc3339(),
+        )
+        .await;
+        return Err(error);
+    }
 
     let identities = identity_values(&manifest_without_digest)?;
     let mutation_identities = mutation_identity_values(&manifest_without_digest)?;
@@ -1396,9 +1599,8 @@ pub async fn apply_fault(pool: &SqlitePool, request: FaultRequest) -> Result<Vec
     let applied_at = parse_application_time(request.application_time.as_deref())?;
     let receipt_id = receipt_id("fault");
     let reset_token = reset_token();
-    let mut tx = pool.begin().await?;
     let target = sqlx::query(
-        "SELECT control_id, target_kind, instance_state, instance_type,
+        "SELECT control_id, target_kind, setup_fault_kind, instance_state, instance_type,
                 initial_state, initial_type, terminal_state, terminal_type
          FROM fixture_mutation_resources
          WHERE resource_id = ? AND mutation_generation = ? AND generation_id = ?
@@ -1407,13 +1609,14 @@ pub async fn apply_fault(pool: &SqlitePool, request: FaultRequest) -> Result<Vec
     .bind(&target_id)
     .bind(mutation_generation)
     .bind(&generation_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(pool)
     .await?
     .ok_or_else(|| anyhow!("target is not part of the active mutation generation"))?;
     let stored_control: String = target.try_get("control_id")?;
     let target_kind: String = target.try_get("target_kind")?;
-    if stored_control != control_id || target_kind != fault_kind {
-        bail!("control_id, target_id, and fault_kind do not match the manifest-bound target")
+    let setup_fault_kind: String = target.try_get("setup_fault_kind")?;
+    if stored_control != control_id || setup_fault_kind != fault_kind {
+        bail!("control_id, target_id, and fault_kind do not match the manifest-bound setup fault")
     }
     let prior_state: String = target.try_get("instance_state")?;
     let prior_type: String = target.try_get("instance_type")?;
@@ -1428,23 +1631,112 @@ pub async fn apply_fault(pool: &SqlitePool, request: FaultRequest) -> Result<Vec
     )
     .bind(mutation_generation)
     .bind(&target_id)
-    .fetch_one(&mut *tx)
+    .fetch_one(pool)
     .await?;
     if duplicate != 0 {
         bail!("target already has an active fault")
     }
     let terminal_state: String = target.try_get("terminal_state")?;
     let terminal_type: String = target.try_get("terminal_type")?;
-    sqlx::query(
-        "UPDATE fixture_mutation_resources SET instance_state = ?, instance_type = ?
-         WHERE resource_id = ? AND mutation_generation = ?",
+    let scenario = mutation::scenario_for_control(&control_id)?;
+    if scenario.target_kind.as_str() != target_kind
+        || scenario.setup_fault_kind.as_str() != fault_kind
+    {
+        bail!("target metadata is inconsistent with the canonical mutation catalogue")
+    }
+    let intent_id = begin_mutation_intent(
+        pool,
+        "fault",
+        IntentContext {
+            mutation_generation: Some(mutation_generation),
+            generation_id: Some(&generation_id),
+            fixture_generation: request.authority.generation,
+            target_id: Some(&target_id),
+        },
+        &serde_json::to_value(&request)?,
+        &applied_at,
+    )
+    .await?;
+    mark_intent_dispatched(pool, &intent_id, &now_rfc3339()).await?;
+    let backend =
+        match mutation_backend_for_generation(pool, mutation_generation, &generation_id).await {
+            Ok(backend) => backend,
+            Err(error) => {
+                let _ = update_mutation_intent(
+                    pool,
+                    &intent_id,
+                    "AMBIGUOUS",
+                    Some(&error.to_string()),
+                    &now_rfc3339(),
+                )
+                .await;
+                return Err(error);
+            }
+        };
+    let observed = match backend
+        .apply_setup_fault(&target_id, scenario, scenario.setup_fault_kind)
+        .await
+    {
+        Ok(observed) => observed,
+        Err(error) => {
+            let _ = update_mutation_intent(
+                pool,
+                &intent_id,
+                "AMBIGUOUS",
+                Some(&error.to_string()),
+                &now_rfc3339(),
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    if observed.instance_state != terminal_state || observed.instance_type != terminal_type {
+        let error = anyhow!(
+            "public EC2 state after fault was {}:{}, expected {}:{}",
+            observed.instance_state,
+            observed.instance_type,
+            terminal_state,
+            terminal_type
+        );
+        let _ = update_mutation_intent(
+            pool,
+            &intent_id,
+            "AMBIGUOUS",
+            Some(&error.to_string()),
+            &now_rfc3339(),
+        )
+        .await;
+        return Err(error);
+    }
+    let mut tx = pool.begin().await?;
+    let updated = sqlx::query(
+        "UPDATE fixture_mutation_resources SET instance_state = ?, instance_type = ?,
+                external_status = 'FAULTED', external_identity_verified = 1
+         WHERE resource_id = ? AND mutation_generation = ? AND generation_id = ?
+           AND instance_state = ? AND instance_type = ? AND retired_at IS NULL",
     )
     .bind(&terminal_state)
     .bind(&terminal_type)
     .bind(&target_id)
     .bind(mutation_generation)
+    .bind(&generation_id)
+    .bind(&prior_state)
+    .bind(&prior_type)
     .execute(&mut *tx)
-    .await?;
+    .await?
+    .rows_affected();
+    if updated != 1 {
+        let error = anyhow!("fault finalization lost the target row to a concurrent operation");
+        let _ = update_mutation_intent(
+            pool,
+            &intent_id,
+            "AMBIGUOUS",
+            Some(&error.to_string()),
+            &now_rfc3339(),
+        )
+        .await;
+        return Err(error);
+    }
     sqlx::query(
         "INSERT INTO fixture_faults
          (receipt_id, mutation_generation, generation_id, manifest_digest, control_id,
@@ -1500,6 +1792,7 @@ pub async fn apply_fault(pool: &SqlitePool, request: FaultRequest) -> Result<Vec
     )
     .await?;
     tx.commit().await?;
+    update_mutation_intent(pool, &intent_id, "SUCCEEDED", None, &now_rfc3339()).await?;
     Ok(receipt_bytes)
 }
 
@@ -1510,7 +1803,6 @@ pub async fn reset_fault(pool: &SqlitePool, request: ResetRequest) -> Result<Vec
     let reset_token = non_empty(Some(&request.reset_token), "reset_token")?;
     let reset_receipt_id = receipt_id("reset");
     let reset_at = now_rfc3339();
-    let mut tx = pool.begin().await?;
     let fault = sqlx::query(
         "SELECT control_id, target_id, scope, fault_kind, applied_at, prior_state,
                 terminal_state, reset_token
@@ -1522,7 +1814,7 @@ pub async fn reset_fault(pool: &SqlitePool, request: ResetRequest) -> Result<Vec
     .bind(mutation_generation)
     .bind(&generation_id)
     .bind(&manifest_digest)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(pool)
     .await?
     .ok_or_else(|| anyhow!("fault receipt is stale, already reset, or unknown"))?;
     let stored_token: String = fault.try_get("reset_token")?;
@@ -1531,7 +1823,7 @@ pub async fn reset_fault(pool: &SqlitePool, request: ResetRequest) -> Result<Vec
     }
     let target_id: String = fault.try_get("target_id")?;
     let target = sqlx::query(
-        "SELECT instance_state, instance_type, initial_state, initial_type
+        "SELECT control_id, instance_state, instance_type, initial_state, initial_type
          FROM fixture_mutation_resources
          WHERE resource_id = ? AND mutation_generation = ? AND generation_id = ?
            AND retired_at IS NULL",
@@ -1539,7 +1831,7 @@ pub async fn reset_fault(pool: &SqlitePool, request: ResetRequest) -> Result<Vec
     .bind(&target_id)
     .bind(mutation_generation)
     .bind(&generation_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(pool)
     .await?
     .ok_or_else(|| anyhow!("fault target is absent from the active generation"))?;
     let prior_terminal_state = format!(
@@ -1547,28 +1839,117 @@ pub async fn reset_fault(pool: &SqlitePool, request: ResetRequest) -> Result<Vec
         target.try_get::<String, _>("instance_state")?,
         target.try_get::<String, _>("instance_type")?
     );
+    let recorded_terminal_state: String = fault.try_get("terminal_state")?;
+    if prior_terminal_state != recorded_terminal_state {
+        bail!("fault target state changed; reset requires the recorded terminal state")
+    }
+    let control_id: String = target.try_get("control_id")?;
+    let scenario = mutation::scenario_for_control(&control_id)?;
     let initial_state: String = target.try_get("initial_state")?;
     let initial_type: String = target.try_get("initial_type")?;
-    sqlx::query(
-        "UPDATE fixture_mutation_resources SET instance_state = ?, instance_type = ?
-         WHERE resource_id = ? AND mutation_generation = ? AND generation_id = ?",
+    let intent_id = begin_mutation_intent(
+        pool,
+        "reset",
+        IntentContext {
+            mutation_generation: Some(mutation_generation),
+            generation_id: Some(&generation_id),
+            fixture_generation: request.authority.generation,
+            target_id: Some(&target_id),
+        },
+        &serde_json::to_value(&request)?,
+        &reset_at,
+    )
+    .await?;
+    mark_intent_dispatched(pool, &intent_id, &now_rfc3339()).await?;
+    let backend =
+        match mutation_backend_for_generation(pool, mutation_generation, &generation_id).await {
+            Ok(backend) => backend,
+            Err(error) => {
+                let _ = update_mutation_intent(
+                    pool,
+                    &intent_id,
+                    "AMBIGUOUS",
+                    Some(&error.to_string()),
+                    &now_rfc3339(),
+                )
+                .await;
+                return Err(error);
+            }
+        };
+    let observed = match backend.reset_setup_fault(&target_id, scenario).await {
+        Ok(observed) => observed,
+        Err(error) => {
+            let _ = update_mutation_intent(
+                pool,
+                &intent_id,
+                "AMBIGUOUS",
+                Some(&error.to_string()),
+                &now_rfc3339(),
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    if observed.instance_state != initial_state || observed.instance_type != initial_type {
+        let error = anyhow!(
+            "public EC2 state after reset was {}:{}, expected {}:{}",
+            observed.instance_state,
+            observed.instance_type,
+            initial_state,
+            initial_type
+        );
+        let _ = update_mutation_intent(
+            pool,
+            &intent_id,
+            "AMBIGUOUS",
+            Some(&error.to_string()),
+            &now_rfc3339(),
+        )
+        .await;
+        return Err(error);
+    }
+    let mut tx = pool.begin().await?;
+    let target_updated = sqlx::query(
+        "UPDATE fixture_mutation_resources SET instance_state = ?, instance_type = ?,
+                external_status = 'RESTORED', external_identity_verified = 1
+         WHERE resource_id = ? AND mutation_generation = ? AND generation_id = ?
+           AND instance_state = ? AND instance_type = ? AND retired_at IS NULL",
     )
     .bind(&initial_state)
     .bind(&initial_type)
     .bind(&target_id)
     .bind(mutation_generation)
     .bind(&generation_id)
+    .bind(target.try_get::<String, _>("instance_state")?)
+    .bind(target.try_get::<String, _>("instance_type")?)
     .execute(&mut *tx)
-    .await?;
-    sqlx::query(
+    .await?
+    .rows_affected();
+    let fault_updated = sqlx::query(
         "UPDATE fixture_faults SET status = 'RESET', reset_at = ?, reset_receipt_id = ?
-         WHERE receipt_id = ? AND status = 'ACTIVE'",
+         WHERE receipt_id = ? AND mutation_generation = ? AND generation_id = ? AND status = 'ACTIVE'",
     )
     .bind(&reset_at)
     .bind(&reset_receipt_id)
     .bind(&fault_receipt_id)
+    .bind(mutation_generation)
+    .bind(&generation_id)
     .execute(&mut *tx)
-    .await?;
+    .await?
+    .rows_affected();
+    if target_updated != 1 || fault_updated != 1 {
+        let error =
+            anyhow!("reset finalization lost the fault or target row to a concurrent operation");
+        let _ = update_mutation_intent(
+            pool,
+            &intent_id,
+            "AMBIGUOUS",
+            Some(&error.to_string()),
+            &now_rfc3339(),
+        )
+        .await;
+        return Err(error);
+    }
     let receipt = json!({
         "schema": "foxtail.release-fixture-reset-receipt/v1",
         "operation": "reset",
@@ -1579,7 +1960,7 @@ pub async fn reset_fault(pool: &SqlitePool, request: ResetRequest) -> Result<Vec
         "manifest_digest": manifest_digest,
         "mutation_generation": mutation_generation,
         "mutation_generation_id": generation_id,
-        "control_id": fault.try_get::<String, _>("control_id")?,
+        "control_id": control_id,
         "target_id": target_id,
         "scope": fault.try_get::<String, _>("scope")?,
         "fault_kind": fault.try_get::<String, _>("fault_kind")?,
@@ -1603,6 +1984,7 @@ pub async fn reset_fault(pool: &SqlitePool, request: ResetRequest) -> Result<Vec
     )
     .await?;
     tx.commit().await?;
+    update_mutation_intent(pool, &intent_id, "SUCCEEDED", None, &now_rfc3339()).await?;
     Ok(receipt_bytes)
 }
 
@@ -1625,6 +2007,35 @@ pub async fn recreate(pool: &SqlitePool, request: RecreateRequest) -> Result<Vec
         .and_then(Value::as_str)
         .map(str::to_string);
     let anchor = request.clock_anchor.clone().or(old_clock_anchor);
+    let predicted_generation: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(value), 0) + 1 FROM (
+            SELECT generation AS value FROM fixture_realizations
+            UNION ALL SELECT fixture_generation AS value FROM fixture_mutation_generations
+        )",
+    )
+    .fetch_one(pool)
+    .await?;
+    let predicted_mutation_generation: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(mutation_generation), 0) + 1 FROM fixture_mutation_generations",
+    )
+    .fetch_one(pool)
+    .await?;
+    let predicted_generation_id = mutation_generation_id(predicted_mutation_generation);
+    let created_at = now_rfc3339();
+    let intent_id = begin_mutation_intent(
+        pool,
+        "recreate",
+        IntentContext {
+            mutation_generation: Some(predicted_mutation_generation),
+            generation_id: Some(&predicted_generation_id),
+            fixture_generation: Some(predicted_generation),
+            target_id: None,
+        },
+        &serde_json::to_value(&request)?,
+        &created_at,
+    )
+    .await?;
+    mark_intent_dispatched(pool, &intent_id, &now_rfc3339()).await?;
     let snapshot = realize(
         pool,
         RealizeRequest {
@@ -1646,16 +2057,78 @@ pub async fn recreate(pool: &SqlitePool, request: RecreateRequest) -> Result<Vec
                 .get("localstack_version")
                 .and_then(Value::as_str)
                 .map(str::to_string),
+            force_new: true,
         },
     )
-    .await?;
+    .await;
+    let snapshot = match snapshot {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let _ = update_mutation_intent(
+                pool,
+                &intent_id,
+                "AMBIGUOUS",
+                Some(&error.to_string()),
+                &now_rfc3339(),
+            )
+            .await;
+            return Err(error);
+        }
+    };
     let new_manifest: Value = serde_json::from_slice(&snapshot.manifest_bytes)?;
     let new_targets = new_manifest
         .get("mutation_resources")
         .cloned()
         .unwrap_or_else(|| json!([]));
+    let new_mutation_generation = new_manifest
+        .get("mutation_generation")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| anyhow!("recreate did not produce an isolated mutation generation"))?;
+    let new_generation_id = new_manifest
+        .get("mutation_generation_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("recreate did not produce a mutation generation id"))?;
+    if new_mutation_generation != predicted_mutation_generation
+        || new_generation_id != predicted_generation_id
+    {
+        let error = anyhow!("concurrent realization changed the mutation generation allocation");
+        let _ = update_mutation_intent(
+            pool,
+            &intent_id,
+            "AMBIGUOUS",
+            Some(&error.to_string()),
+            &now_rfc3339(),
+        )
+        .await;
+        return Err(error);
+    }
+    let old_ids = old_targets
+        .iter()
+        .filter_map(|target| target.get("resource_id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let old_backend =
+        mutation_backend_for_generation(pool, old_mutation_generation, &old_generation_id).await?;
+    if let Err(error) = old_backend.terminate_all(&old_ids).await {
+        sqlx::query(
+            "UPDATE fixture_mutation_generations SET external_status = 'AMBIGUOUS'
+             WHERE mutation_generation = ? AND generation_id = ? AND state = 'ACTIVE'",
+        )
+        .bind(new_mutation_generation)
+        .bind(new_generation_id)
+        .execute(pool)
+        .await?;
+        let _ = update_mutation_intent(
+            pool,
+            &intent_id,
+            "AMBIGUOUS",
+            Some(&error.to_string()),
+            &now_rfc3339(),
+        )
+        .await;
+        return Err(error);
+    }
     let receipt_id = receipt_id("recreate");
-    let created_at = now_rfc3339();
     let receipt = json!({
         "schema": "foxtail.release-fixture-recreate-receipt/v1",
         "operation": "recreate",
@@ -1678,6 +2151,53 @@ pub async fn recreate(pool: &SqlitePool, request: RecreateRequest) -> Result<Vec
     });
     let receipt_bytes = canonical_receipt(receipt)?;
     let mut tx = pool.begin().await?;
+    let old_retired = sqlx::query(
+        "UPDATE fixture_mutation_resources SET retired_at = ?, external_status = 'DESTROYED'
+         WHERE mutation_generation = ? AND generation_id = ? AND retired_at IS NULL",
+    )
+    .bind(&created_at)
+    .bind(old_mutation_generation)
+    .bind(&old_generation_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if old_retired != old_ids.len() as u64 {
+        let error = anyhow!("recreate lost an old mutation target row during retirement");
+        let _ = update_mutation_intent(
+            pool,
+            &intent_id,
+            "AMBIGUOUS",
+            Some(&error.to_string()),
+            &now_rfc3339(),
+        )
+        .await;
+        return Err(error);
+    }
+    for id in &old_ids {
+        sqlx::query("DELETE FROM metrics WHERE resource_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM cost_records WHERE resource_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM resources WHERE id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    sqlx::query(
+        "UPDATE fixture_mutation_generations SET state = 'DESTROYED', external_status = 'DESTROYED',
+                public_absence = ?, destroyed_at = ?
+         WHERE mutation_generation = ? AND generation_id = ? AND state = 'ACTIVE'",
+    )
+    .bind(serde_json::to_string(&json!({"checked_at": created_at, "resource_ids": old_ids, "all_absent": true}))?)
+    .bind(&created_at)
+    .bind(old_mutation_generation)
+    .bind(&old_generation_id)
+    .execute(&mut *tx)
+    .await?;
     persist_receipt(
         &mut tx,
         "recreate",
@@ -1696,6 +2216,7 @@ pub async fn recreate(pool: &SqlitePool, request: RecreateRequest) -> Result<Vec
     )
     .await?;
     tx.commit().await?;
+    update_mutation_intent(pool, &intent_id, "SUCCEEDED", None, &now_rfc3339()).await?;
     Ok(receipt_bytes)
 }
 
@@ -1704,7 +2225,6 @@ pub async fn destroy(pool: &SqlitePool, request: DestroyRequest) -> Result<Vec<u
         validate_mutation_authority(pool, &request.authority).await?;
     let destroyed_at = now_rfc3339();
     let destroy_receipt_id = receipt_id("destroy");
-    let mut tx = pool.begin().await?;
     let target_rows = sqlx::query(
         "SELECT resource_id, control_id, target_kind, instance_state, instance_type,
                 restored_state, restored_type
@@ -1714,7 +2234,7 @@ pub async fn destroy(pool: &SqlitePool, request: DestroyRequest) -> Result<Vec<u
     )
     .bind(mutation_generation)
     .bind(&generation_id)
-    .fetch_all(&mut *tx)
+    .fetch_all(pool)
     .await?;
     let target_records = target_rows
         .iter()
@@ -1749,42 +2269,86 @@ pub async fn destroy(pool: &SqlitePool, request: DestroyRequest) -> Result<Vec<u
     )
     .bind(mutation_generation)
     .bind(&generation_id)
-    .fetch_all(&mut *tx)
+    .fetch_all(pool)
     .await?;
+    let intent_id = begin_mutation_intent(
+        pool,
+        "destroy",
+        IntentContext {
+            mutation_generation: Some(mutation_generation),
+            generation_id: Some(&generation_id),
+            fixture_generation: request.authority.generation,
+            target_id: None,
+        },
+        &serde_json::to_value(&request)?,
+        &destroyed_at,
+    )
+    .await?;
+    mark_intent_dispatched(pool, &intent_id, &now_rfc3339()).await?;
+    let backend =
+        match mutation_backend_for_generation(pool, mutation_generation, &generation_id).await {
+            Ok(backend) => backend,
+            Err(error) => {
+                let _ = update_mutation_intent(
+                    pool,
+                    &intent_id,
+                    "AMBIGUOUS",
+                    Some(&error.to_string()),
+                    &now_rfc3339(),
+                )
+                .await;
+                return Err(error);
+            }
+        };
     let mut reset_receipts = Vec::new();
-    for fault in active_faults {
+    for fault in &active_faults {
         let fault_receipt_id: String = fault.try_get("receipt_id")?;
         let target_id: String = fault.try_get("target_id")?;
         let target = sqlx::query(
-            "SELECT initial_state, initial_type FROM fixture_mutation_resources
+            "SELECT control_id, initial_state, initial_type FROM fixture_mutation_resources
              WHERE resource_id = ? AND mutation_generation = ?",
         )
         .bind(&target_id)
         .bind(mutation_generation)
-        .fetch_one(&mut *tx)
+        .fetch_one(pool)
         .await?;
+        let control_id: String = target.try_get("control_id")?;
         let initial_state: String = target.try_get("initial_state")?;
         let initial_type: String = target.try_get("initial_type")?;
-        sqlx::query(
-            "UPDATE fixture_mutation_resources SET instance_state = ?, instance_type = ?
-             WHERE resource_id = ? AND mutation_generation = ?",
-        )
-        .bind(&initial_state)
-        .bind(&initial_type)
-        .bind(&target_id)
-        .bind(mutation_generation)
-        .execute(&mut *tx)
-        .await?;
+        let scenario = mutation::scenario_for_control(&control_id)?;
+        let observed = match backend.reset_setup_fault(&target_id, scenario).await {
+            Ok(observed) => observed,
+            Err(error) => {
+                let _ = update_mutation_intent(
+                    pool,
+                    &intent_id,
+                    "AMBIGUOUS",
+                    Some(&error.to_string()),
+                    &now_rfc3339(),
+                )
+                .await;
+                return Err(error);
+            }
+        };
+        if observed.instance_state != initial_state || observed.instance_type != initial_type {
+            let error = anyhow!(
+                "public EC2 state after destroy reset was {}:{}, expected {}:{}",
+                observed.instance_state,
+                observed.instance_type,
+                initial_state,
+                initial_type
+            );
+            let _ = update_mutation_intent(
+                pool,
+                &intent_id,
+                "AMBIGUOUS",
+                Some(&error.to_string()),
+                &now_rfc3339(),
+            )
+            .await;
+            return Err(error);
+        }
         let reset_id = receipt_id("reset");
-        sqlx::query(
-            "UPDATE fixture_faults SET status = 'RESET', reset_at = ?, reset_receipt_id = ?
-             WHERE receipt_id = ? AND status = 'ACTIVE'",
-        )
-        .bind(&destroyed_at)
-        .bind(&reset_id)
-        .bind(&fault_receipt_id)
-        .execute(&mut *tx)
-        .await?;
         let reset_receipt = json!({
             "schema": "foxtail.release-fixture-reset-receipt/v1",
             "operation": "reset",
@@ -1796,7 +2360,7 @@ pub async fn destroy(pool: &SqlitePool, request: DestroyRequest) -> Result<Vec<u
             "mutation_generation": mutation_generation,
             "mutation_generation_id": generation_id,
             "target_id": target_id,
-            "control_id": fault.try_get::<String, _>("control_id")?,
+            "control_id": control_id,
             "scope": fault.try_get::<String, _>("scope")?,
             "fault_kind": fault.try_get::<String, _>("fault_kind")?,
             "applied_at": fault.try_get::<String, _>("applied_at")?,
@@ -1805,13 +2369,89 @@ pub async fn destroy(pool: &SqlitePool, request: DestroyRequest) -> Result<Vec<u
             "reset_at": destroyed_at,
             "reset_token_consumed": true
         });
+        reset_receipts.push(reset_receipt);
+    }
+    if let Err(error) = backend.terminate_all(&target_ids).await {
+        let _ = update_mutation_intent(
+            pool,
+            &intent_id,
+            "AMBIGUOUS",
+            Some(&error.to_string()),
+            &now_rfc3339(),
+        )
+        .await;
+        return Err(error);
+    }
+    for target_id in &target_ids {
+        if !backend.verify_absent(target_id).await? {
+            let error = anyhow!("public EC2 still returns retired identity {target_id}");
+            let _ = update_mutation_intent(
+                pool,
+                &intent_id,
+                "AMBIGUOUS",
+                Some(&error.to_string()),
+                &now_rfc3339(),
+            )
+            .await;
+            return Err(error);
+        }
+    }
+    let mut tx = pool.begin().await?;
+    for fault in &active_faults {
+        let fault_receipt_id: String = fault.try_get("receipt_id")?;
+        let reset_id = reset_receipts
+            .iter()
+            .find(|receipt| receipt["fault_receipt_id"].as_str() == Some(fault_receipt_id.as_str()))
+            .and_then(|receipt| receipt["receipt_id"].as_str())
+            .ok_or_else(|| anyhow!("destroy reset receipt id is missing"))?;
+        let target_id: String = fault.try_get("target_id")?;
+        let target_updated = sqlx::query(
+            "UPDATE fixture_mutation_resources SET instance_state = initial_state,
+                    instance_type = initial_type, external_status = 'RESTORED',
+                    external_identity_verified = 1
+             WHERE resource_id = ? AND mutation_generation = ? AND generation_id = ?
+               AND retired_at IS NULL",
+        )
+        .bind(&target_id)
+        .bind(mutation_generation)
+        .bind(&generation_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        let fault_updated = sqlx::query(
+            "UPDATE fixture_faults SET status = 'RESET', reset_at = ?, reset_receipt_id = ?
+             WHERE receipt_id = ? AND mutation_generation = ? AND generation_id = ? AND status = 'ACTIVE'",
+        )
+        .bind(&destroyed_at)
+        .bind(reset_id)
+        .bind(&fault_receipt_id)
+        .bind(mutation_generation)
+        .bind(&generation_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if target_updated != 1 || fault_updated != 1 {
+            let error =
+                anyhow!("destroy lost an active fault or target row during reset finalization");
+            let _ = update_mutation_intent(
+                pool,
+                &intent_id,
+                "AMBIGUOUS",
+                Some(&error.to_string()),
+                &now_rfc3339(),
+            )
+            .await;
+            return Err(error);
+        }
+        let reset_receipt = reset_receipts
+            .iter()
+            .find(|receipt| receipt["receipt_id"].as_str() == Some(reset_id))
+            .ok_or_else(|| anyhow!("destroy reset receipt is missing"))?;
         let reset_bytes = canonical_receipt(reset_receipt.clone())?;
         persist_receipt(
             &mut tx,
             "reset",
-            reset_receipt["receipt_id"]
-                .as_str()
-                .ok_or_else(|| anyhow!("destroy reset receipt id is missing"))?,
+            reset_id,
             ReceiptContext {
                 mutation_generation: Some(mutation_generation),
                 generation_id: Some(&generation_id),
@@ -1821,7 +2461,6 @@ pub async fn destroy(pool: &SqlitePool, request: DestroyRequest) -> Result<Vec<u
             &destroyed_at,
         )
         .await?;
-        reset_receipts.push(reset_receipt);
     }
     for id in &target_ids {
         sqlx::query("DELETE FROM metrics WHERE resource_id = ?")
@@ -1838,14 +2477,16 @@ pub async fn destroy(pool: &SqlitePool, request: DestroyRequest) -> Result<Vec<u
             .await?;
     }
     sqlx::query(
-        "UPDATE fixture_mutation_resources SET retired_at = ?
+        "UPDATE fixture_mutation_resources SET retired_at = ?, external_status = 'DESTROYED',
+                external_identity_verified = 1
          WHERE mutation_generation = ? AND generation_id = ? AND retired_at IS NULL",
     )
     .bind(&destroyed_at)
     .bind(mutation_generation)
     .bind(&generation_id)
     .execute(&mut *tx)
-    .await?;
+    .await?
+    .rows_affected();
     let absent_count: i64 = if target_ids.is_empty() {
         0
     } else {
@@ -1860,8 +2501,9 @@ pub async fn destroy(pool: &SqlitePool, request: DestroyRequest) -> Result<Vec<u
         bail!("destroy could not prove all mutation identities absent")
     }
     sqlx::query(
-        "UPDATE fixture_mutation_generations SET state = 'DESTROYED', public_absence = ?, destroyed_at = ?
-         WHERE mutation_generation = ? AND generation_id = ?",
+        "UPDATE fixture_mutation_generations SET state = 'DESTROYED', external_status = 'DESTROYED',
+                public_absence = ?, destroyed_at = ?
+         WHERE mutation_generation = ? AND generation_id = ? AND state = 'ACTIVE'",
     )
     .bind(serde_json::to_string(&json!({
         "checked_at": destroyed_at,
@@ -1905,10 +2547,16 @@ pub async fn destroy(pool: &SqlitePool, request: DestroyRequest) -> Result<Vec<u
         &destroyed_at,
     )
     .await?;
-    sqlx::query("DELETE FROM fixture_realizations WHERE singleton_id = 1")
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(
+        "DELETE FROM fixture_realizations
+         WHERE singleton_id = 1 AND mutation_generation = ? AND mutation_generation_id = ?",
+    )
+    .bind(mutation_generation)
+    .bind(&generation_id)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
+    update_mutation_intent(pool, &intent_id, "SUCCEEDED", None, &now_rfc3339()).await?;
     Ok(receipt_bytes)
 }
 
@@ -2011,8 +2659,8 @@ struct ManifestContext<'a> {
     generation: i64,
     read_only_fingerprint: &'a str,
     complete_fingerprint: &'a str,
-    mutation_generation: i64,
-    mutation_generation_id: &'a str,
+    mutation_generation: Option<i64>,
+    mutation_generation_id: Option<&'a str>,
     mutation_targets: &'a [Value],
 }
 
@@ -2370,9 +3018,12 @@ fn build_manifest(context: ManifestContext<'_>) -> Result<Value> {
             "role": role,
             "service": "ec2",
             "scenario": scenario_intent,
-            "realization_status": "realized",
+            "realization_status": if target.is_some() { "realized" } else { "declared-only" },
             "target_kind": MUTATION_TARGET_KINDS[index],
-            "realization": target.cloned().unwrap_or_else(|| json!({"lifecycle": "deferred"}))
+            "realization": target.cloned().unwrap_or_else(|| json!({
+                "lifecycle": "qualification-only",
+                "mutation_controls_declared": true
+            }))
         }));
     }
     control_catalogue.sort_by(|left, right| {
@@ -2430,8 +3081,10 @@ fn role_and_intent(control_id: &str) -> (&'static str, &'static str) {
         "ec2-resize-negative-001" => ("negative", "ec2.resize.no-compatible-recommendation"),
         "ec2-mutation-stop-001" => ("mutation", "ec2.mutation.disposable-stop"),
         "ec2-mutation-resize-001" => ("mutation", "ec2.mutation.disposable-resize"),
-        "ec2-mutation-recovery-001" => ("mutation", "ec2.mutation.disposable-recovery"),
-        "ec2-mutation-restoration-001" => ("mutation", "ec2.mutation.disposable-restoration"),
+        "ec2-mutation-stop-recovery-001" => ("mutation", "ec2.mutation.disposable-stop-recovery"),
+        "ec2-mutation-resize-restoration-001" => {
+            ("mutation", "ec2.mutation.disposable-resize-restoration")
+        }
         _ => ("degraded", "ec2.unknown"),
     }
 }
@@ -2580,6 +3233,125 @@ pub fn parse_json_request(body: &[u8]) -> Result<RealizeRequest> {
 
 pub fn cli_bytes_to_string(bytes: &[u8]) -> Result<String> {
     String::from_utf8(bytes.to_vec()).context("fixture document is not UTF-8")
+}
+
+/// Execute one native fixture CLI subcommand and return the exact canonical
+/// document that the binary prints. Keeping this dispatch next to the
+/// lifecycle boundary lets the HTTP handlers and CLI integration tests prove
+/// the same operation contract without spawning a second process or bypassing
+/// the public mutation adapter.
+pub async fn execute_fixture_cli_command(
+    pool: &SqlitePool,
+    command: crate::cli::FixtureCommands,
+) -> Result<Vec<u8>> {
+    use crate::cli::FixtureCommands;
+
+    let bytes = match command {
+        FixtureCommands::Definition { version } => {
+            validate_version(Some(&version))?;
+            canonical_definition()?.0
+        }
+        FixtureCommands::Realize {
+            version,
+            clock_anchor,
+            account_id,
+            region,
+            endpoint_url,
+            localstack_version,
+        } => realization_response(
+            &realize(
+                pool,
+                RealizeRequest {
+                    version: Some(version),
+                    clock_anchor,
+                    account_id,
+                    region,
+                    endpoint_url,
+                    localstack_version,
+                    force_new: false,
+                },
+            )
+            .await?,
+        )?,
+        FixtureCommands::Status => read_state(pool).await?.status_bytes,
+        FixtureCommands::Manifest => read_state(pool)
+            .await?
+            .manifest_bytes
+            .ok_or_else(|| anyhow!("fixture has not been realized"))?,
+        FixtureCommands::Identities => read_state(pool).await?.identities_bytes,
+        FixtureCommands::MutationStatus => mutation_status(pool).await?,
+        FixtureCommands::Fault {
+            authority,
+            control_id,
+            target_id,
+            scope,
+            fault_kind,
+            application_time,
+        } => {
+            apply_fault(
+                pool,
+                FaultRequest {
+                    authority: mutation_authority_from_cli(authority),
+                    control_id,
+                    target_id,
+                    scope,
+                    fault_kind,
+                    application_time,
+                },
+            )
+            .await?
+        }
+        FixtureCommands::Reset {
+            authority,
+            receipt_id,
+            reset_token,
+        } => {
+            reset_fault(
+                pool,
+                ResetRequest {
+                    authority: mutation_authority_from_cli(authority),
+                    receipt_id,
+                    reset_token,
+                },
+            )
+            .await?
+        }
+        FixtureCommands::Recreate {
+            authority,
+            clock_anchor,
+        } => {
+            recreate(
+                pool,
+                RecreateRequest {
+                    authority: mutation_authority_from_cli(authority),
+                    clock_anchor,
+                },
+            )
+            .await?
+        }
+        FixtureCommands::Destroy { authority } => {
+            destroy(
+                pool,
+                DestroyRequest {
+                    authority: mutation_authority_from_cli(authority),
+                },
+            )
+            .await?
+        }
+    };
+    Ok(bytes)
+}
+
+fn mutation_authority_from_cli(
+    args: crate::cli::FixtureMutationAuthorityArgs,
+) -> MutationAuthority {
+    MutationAuthority {
+        version: Some(args.version),
+        generation: Some(args.generation),
+        manifest_digest: Some(args.manifest_digest),
+        mutation_generation: Some(args.mutation_generation),
+        mutation_generation_id: Some(args.mutation_generation_id),
+    }
 }
 
 #[cfg(test)]
@@ -2847,115 +3619,105 @@ mod tests {
 
     #[tokio::test]
     async fn mutation_lifecycle_uses_four_disposable_targets_and_proves_recreation_and_destroy() {
-        unsafe { std::env::set_var(ISOLATED_QUALIFICATION_ENV, ISOLATED_QUALIFICATION_VALUE) };
-        let path = std::env::temp_dir().join(format!(
-            "foxtail-mutation-lifecycle-{}.db",
-            uuid::Uuid::new_v4()
-        ));
-        let pool = crate::db::init(&format!("sqlite:{}", path.display()))
-            .await
-            .unwrap();
-        for index in 0..5 {
-            sqlx::query(
-                "INSERT INTO resources (id, resource_type, region, scenario, tags)
+        with_isolated_qualification(async {
+            let path = std::env::temp_dir().join(format!(
+                "foxtail-mutation-lifecycle-{}.db",
+                uuid::Uuid::new_v4()
+            ));
+            let pool = crate::db::init(&format!("sqlite:{}", path.display()))
+                .await
+                .unwrap();
+            for index in 0..5 {
+                sqlx::query(
+                    "INSERT INTO resources (id, resource_type, region, scenario, tags)
                  VALUES (?, 'ec2', 'us-east-1', 'Baseline', '{}')",
+                )
+                .bind(format!("i-mutation-source-{index}"))
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            let first = realize(
+                &pool,
+                RealizeRequest {
+                    clock_anchor: Some("2026-08-05T00:00:00Z".to_string()),
+                    endpoint_url: Some(format!("mock://{}", uuid::Uuid::new_v4())),
+                    ..RealizeRequest::default()
+                },
             )
-            .bind(format!("i-mutation-source-{index}"))
-            .execute(&pool)
             .await
             .unwrap();
-        }
-        let first = realize(
-            &pool,
-            RealizeRequest {
-                clock_anchor: Some("2026-08-05T00:00:00Z".to_string()),
-                ..RealizeRequest::default()
-            },
-        )
-        .await
-        .unwrap();
-        let first_manifest: Value = serde_json::from_slice(&first.manifest_bytes).unwrap();
-        let first_targets = first_manifest["mutation_resources"]
-            .as_array()
-            .unwrap()
-            .clone();
-        assert_eq!(first_targets.len(), 4);
-        assert_eq!(
-            first_targets
-                .iter()
-                .filter_map(|target| target["resource_id"].as_str())
-                .collect::<BTreeSet<_>>()
-                .len(),
-            4
-        );
-        assert!(first_targets.iter().all(|target| {
-            !first_manifest["resources"]
+            let first_manifest: Value = serde_json::from_slice(&first.manifest_bytes).unwrap();
+            let first_targets = first_manifest["mutation_resources"]
                 .as_array()
                 .unwrap()
-                .iter()
-                .any(|read_only| read_only["resource_id"] == target["resource_id"])
-        }));
-
-        let authority = MutationAuthority {
-            version: Some(FIXTURE_VERSION.to_string()),
-            generation: Some(first.generation),
-            manifest_digest: Some(first.manifest_digest.clone()),
-            mutation_generation: Some(first_manifest["mutation_generation"].as_i64().unwrap()),
-            mutation_generation_id: Some(
-                first_manifest["mutation_generation_id"]
-                    .as_str()
+                .clone();
+            assert_eq!(first_targets.len(), 4);
+            assert_eq!(
+                first_targets
+                    .iter()
+                    .filter_map(|target| target["resource_id"].as_str())
+                    .collect::<BTreeSet<_>>()
+                    .len(),
+                4
+            );
+            assert!(first_targets.iter().all(|target| {
+                !first_manifest["resources"]
+                    .as_array()
                     .unwrap()
-                    .to_string(),
-            ),
-        };
-        let stop = first_targets
-            .iter()
-            .find(|target| target["target_kind"] == "stop")
+                    .iter()
+                    .any(|read_only| read_only["resource_id"] == target["resource_id"])
+            }));
+
+            let authority = MutationAuthority {
+                version: Some(FIXTURE_VERSION.to_string()),
+                generation: Some(first.generation),
+                manifest_digest: Some(first.manifest_digest.clone()),
+                mutation_generation: Some(first_manifest["mutation_generation"].as_i64().unwrap()),
+                mutation_generation_id: Some(
+                    first_manifest["mutation_generation_id"]
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                ),
+            };
+            let stop = first_targets
+                .iter()
+                .find(|target| target["target_kind"] == "stop")
+                .unwrap();
+            let fault: Value = serde_json::from_slice(
+                &apply_fault(
+                    &pool,
+                    FaultRequest {
+                        authority: authority.clone(),
+                        control_id: stop["control_id"].as_str().unwrap().to_string(),
+                        target_id: stop["resource_id"].as_str().unwrap().to_string(),
+                        scope: "target".to_string(),
+                        fault_kind: "stop".to_string(),
+                        application_time: Some("2026-08-05T00:00:00Z".to_string()),
+                    },
+                )
+                .await
+                .unwrap(),
+            )
             .unwrap();
-        let fault: Value = serde_json::from_slice(
-            &apply_fault(
-                &pool,
-                FaultRequest {
-                    authority: authority.clone(),
-                    control_id: stop["control_id"].as_str().unwrap().to_string(),
-                    target_id: stop["resource_id"].as_str().unwrap().to_string(),
-                    scope: "target".to_string(),
-                    fault_kind: "stop".to_string(),
-                    application_time: Some("2026-08-05T00:00:00Z".to_string()),
-                },
-            )
-            .await
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(fault["manifest_digest"], first.manifest_digest);
-        assert_eq!(fault["reset_token_use"], "one-use");
-        assert!(
-            apply_fault(
-                &pool,
-                FaultRequest {
-                    authority: authority.clone(),
-                    control_id: stop["control_id"].as_str().unwrap().to_string(),
-                    target_id: stop["resource_id"].as_str().unwrap().to_string(),
-                    scope: "target".to_string(),
-                    fault_kind: "stop".to_string(),
-                    application_time: None,
-                },
-            )
-            .await
-            .is_err()
-        );
-        reset_fault(
-            &pool,
-            ResetRequest {
-                authority: authority.clone(),
-                receipt_id: fault["receipt_id"].as_str().unwrap().to_string(),
-                reset_token: fault["reset_token"].as_str().unwrap().to_string(),
-            },
-        )
-        .await
-        .unwrap();
-        assert!(
+            assert_eq!(fault["manifest_digest"], first.manifest_digest);
+            assert_eq!(fault["reset_token_use"], "one-use");
+            assert!(
+                apply_fault(
+                    &pool,
+                    FaultRequest {
+                        authority: authority.clone(),
+                        control_id: stop["control_id"].as_str().unwrap().to_string(),
+                        target_id: stop["resource_id"].as_str().unwrap().to_string(),
+                        scope: "target".to_string(),
+                        fault_kind: "stop".to_string(),
+                        application_time: None,
+                    },
+                )
+                .await
+                .is_err()
+            );
             reset_fault(
                 &pool,
                 ResetRequest {
@@ -2965,118 +3727,131 @@ mod tests {
                 },
             )
             .await
-            .is_err()
-        );
-
-        let recreate_receipt: Value = serde_json::from_slice(
-            &recreate(
-                &pool,
-                RecreateRequest {
-                    authority: authority.clone(),
-                    clock_anchor: Some("2026-08-05T00:00:00Z".to_string()),
-                },
-            )
-            .await
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(recreate_receipt["status"], "RECREATED");
-        let second = read_state(&pool).await.unwrap();
-        let second_manifest: Value =
-            serde_json::from_slice(second.manifest_bytes.as_ref().unwrap()).unwrap();
-        assert_ne!(
-            first_manifest["mutation_generation_id"],
-            second_manifest["mutation_generation_id"]
-        );
-        assert_ne!(
-            first_manifest["mutation_resources"],
-            second_manifest["mutation_resources"]
-        );
-        assert_ne!(
-            first.manifest_digest,
-            second.manifest_digest.as_deref().unwrap()
-        );
-        assert_eq!(
-            first_manifest["environment"]["read_only_estate_fingerprint"],
-            second_manifest["environment"]["read_only_estate_fingerprint"]
-        );
-
-        let second_authority = MutationAuthority {
-            version: Some(FIXTURE_VERSION.to_string()),
-            generation: second.generation,
-            manifest_digest: second.manifest_digest.clone(),
-            mutation_generation: Some(second_manifest["mutation_generation"].as_i64().unwrap()),
-            mutation_generation_id: Some(
-                second_manifest["mutation_generation_id"]
-                    .as_str()
-                    .unwrap()
-                    .to_string(),
-            ),
-        };
-        let second_stop = second_manifest["mutation_resources"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|target| target["target_kind"] == "stop")
             .unwrap();
-        apply_fault(
-            &pool,
-            FaultRequest {
-                authority: second_authority.clone(),
-                control_id: second_stop["control_id"].as_str().unwrap().to_string(),
-                target_id: second_stop["resource_id"].as_str().unwrap().to_string(),
-                scope: "target".to_string(),
-                fault_kind: "stop".to_string(),
-                application_time: Some("2026-08-05T00:00:00Z".to_string()),
-            },
-        )
-        .await
-        .unwrap();
-        let destroy_receipt: Value = serde_json::from_slice(
-            &destroy(
+            assert!(
+                reset_fault(
+                    &pool,
+                    ResetRequest {
+                        authority: authority.clone(),
+                        receipt_id: fault["receipt_id"].as_str().unwrap().to_string(),
+                        reset_token: fault["reset_token"].as_str().unwrap().to_string(),
+                    },
+                )
+                .await
+                .is_err()
+            );
+
+            let recreate_receipt: Value = serde_json::from_slice(
+                &recreate(
+                    &pool,
+                    RecreateRequest {
+                        authority: authority.clone(),
+                        clock_anchor: Some("2026-08-05T00:00:00Z".to_string()),
+                    },
+                )
+                .await
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(recreate_receipt["status"], "RECREATED");
+            let second = read_state(&pool).await.unwrap();
+            let second_manifest: Value =
+                serde_json::from_slice(second.manifest_bytes.as_ref().unwrap()).unwrap();
+            assert_ne!(
+                first_manifest["mutation_generation_id"],
+                second_manifest["mutation_generation_id"]
+            );
+            assert_ne!(
+                first_manifest["mutation_resources"],
+                second_manifest["mutation_resources"]
+            );
+            assert_ne!(
+                first.manifest_digest,
+                second.manifest_digest.as_deref().unwrap()
+            );
+            assert_eq!(
+                first_manifest["environment"]["read_only_estate_fingerprint"],
+                second_manifest["environment"]["read_only_estate_fingerprint"]
+            );
+
+            let second_authority = MutationAuthority {
+                version: Some(FIXTURE_VERSION.to_string()),
+                generation: second.generation,
+                manifest_digest: second.manifest_digest.clone(),
+                mutation_generation: Some(second_manifest["mutation_generation"].as_i64().unwrap()),
+                mutation_generation_id: Some(
+                    second_manifest["mutation_generation_id"]
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                ),
+            };
+            let second_stop = second_manifest["mutation_resources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|target| target["target_kind"] == "stop")
+                .unwrap();
+            apply_fault(
                 &pool,
-                DestroyRequest {
-                    authority: second_authority,
+                FaultRequest {
+                    authority: second_authority.clone(),
+                    control_id: second_stop["control_id"].as_str().unwrap().to_string(),
+                    target_id: second_stop["resource_id"].as_str().unwrap().to_string(),
+                    scope: "target".to_string(),
+                    fault_kind: "stop".to_string(),
+                    application_time: Some("2026-08-05T00:00:00Z".to_string()),
                 },
             )
             .await
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(destroy_receipt["status"], "DESTROYED");
-        assert_eq!(
-            destroy_receipt["public_inventory_absence"]["all_absent"],
-            true
-        );
-        assert_eq!(destroy_receipt["faults_reset"][0]["status"], "RESET");
-        let reset_receipts: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM fixture_operation_receipts WHERE operation = 'reset'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(reset_receipts, 2);
-        let mutation_rows: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM resources WHERE id LIKE 'i-foxtail-mutation-%'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(mutation_rows, 0);
-        assert_eq!(read_state(&pool).await.unwrap().status, "ABSENT");
-        let next = realize(
-            &pool,
-            RealizeRequest {
-                clock_anchor: Some("2026-08-05T00:00:00Z".to_string()),
-                ..RealizeRequest::default()
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(next.generation, 3);
-        assert_ne!(next.manifest_digest, first.manifest_digest);
-        unsafe { std::env::remove_var(ISOLATED_QUALIFICATION_ENV) };
-        pool.close().await;
+            .unwrap();
+            let destroy_receipt: Value = serde_json::from_slice(
+                &destroy(
+                    &pool,
+                    DestroyRequest {
+                        authority: second_authority,
+                    },
+                )
+                .await
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(destroy_receipt["status"], "DESTROYED");
+            assert_eq!(
+                destroy_receipt["public_inventory_absence"]["all_absent"],
+                true
+            );
+            assert_eq!(destroy_receipt["faults_reset"][0]["status"], "RESET");
+            let reset_receipts: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM fixture_operation_receipts WHERE operation = 'reset'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(reset_receipts, 2);
+            let mutation_rows: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM resources WHERE id LIKE 'i-foxtail-mutation-%'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(mutation_rows, 0);
+            assert_eq!(read_state(&pool).await.unwrap().status, "ABSENT");
+            let next = realize(
+                &pool,
+                RealizeRequest {
+                    clock_anchor: Some("2026-08-05T00:00:00Z".to_string()),
+                    endpoint_url: Some(format!("mock://{}", uuid::Uuid::new_v4())),
+                    ..RealizeRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(next.generation, 3);
+            assert_ne!(next.manifest_digest, first.manifest_digest);
+            pool.close().await;
+        })
+        .await;
     }
 
     #[test]

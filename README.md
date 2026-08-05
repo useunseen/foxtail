@@ -169,13 +169,23 @@ curl -X POST http://127.0.0.1:8080/_mock/fixture/realize \
 ~~~~
 
 The manifest binds the definition digest, generator and LocalStack provenance,
-clock anchor, AWS account/region scope, realized read-only identities, four
-fresh generation-owned mutation identities (stop, resize, recovery, and
-restoration), and public evidence declarations. The ordinary AWS-compatible
-inventory, CloudWatch, Cost Explorer, and Compute Optimizer routes remain the
-authoritative evidence surfaces. The default public account scope is
-`123456789012`; an explicit fixture `account_id` must match it so manifest ARNs
-and public identities cannot diverge.
+clock anchor, AWS account/region scope, realized read-only identities, and (in
+isolated mode only) four fresh generation-owned EC2 identities: `stop`,
+`resize`, `stop-recovery`, and `resize-restoration`. The ordinary
+AWS-compatible inventory, CloudWatch, Cost Explorer, and Compute Optimizer
+routes remain the authoritative evidence surfaces. The default public account
+scope is `123456789012`; an explicit fixture `account_id` must match it so
+manifest ARNs and public identities cannot diverge.
+
+Without the exact `FOXTAIL_QUALIFICATION_ENV=isolated` value, `fixture realize`
+keeps those mutation controls declared-only and does not call EC2 or write a
+mutation generation. In isolated mode, Foxtail uses the `AWS_ENDPOINT_URL` (or
+the request's `endpoint_url`) to call EC2 `RunInstances`, `StopInstances`,
+`ModifyInstanceAttribute`, `StartInstances`, `DescribeInstances`, and
+`TerminateInstances`. Set `FOXTAIL_MUTATION_AMI_ID` (and, when required by the
+endpoint, `FOXTAIL_MUTATION_SUBNET_ID` and `FOXTAIL_MUTATION_SECURITY_GROUP_ID`)
+to values valid for that LocalStack account. A generation is not considered
+complete until its returned public IDs, states, and instance types reconcile.
 
 Mutation controls are qualification-only. Set `FOXTAIL_QUALIFICATION_ENV=isolated`
 in the disposable process, and send `x-mock-admin-token` when
@@ -200,6 +210,12 @@ target/debug/foxtail fixture fault \
   --target-id i-foxtail-mutation-g0001-stop \
   --scope target --fault-kind stop
 ```
+
+The target ID in a live generation is the ID returned by EC2 and copied from
+the current manifest; the example ID is only the deterministic `mock://` test
+backend form. After `fault` or `reset`, verify the state/type with public EC2
+`DescribeInstances`; after `destroy`, verify every retired ID is absent from
+both `DescribeInstances` and Resource Groups Tagging.
 
 ## Supported AWS-Compatible Commands
 

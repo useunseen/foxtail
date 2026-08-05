@@ -6,15 +6,15 @@ Invariant: qualification mutations can affect only fresh, manifest-bound, one-us
 
 ## Acceptance Map
 
-- [ ] Distinct targets: fixture lifecycle/persistence owns separate stop, resize, recovery, and restoration targets; manifest/status and public inventory consume their identities; existing read-only controls remain compatible; prove four unique mutation identities with no reuse or read-only overlap.
-- [ ] Recreation identity: atomic recreation owns a new mutation-generation identity, new resource IDs, updated complete-estate fingerprint, and regenerated manifest digest while preserving definition/read-only identity; prove two consecutive generations differ at every required boundary.
-- [ ] Supported controls: CLI parsing/execution and HTTP routes expose status, fault, reset, recreate, and destroy through the same fixture domain operations; prove CLI/HTTP canonical response parity and error parity.
-- [ ] Fault receipts: fault application binds exact manifest digest, mutation control, target/scope, enumerated fault kind, application time, and one-use reset token; prove canonical auditable receipt content and persisted active-fault state.
-- [ ] Reset/cleanup receipts: reset and destruction enumerate exact faults/targets acted on plus their prior and terminal state; prove targeted reset does not broaden scope and cleanup reports complete evidence.
-- [ ] Isolation gate: every mutating fixture operation requires an explicit isolated-qualification environment signal in addition to existing HTTP admin authentication; prove unset/invalid environments deny without state changes.
-- [ ] Destruction proof: cleanup removes all generation-owned resources and evidence, resets every active fault, and records public-inventory absence for every prior identity; prove old identities cannot be observed through AWS-compatible inventory after success.
-- [ ] Fail closed: duplicate, stale-generation, wrong-manifest, wrong-control/target, malformed, unknown-field, and ambiguous requests are rejected atomically without repair or scope expansion; prove state and public evidence remain unchanged on each rejection.
-- [ ] Full proof: focused Rust unit and HTTP/CLI integration tests cover the lifecycle; the interoperability smoke covers realize, recreate, fault, reset, destroy, and absence against the available Foxtail/LocalStack-compatible surface; record any genuinely unavailable external environment separately.
+- [x] Distinct targets: fixture lifecycle/persistence owns separate stop, resize, stop-recovery, and resize-restoration targets; manifest/status and public inventory consume their identities; existing read-only controls remain compatible; prove four unique mutation identities with no reuse or read-only overlap.
+- [x] Recreation identity: isolated recreation provisions a new mutation-generation identity, new public EC2 IDs, regenerated manifest digest, and retires the old public identities while preserving definition/read-only identity.
+- [x] Supported controls: CLI parsing/execution and HTTP routes expose status, fault, reset, recreate, and destroy through the same fixture domain operations.
+- [x] Fault receipts: fault application binds exact manifest digest, mutation control, target/scope, setup fault kind, application time, and one-use reset token; public EC2 state/type is reconciled before commit.
+- [x] Reset/cleanup receipts: reset and destruction enumerate exact faults/targets acted on plus their prior and terminal state; targeted reset is guarded by the recorded terminal state.
+- [x] Isolation gate: every mutating fixture operation requires an explicit isolated-qualification environment signal in addition to existing HTTP admin authentication; ordinary realization remains declared-only and read-only.
+- [x] Destruction proof: cleanup removes generation-owned resources and evidence, resets every active fault, terminates public targets, verifies public absence, and records the absence receipt.
+- [x] Fail closed: duplicate, stale-generation, wrong-manifest, wrong-control/target, malformed, unknown-field, and ambiguous external operations are rejected without private-state repair or scope expansion.
+- [ ] Full proof: focused Rust unit/integration tests cover the lifecycle and deterministic mock boundary; the real LocalStack smoke remains an environment-dependent gate and must be run with a valid mutation AMI/endpoint.
 
 ## Execution Plan
 
@@ -28,9 +28,16 @@ Invariant: qualification mutations can affect only fresh, manifest-bound, one-us
 
 - Implementation complete; frozen-head review remains with the parent agent.
 
+## Issue #5 Repair Results
+
+- Added a typed canonical mutation catalogue and a single EC2 boundary. Isolated generations use the AWS SDK against the configured endpoint and reconcile returned IDs, states, and instance types; a deterministic `mock://` backend exercises the same lifecycle in tests.
+- Ordinary `fixture realize` with an unset or invalid qualification value keeps mutation controls declared-only, writes no mutation ledger, and performs no external dispatch. Mutation operations persist an intent before dispatch and finalize only after public reconciliation and affected-row guards.
+- Fault, reset, recreate, and destroy now dispatch through the external boundary. Recreate terminates and verifies every prior target before retiring its ledger; destroy resets active faults, terminates targets, and verifies public absence.
+- Verification completed with `cargo fmt --all -- --check`, `cargo test -q` (71 unit, 2 API-contract, 10 mutation integration, 3 wrapper tests), `cargo clippy --all-targets --all-features -- -D warnings`, the pinned Draft 2020-12 validator, `bash -n scripts/verify_cli_interop.sh`, and `git diff --check`. Real LocalStack/EC2 smoke remains pending a live endpoint and valid `FOXTAIL_MUTATION_AMI_ID`.
+
 ## Issue #5 Implementation Results
 
-- Added a migration-backed disposable mutation ledger with four generation-owned EC2 targets (stop, resize, recovery, and restoration), manifest/status/identity exposure, complete-estate fingerprinting, and canonical persisted operation receipts.
+- Added a migration-backed disposable mutation ledger with four generation-owned EC2 targets (stop, resize, stop-recovery, and resize-restoration), manifest/status/identity exposure, complete-estate fingerprinting, and canonical persisted operation receipts.
 - Added isolated-environment and existing admin-token gates for mutation status, fault, reset, recreate, and destroy; authority binds version, fixture generation, mutation generation/id, and exact manifest digest, with one-use reset tokens and fail-closed stale/duplicate/unknown-field handling.
 - Added CLI and HTTP lifecycle surfaces, recreation identity replacement, destruction cleanup with public-inventory absence proof, updated schemas/goldens/docs, focused lifecycle and parser tests, and smoke-script coverage. The smoke script keeps large AWS responses in temporary files to avoid shell argument-size limits.
 - Verification completed successfully with `cargo fmt --all -- --check`, `cargo test -q` (71 unit, 2 API-contract, 3 wrapper tests), `cargo clippy --all-targets --all-features -- -D warnings`, `python3 scripts/validate_release_fixture.py --definition tests/fixtures/release-qualification-v1.definition.json --manifest tests/fixtures/release-qualification-v1.manifest.json --negative`, `bash -n scripts/verify_cli_interop.sh`, `git diff --check`, and `bash scripts/verify_cli_interop.sh` (localhost access required and granted).

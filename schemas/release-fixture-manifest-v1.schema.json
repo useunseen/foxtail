@@ -75,8 +75,8 @@
       "additionalProperties": false
     },
     "generation": {"type": "integer", "minimum": 1},
-    "mutation_generation": {"type": "integer", "minimum": 1},
-    "mutation_generation_id": {"type": "string", "pattern": "^mg-[0-9]{4,}$"},
+    "mutation_generation": {"type": ["integer", "null"], "minimum": 0},
+    "mutation_generation_id": {"type": ["string", "null"], "pattern": "^mg-[0-9]{4,}$"},
     "resources": {
       "type": "array",
       "minItems": 5,
@@ -131,7 +131,7 @@
     },
     "mutation_resources": {
       "type": "array",
-      "minItems": 4,
+      "minItems": 0,
       "maxItems": 4,
       "uniqueItems": true,
       "items": {
@@ -139,6 +139,7 @@
         "required": [
           "control_id",
           "target_kind",
+          "setup_fault_kind",
           "resource_id",
           "aws_identity",
           "instance_state",
@@ -152,7 +153,8 @@
         ],
         "properties": {
           "control_id": {"type": "string"},
-          "target_kind": {"enum": ["stop", "resize", "recovery", "restoration"]},
+          "target_kind": {"enum": ["stop", "resize", "stop-recovery", "resize-restoration"]},
+          "setup_fault_kind": {"enum": ["stop", "resize"]},
           "resource_id": {"type": "string"},
           "aws_identity": {"type": "string"},
           "instance_state": {"enum": ["running", "stopped"]},
@@ -162,7 +164,9 @@
           "terminal_state": {"enum": ["running", "stopped"]},
           "terminal_type": {"type": "string"},
           "restored_state": {"enum": ["running", "stopped"]},
-          "restored_type": {"type": "string"}
+          "restored_type": {"type": "string"},
+          "external_status": {"type": "string"},
+          "external_identity_verified": {"const": true}
         },
         "additionalProperties": false
       }

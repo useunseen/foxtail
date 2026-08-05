@@ -1,0 +1,606 @@
+//! Canonical disposable mutation catalogue and the live EC2 adapter.
+//!
+//! The fixture database records the contract and lifecycle ledger, but it is
+//! never the authority for the live instance state. This module owns the
+//! scenario metadata once and keeps all EC2 calls behind one reviewable
+//! boundary.
+
+use anyhow::{Context, Result, anyhow, bail};
+use aws_config::BehaviorVersion;
+use aws_sdk_ec2::Client;
+use aws_sdk_ec2::config::{Credentials, Region};
+use aws_sdk_ec2::types::{
+    AttributeValue, InstanceAttributeName, InstanceStateName, InstanceType, ResourceType, Tag,
+    TagSpecification,
+};
+use aws_smithy_http_client::Builder as HttpClientBuilder;
+use chrono::{Duration, Utc};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration as StdDuration;
+use tokio::time::sleep;
+
+pub const MUTATION_AMI_ENV: &str = "FOXTAIL_MUTATION_AMI_ID";
+pub const MUTATION_SUBNET_ENV: &str = "FOXTAIL_MUTATION_SUBNET_ID";
+pub const MUTATION_SECURITY_GROUP_ENV: &str = "FOXTAIL_MUTATION_SECURITY_GROUP_ID";
+pub const DEFAULT_MUTATION_AMI_ID: &str = "ami-00000000";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TargetKind {
+    Stop,
+    Resize,
+    StopRecovery,
+    ResizeRestoration,
+}
+
+impl TargetKind {
+    pub const ALL: [Self; 4] = [
+        Self::Stop,
+        Self::Resize,
+        Self::StopRecovery,
+        Self::ResizeRestoration,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Resize => "resize",
+            Self::StopRecovery => "stop-recovery",
+            Self::ResizeRestoration => "resize-restoration",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SetupFaultKind {
+    Stop,
+    Resize,
+}
+
+impl SetupFaultKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Resize => "resize",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MutationScenario {
+    pub control_id: &'static str,
+    pub target_kind: TargetKind,
+    pub setup_fault_kind: SetupFaultKind,
+    pub initial_state: &'static str,
+    pub initial_type: &'static str,
+    pub terminal_state: &'static str,
+    pub terminal_type: &'static str,
+    pub restored_state: &'static str,
+    pub restored_type: &'static str,
+}
+
+pub const CATALOGUE: [MutationScenario; 4] = [
+    MutationScenario {
+        control_id: "ec2-mutation-stop-001",
+        target_kind: TargetKind::Stop,
+        setup_fault_kind: SetupFaultKind::Stop,
+        initial_state: "running",
+        initial_type: "m6i.large",
+        terminal_state: "stopped",
+        terminal_type: "m6i.large",
+        restored_state: "running",
+        restored_type: "m6i.large",
+    },
+    MutationScenario {
+        control_id: "ec2-mutation-resize-001",
+        target_kind: TargetKind::Resize,
+        setup_fault_kind: SetupFaultKind::Resize,
+        initial_state: "stopped",
+        initial_type: "m6i.large",
+        terminal_state: "stopped",
+        terminal_type: "m6i.medium",
+        restored_state: "stopped",
+        restored_type: "m6i.large",
+    },
+    MutationScenario {
+        control_id: "ec2-mutation-stop-recovery-001",
+        target_kind: TargetKind::StopRecovery,
+        setup_fault_kind: SetupFaultKind::Stop,
+        initial_state: "running",
+        initial_type: "m6i.large",
+        terminal_state: "stopped",
+        terminal_type: "m6i.large",
+        restored_state: "running",
+        restored_type: "m6i.large",
+    },
+    MutationScenario {
+        control_id: "ec2-mutation-resize-restoration-001",
+        target_kind: TargetKind::ResizeRestoration,
+        setup_fault_kind: SetupFaultKind::Resize,
+        initial_state: "stopped",
+        initial_type: "m6i.medium",
+        terminal_state: "stopped",
+        terminal_type: "m6i.large",
+        restored_state: "stopped",
+        restored_type: "m6i.medium",
+    },
+];
+
+pub fn scenario_for_control(control_id: &str) -> Result<&'static MutationScenario> {
+    CATALOGUE
+        .iter()
+        .find(|scenario| scenario.control_id == control_id)
+        .ok_or_else(|| anyhow!("unknown mutation control '{control_id}'"))
+}
+
+pub fn scenario_for_target_kind(target_kind: &str) -> Result<&'static MutationScenario> {
+    CATALOGUE
+        .iter()
+        .find(|scenario| scenario.target_kind.as_str() == target_kind)
+        .ok_or_else(|| anyhow!("unknown mutation target kind '{target_kind}'"))
+}
+
+pub fn resource_id_hint(generation: i64, target_kind: TargetKind) -> String {
+    format!(
+        "i-foxtail-mutation-g{generation:04}-{}",
+        target_kind.as_str()
+    )
+}
+
+pub fn generation_id(generation: i64) -> String {
+    format!("mg-{generation:04}")
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ObservedInstance {
+    pub resource_id: String,
+    pub instance_state: String,
+    pub instance_type: String,
+    pub availability_zone: Option<String>,
+}
+
+#[derive(Default)]
+struct MockState {
+    instances: BTreeMap<String, ObservedInstance>,
+}
+
+enum BackendKind {
+    Aws(Client),
+    Mock(Arc<Mutex<MockState>>),
+}
+
+static MOCK_STATES: OnceLock<Mutex<BTreeMap<String, Arc<Mutex<MockState>>>>> = OnceLock::new();
+
+#[derive(Clone)]
+pub struct Ec2MutationBackend {
+    backend: Arc<BackendKind>,
+    region: String,
+    account_id: String,
+}
+
+impl Ec2MutationBackend {
+    pub async fn connect(endpoint_url: &str, region: &str, account_id: &str) -> Result<Self> {
+        if let Some(mock_key) = endpoint_url.strip_prefix("mock://") {
+            let states = MOCK_STATES.get_or_init(|| Mutex::new(BTreeMap::new()));
+            let state = states
+                .lock()
+                .map_err(|_| anyhow!("mock mutation state lock poisoned"))?
+                .entry(mock_key.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(MockState::default())))
+                .clone();
+            return Ok(Self {
+                backend: Arc::new(BackendKind::Mock(state)),
+                region: region.to_string(),
+                account_id: account_id.to_string(),
+            });
+        }
+        let mut loader = aws_config::defaults(BehaviorVersion::latest())
+            .region(Region::new(region.to_string()))
+            .endpoint_url(endpoint_url)
+            .credentials_provider(Credentials::new("test", "test", None, None, "static"));
+        if endpoint_url.starts_with("http://") {
+            loader = loader.http_client(HttpClientBuilder::new().build_http());
+        }
+        let config = loader.load().await;
+        Ok(Self {
+            backend: Arc::new(BackendKind::Aws(Client::new(&config))),
+            region: region.to_string(),
+            account_id: account_id.to_string(),
+        })
+    }
+
+    pub fn resource_arn(&self, resource_id: &str) -> String {
+        format!(
+            "arn:aws:ec2:{}:{}:instance/{resource_id}",
+            self.region, self.account_id
+        )
+    }
+
+    fn aws_client(&self) -> &Client {
+        match self.backend.as_ref() {
+            BackendKind::Aws(client) => client,
+            BackendKind::Mock(_) => {
+                unreachable!("mock backend must be handled before AWS dispatch")
+            }
+        }
+    }
+
+    pub async fn provision_generation(
+        &self,
+        generation: i64,
+        generation_id: &str,
+    ) -> Result<Vec<(MutationScenario, ObservedInstance)>> {
+        let mut provisioned = Vec::with_capacity(CATALOGUE.len());
+        for scenario in CATALOGUE {
+            match self
+                .provision_target(generation, generation_id, &scenario)
+                .await
+            {
+                Ok(observed) => provisioned.push((scenario, observed)),
+                Err(error) => {
+                    let ids = provisioned
+                        .iter()
+                        .map(|(_, observed): &(MutationScenario, ObservedInstance)| {
+                            observed.resource_id.clone()
+                        })
+                        .collect::<Vec<_>>();
+                    let cleanup = self.terminate_all(&ids).await;
+                    if let Err(cleanup_error) = cleanup {
+                        return Err(error.context(format!(
+                            "mutation provisioning failed; cleanup also failed: {cleanup_error}"
+                        )));
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(provisioned)
+    }
+
+    async fn provision_target(
+        &self,
+        generation: i64,
+        generation_id: &str,
+        scenario: &MutationScenario,
+    ) -> Result<ObservedInstance> {
+        if let BackendKind::Mock(state) = self.backend.as_ref() {
+            let resource_id = resource_id_hint(generation, scenario.target_kind);
+            let observed = ObservedInstance {
+                resource_id: resource_id.clone(),
+                instance_state: scenario.initial_state.to_string(),
+                instance_type: scenario.initial_type.to_string(),
+                availability_zone: Some("mock-az".to_string()),
+            };
+            let mut state = state
+                .lock()
+                .map_err(|_| anyhow!("mock mutation state lock poisoned"))?;
+            if state.instances.contains_key(&resource_id) {
+                bail!("mock mutation target {resource_id} already exists")
+            }
+            state.instances.insert(resource_id, observed.clone());
+            return Ok(observed);
+        }
+        let image_id =
+            std::env::var(MUTATION_AMI_ENV).unwrap_or_else(|_| DEFAULT_MUTATION_AMI_ID.to_string());
+        let tags = [
+            ("Name", resource_id_hint(generation, scenario.target_kind)),
+            ("FoxtailFixture", "release-qualification-v1".to_string()),
+            ("FoxtailMutationGeneration", generation.to_string()),
+            ("FoxtailMutationGenerationId", generation_id.to_string()),
+            ("FoxtailMutationControl", scenario.control_id.to_string()),
+            (
+                "FoxtailMutationTarget",
+                scenario.target_kind.as_str().to_string(),
+            ),
+        ];
+        let tag_specification = tags.into_iter().fold(
+            TagSpecification::builder().resource_type(ResourceType::Instance),
+            |builder, (key, value)| builder.tags(Tag::builder().key(key).value(value).build()),
+        );
+        let client = match self.backend.as_ref() {
+            BackendKind::Aws(client) => client,
+            BackendKind::Mock(_) => unreachable!(),
+        };
+        let mut builder = client
+            .run_instances()
+            .image_id(image_id)
+            .instance_type(InstanceType::from(scenario.initial_type))
+            .min_count(1)
+            .max_count(1)
+            .tag_specifications(tag_specification.build());
+        if let Ok(subnet_id) = std::env::var(MUTATION_SUBNET_ENV) {
+            builder = builder.subnet_id(subnet_id);
+        }
+        if let Ok(security_group_id) = std::env::var(MUTATION_SECURITY_GROUP_ENV) {
+            builder = builder.security_group_ids(security_group_id);
+        }
+        let response = builder
+            .send()
+            .await
+            .context("run EC2 instance for disposable mutation target")?;
+        let resource_id = response
+            .instances()
+            .first()
+            .and_then(|instance| instance.instance_id())
+            .ok_or_else(|| anyhow!("run-instances returned no instance identity"))?
+            .to_string();
+        let observed = self
+            .wait_for_instance(&resource_id, "running", scenario.initial_type)
+            .await?;
+        if scenario.initial_state == "stopped" {
+            self.aws_client()
+                .stop_instances()
+                .instance_ids(&resource_id)
+                .send()
+                .await
+                .context("stop initial stopped mutation target")?;
+            self.wait_for_instance(&resource_id, "stopped", scenario.initial_type)
+                .await
+        } else {
+            Ok(observed)
+        }
+    }
+
+    pub async fn apply_setup_fault(
+        &self,
+        target_id: &str,
+        scenario: &MutationScenario,
+        fault_kind: SetupFaultKind,
+    ) -> Result<ObservedInstance> {
+        if scenario.setup_fault_kind != fault_kind {
+            bail!(
+                "fault kind '{}' is not valid for target scenario '{}'",
+                fault_kind.as_str(),
+                scenario.target_kind.as_str()
+            );
+        }
+        if let BackendKind::Mock(state) = self.backend.as_ref() {
+            let mut state = state
+                .lock()
+                .map_err(|_| anyhow!("mock mutation state lock poisoned"))?;
+            let observed = state
+                .instances
+                .get_mut(target_id)
+                .ok_or_else(|| anyhow!("public EC2 describe returned no target '{target_id}'"))?;
+            match fault_kind {
+                SetupFaultKind::Stop => observed.instance_state = "stopped".to_string(),
+                SetupFaultKind::Resize => {
+                    observed.instance_state = "stopped".to_string();
+                    observed.instance_type = scenario.terminal_type.to_string();
+                }
+            }
+            return Ok(observed.clone());
+        }
+        let before = self.describe_instance(target_id).await?;
+        match fault_kind {
+            SetupFaultKind::Stop => {
+                self.aws_client()
+                    .stop_instances()
+                    .instance_ids(target_id)
+                    .send()
+                    .await
+                    .context("stop disposable mutation target")?;
+                self.wait_for_instance(target_id, "stopped", scenario.terminal_type)
+                    .await
+            }
+            SetupFaultKind::Resize => {
+                if before.instance_state != "stopped" {
+                    self.aws_client()
+                        .stop_instances()
+                        .instance_ids(target_id)
+                        .send()
+                        .await
+                        .context("stop target before resize")?;
+                    self.wait_for_instance(target_id, "stopped", &before.instance_type)
+                        .await?;
+                }
+                self.aws_client()
+                    .modify_instance_attribute()
+                    .instance_id(target_id)
+                    .attribute(InstanceAttributeName::InstanceType)
+                    .instance_type(
+                        AttributeValue::builder()
+                            .value(scenario.terminal_type)
+                            .build(),
+                    )
+                    .send()
+                    .await
+                    .context("resize disposable mutation target")?;
+                self.wait_for_instance(target_id, "stopped", scenario.terminal_type)
+                    .await
+            }
+        }
+    }
+
+    pub async fn reset_setup_fault(
+        &self,
+        target_id: &str,
+        scenario: &MutationScenario,
+    ) -> Result<ObservedInstance> {
+        if let BackendKind::Mock(state) = self.backend.as_ref() {
+            let mut state = state
+                .lock()
+                .map_err(|_| anyhow!("mock mutation state lock poisoned"))?;
+            let observed = state
+                .instances
+                .get_mut(target_id)
+                .ok_or_else(|| anyhow!("public EC2 describe returned no target '{target_id}'"))?;
+            observed.instance_state = scenario.initial_state.to_string();
+            observed.instance_type = scenario.initial_type.to_string();
+            return Ok(observed.clone());
+        }
+        let before = self.describe_instance(target_id).await?;
+        if before.instance_state != "stopped" {
+            self.aws_client()
+                .stop_instances()
+                .instance_ids(target_id)
+                .send()
+                .await
+                .context("stop target before reset")?;
+            self.wait_for_instance(target_id, "stopped", &before.instance_type)
+                .await?;
+        }
+        if before.instance_type != scenario.initial_type {
+            self.aws_client()
+                .modify_instance_attribute()
+                .instance_id(target_id)
+                .attribute(InstanceAttributeName::InstanceType)
+                .instance_type(
+                    AttributeValue::builder()
+                        .value(scenario.initial_type)
+                        .build(),
+                )
+                .send()
+                .await
+                .context("restore mutation target instance type")?;
+        }
+        if scenario.initial_state == "running" {
+            self.aws_client()
+                .start_instances()
+                .instance_ids(target_id)
+                .send()
+                .await
+                .context("start mutation target during reset")?;
+            self.wait_for_instance(target_id, "running", scenario.initial_type)
+                .await
+        } else {
+            self.wait_for_instance(target_id, "stopped", scenario.initial_type)
+                .await
+        }
+    }
+
+    pub async fn describe_instance(&self, target_id: &str) -> Result<ObservedInstance> {
+        if let BackendKind::Mock(state) = self.backend.as_ref() {
+            let state = state
+                .lock()
+                .map_err(|_| anyhow!("mock mutation state lock poisoned"))?;
+            return state
+                .instances
+                .get(target_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("public EC2 describe returned no target '{target_id}'"));
+        }
+        let response = self
+            .aws_client()
+            .describe_instances()
+            .instance_ids(target_id)
+            .send()
+            .await
+            .context("describe disposable mutation target")?;
+        response
+            .reservations()
+            .iter()
+            .flat_map(|reservation| reservation.instances())
+            .find_map(|instance| {
+                let id = instance.instance_id()?.to_string();
+                if id != target_id {
+                    return None;
+                }
+                let state = instance
+                    .state()
+                    .and_then(|state| state.name())
+                    .map(InstanceStateName::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
+                let instance_type = instance
+                    .instance_type()
+                    .map(InstanceType::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                Some(ObservedInstance {
+                    resource_id: id,
+                    instance_state: state,
+                    instance_type,
+                    availability_zone: instance
+                        .placement()
+                        .and_then(|placement| placement.availability_zone())
+                        .map(str::to_string),
+                })
+            })
+            .ok_or_else(|| anyhow!("public EC2 describe returned no target '{target_id}'"))
+    }
+
+    pub async fn verify_absent(&self, target_id: &str) -> Result<bool> {
+        match self.describe_instance(target_id).await {
+            Ok(observed) if observed.instance_state == "terminated" => Ok(true),
+            Ok(_) => Ok(false),
+            Err(error) if is_not_found_error(&error) => Ok(true),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn terminate_all(&self, target_ids: &[String]) -> Result<()> {
+        if target_ids.is_empty() {
+            return Ok(());
+        }
+        if let BackendKind::Mock(state) = self.backend.as_ref() {
+            let mut state = state
+                .lock()
+                .map_err(|_| anyhow!("mock mutation state lock poisoned"))?;
+            for target_id in target_ids {
+                state.instances.remove(target_id);
+            }
+            return Ok(());
+        }
+        self.aws_client()
+            .terminate_instances()
+            .set_instance_ids(Some(target_ids.to_vec()))
+            .send()
+            .await
+            .context("terminate disposable mutation targets")?;
+        let deadline = Utc::now() + Duration::seconds(30);
+        loop {
+            let mut absent = true;
+            for target_id in target_ids {
+                match self.describe_instance(target_id).await {
+                    Ok(observed) if observed.instance_state == "terminated" => {}
+                    Ok(_) => absent = false,
+                    Err(error) if is_not_found_error(&error) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            if absent {
+                return Ok(());
+            }
+            if Utc::now() >= deadline {
+                bail!("timed out waiting for mutation targets to terminate")
+            }
+            sleep(StdDuration::from_millis(200)).await;
+        }
+    }
+
+    async fn wait_for_instance(
+        &self,
+        target_id: &str,
+        expected_state: &str,
+        expected_type: &str,
+    ) -> Result<ObservedInstance> {
+        let deadline = Utc::now() + Duration::seconds(30);
+        loop {
+            let observed = self.describe_instance(target_id).await?;
+            if observed.instance_state == expected_state && observed.instance_type == expected_type
+            {
+                return Ok(observed);
+            }
+            if Utc::now() >= deadline {
+                bail!(
+                    "timed out waiting for target {target_id}: expected {expected_state}:{expected_type}, observed {}:{}",
+                    observed.instance_state,
+                    observed.instance_type
+                )
+            }
+            sleep(StdDuration::from_millis(200)).await;
+        }
+    }
+}
+
+fn is_not_found_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("no target")
+        || message.contains("notfound")
+        || message.contains("not found")
+        || message.contains("does not exist")
+}
