@@ -4,7 +4,8 @@ use axum::{
 };
 use foxtail::cli::{FixtureCommands, FixtureMutationAuthorityArgs};
 use foxtail::fixture::{
-    self, DEFAULT_ACCOUNT_ID, DEFAULT_REGION, FaultRequest, MutationAuthority, RealizeRequest,
+    self, DEFAULT_ACCOUNT_ID, DEFAULT_REGION, DestroyRequest, FaultRequest, MutationAuthority,
+    RealizeRequest,
 };
 use foxtail::mutation::{self, SetupFaultKind};
 use serde_json::Value;
@@ -415,6 +416,43 @@ async fn cleanup_failure_quarantines_every_returned_id_as_ambiguous() {
             .unwrap(),
             1
         );
+        let status: Value = serde_json::from_slice(&fixture::mutation_status(&pool).await.unwrap())
+            .unwrap();
+        assert_eq!(status["status"], "QUARANTINED");
+        assert_eq!(
+            status["resource_ids"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(status["intents"].as_array().unwrap().len(), 1);
+        validate_emitted_schema("status", &status);
+        let generation_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM fixture_mutation_generations",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let intent_count_before_retry = intent_count(&pool).await;
+        let retry_error = fixture::realize(
+            &pool,
+            RealizeRequest {
+                endpoint_url: Some(endpoint.clone()),
+                ..RealizeRequest::default()
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(retry_error.contains("globally blocked"));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM fixture_mutation_generations",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            generation_count
+        );
+        assert_eq!(intent_count(&pool).await, intent_count_before_retry);
         let backend = mutation::Ec2MutationBackend::connect(
             &endpoint,
             DEFAULT_REGION,
@@ -428,6 +466,41 @@ async fn cleanup_failure_quarantines_every_returned_id_as_ambiguous() {
         pool.close().await;
     })
     .await;
+}
+
+#[tokio::test]
+async fn lost_or_empty_run_instances_identity_reconciles_without_duplicate_replay() {
+    for (endpoint, generation) in [
+        ("mock://lost-response-1", 901_i64),
+        ("mock://empty-id-1", 902_i64),
+    ] {
+        let backend =
+            mutation::Ec2MutationBackend::connect(endpoint, DEFAULT_REGION, DEFAULT_ACCOUNT_ID)
+                .await
+                .unwrap();
+        let generation_id = mutation::generation_id(generation);
+        let first = backend
+            .provision_generation(generation, &generation_id)
+            .await
+            .unwrap();
+        let replay = backend
+            .provision_generation(generation, &generation_id)
+            .await
+            .unwrap();
+        let first_ids = first
+            .iter()
+            .map(|(_, observed)| observed.resource_id.clone())
+            .collect::<Vec<_>>();
+        let replay_ids = replay
+            .iter()
+            .map(|(_, observed)| observed.resource_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(first_ids, replay_ids);
+        assert_eq!(first_ids.len(), mutation::CATALOGUE.len());
+        for resource_id in first_ids {
+            assert!(backend.describe_instance(&resource_id).await.is_ok());
+        }
+    }
 }
 
 #[tokio::test]
@@ -646,6 +719,94 @@ async fn upgrade_from_pre_boundary_mutation_schema_quarantines_legacy_rows() {
         .await
         .unwrap(),
         4
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'index' AND name = 'idx_fixture_mutation_intents_one_inflight_generation'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        1
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn migration_quarantines_duplicate_nonterminal_intents_before_unique_index() {
+    let path = std::env::temp_dir().join(format!(
+        "foxtail-mutation-duplicate-intents-{}.db",
+        uuid::Uuid::new_v4()
+    ));
+    let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
+        .unwrap()
+        .create_if_missing(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(5)
+        .connect_with(options)
+        .await
+        .unwrap();
+    let full =
+        sqlx::migrate::Migrator::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations"))
+            .await
+            .unwrap();
+    let intermediate_migrations = full
+        .iter()
+        .filter(|migration| migration.version <= 20260806100000)
+        .cloned()
+        .collect::<Vec<_>>();
+    let intermediate = sqlx::migrate::Migrator {
+        migrations: Cow::Owned(intermediate_migrations),
+        ..sqlx::migrate::Migrator::DEFAULT
+    };
+    intermediate.run(&pool).await.unwrap();
+    for (intent_id, status, created_at) in [
+        ("duplicate-old", "INTENT", "2026-08-06T00:00:00Z"),
+        ("duplicate-new", "DISPATCHED", "2026-08-06T00:00:01Z"),
+    ] {
+        sqlx::query(
+            "INSERT INTO fixture_mutation_intents
+             (intent_id, operation, mutation_generation, generation_id, fixture_generation,
+              request_bytes, status, created_at, updated_at)
+             VALUES (?, 'fault', 7, 'mg-0007', 7, ?, ?, ?, ?)",
+        )
+        .bind(intent_id)
+        .bind(b"{}".as_slice())
+        .bind(status)
+        .bind(created_at)
+        .bind(created_at)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    full.run(&pool).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT status FROM fixture_mutation_intents WHERE intent_id = 'duplicate-old'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        "INTENT"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT status FROM fixture_mutation_intents WHERE intent_id = 'duplicate-new'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        "AMBIGUOUS"
+    );
+    assert!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT error FROM fixture_mutation_intents WHERE intent_id = 'duplicate-new'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .contains("duplicate nonterminal")
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
@@ -951,6 +1112,131 @@ async fn concurrent_recreate_allows_one_winner_and_no_duplicate_active_generatio
             .await
             .unwrap(),
             1
+        );
+        pool.close().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn recreate_blocks_new_authority_until_recreated_receipt_commits() {
+    fixture::with_isolated_qualification(async {
+        let pool = seeded_pool().await;
+        let endpoint = "mock://slow-cleanup-500".to_string();
+        let snapshot = fixture::realize(
+            &pool,
+            RealizeRequest {
+                endpoint_url: Some(endpoint.clone()),
+                ..RealizeRequest::default()
+            },
+        )
+        .await
+        .unwrap();
+        let old_authority = authority_from_snapshot(&snapshot);
+        let old_generation = old_authority.generation.unwrap();
+        let recreate_pool = pool.clone();
+        let recreate_task = tokio::spawn(async move {
+            fixture::with_isolated_qualification(async move {
+                fixture::recreate(
+                    &recreate_pool,
+                    fixture::RecreateRequest {
+                        authority: old_authority,
+                        clock_anchor: Some("2026-08-06T00:00:00Z".to_string()),
+                    },
+                )
+                .await
+            })
+            .await
+        });
+
+        let mut replacement_authority = None;
+        for _ in 0..200 {
+            let state = fixture::read_state(&pool).await.unwrap();
+            if state.generation.unwrap_or_default() > old_generation {
+                replacement_authority = Some(authority_from_state(&state));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let replacement_authority = match replacement_authority {
+            Some(authority) => authority,
+            None => {
+                let recreate_result = recreate_task.await.unwrap();
+                panic!("replacement generation published: {recreate_result:?}");
+            }
+        };
+        let pending_status: Value =
+            serde_json::from_slice(&fixture::mutation_status(&pool).await.unwrap()).unwrap();
+        assert_eq!(pending_status["status"], "QUARANTINED");
+        assert_eq!(
+            pending_status["quarantined_generations"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        validate_emitted_schema("status", &pending_status);
+        let replacement_manifest: Value = serde_json::from_slice(
+            fixture::read_state(&pool)
+                .await
+                .unwrap()
+                .manifest_bytes
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
+        let target = replacement_manifest["mutation_resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|target| target["target_kind"] == "stop")
+            .unwrap();
+        let blocked_fault = fixture::apply_fault(
+            &pool,
+            FaultRequest {
+                authority: replacement_authority.clone(),
+                control_id: target["control_id"].as_str().unwrap().to_string(),
+                target_id: target["resource_id"].as_str().unwrap().to_string(),
+                scope: "target".to_string(),
+                fault_kind: "stop".to_string(),
+                application_time: None,
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(blocked_fault.contains("globally blocked"));
+        assert!(
+            fixture::destroy(
+                &pool,
+                DestroyRequest {
+                    authority: replacement_authority,
+                },
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM fixture_operation_receipts WHERE operation IN ('fault', 'destroy')",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+        let receipt = recreate_task.await.unwrap().unwrap();
+        let receipt: Value = serde_json::from_slice(&receipt).unwrap();
+        assert_eq!(receipt["status"], "RECREATED");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM fixture_mutation_intents
+                 WHERE operation = 'recreate' AND status IN ('INTENT', 'DISPATCHED')",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
         );
         pool.close().await;
     })

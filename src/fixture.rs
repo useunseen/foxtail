@@ -139,6 +139,18 @@ pub struct RealizeRequest {
     /// from serialized CLI/HTTP input.
     #[serde(skip)]
     pub force_new: bool,
+    /// Internal reservation used by `recreate` while the replacement
+    /// generation is being provisioned and retired.
+    #[serde(skip)]
+    pub reuse_intent_id: Option<String>,
+    /// Keep the replacement-generation reservation nonterminal until the
+    /// outer recreate receipt and old-generation retirement commit.
+    #[serde(skip)]
+    pub defer_intent_finalization: bool,
+    /// Internal allow-list for the two recreate reservations. Other global
+    /// quarantine/nonterminal blockers remain fail-closed.
+    #[serde(skip)]
+    pub allowed_intent_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -238,6 +250,39 @@ pub struct MutationSnapshot {
     pub manifest_digest: Option<String>,
     pub targets: Vec<Value>,
     pub active_faults: Vec<Value>,
+}
+
+async fn ensure_no_global_mutation_blockers(
+    pool: &SqlitePool,
+    allowed_intent_ids: &[String],
+) -> Result<()> {
+    let quarantined_generations: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fixture_mutation_generations
+         WHERE state = 'ACTIVE' AND external_status <> 'ACTIVE'",
+    )
+    .fetch_one(pool)
+    .await?;
+    let intent_rows = sqlx::query(
+        "SELECT intent_id FROM fixture_mutation_intents
+         WHERE status IN ('INTENT', 'DISPATCHED', 'AMBIGUOUS')",
+    )
+    .fetch_all(pool)
+    .await?;
+    let blocked_intents = intent_rows
+        .iter()
+        .filter_map(|row| row.try_get::<String, _>("intent_id").ok())
+        .filter(|intent_id| {
+            !allowed_intent_ids
+                .iter()
+                .any(|allowed| allowed == intent_id)
+        })
+        .count();
+    if quarantined_generations != 0 || blocked_intents != 0 {
+        bail!(
+            "mutation authority is globally blocked by quarantined or nonterminal external state"
+        );
+    }
+    Ok(())
 }
 
 /// Produce canonical UTF-8 JSON with recursively sorted object keys and no
@@ -599,6 +644,7 @@ async fn validate_mutation_authority(
     authority: &MutationAuthority,
 ) -> Result<(i64, String, i64, String)> {
     ensure_isolated_qualification()?;
+    ensure_no_global_mutation_blockers(pool, &[]).await?;
     validate_version(authority.version.as_deref())?;
     let generation = authority
         .generation
@@ -1356,6 +1402,9 @@ pub async fn realize(pool: &SqlitePool, request: RealizeRequest) -> Result<Fixtu
     let anchor = parse_anchor(request.clock_anchor.as_deref())?;
     let isolated = is_isolated_qualification();
     let request_value = serde_json::to_value(&request)?;
+    if isolated {
+        ensure_no_global_mutation_blockers(pool, &request.allowed_intent_ids).await?;
+    }
 
     // Ordinary realization remains a read-only lookup.  An isolated active
     // generation is different: every subsequent realization request, even
@@ -1507,19 +1556,23 @@ pub async fn realize(pool: &SqlitePool, request: RealizeRequest) -> Result<Fixtu
     .await?;
     let mutation_generation_id = isolated.then(|| mutation_generation_id(mutation_generation));
     let intent_id = if isolated {
-        let id = begin_mutation_intent(
-            pool,
-            "realize",
-            IntentContext {
-                mutation_generation: Some(mutation_generation),
-                generation_id: mutation_generation_id.as_deref(),
-                fixture_generation: Some(generation),
-                target_id: None,
-            },
-            &request_value,
-            &anchor.to_rfc3339_opts(SecondsFormat::Secs, true),
-        )
-        .await?;
+        let id = if let Some(reuse_intent_id) = request.reuse_intent_id.clone() {
+            reuse_intent_id
+        } else {
+            begin_mutation_intent(
+                pool,
+                "realize",
+                IntentContext {
+                    mutation_generation: Some(mutation_generation),
+                    generation_id: mutation_generation_id.as_deref(),
+                    fixture_generation: Some(generation),
+                    target_id: None,
+                },
+                &request_value,
+                &anchor.to_rfc3339_opts(SecondsFormat::Secs, true),
+            )
+            .await?
+        };
         if let Err(error) = mark_intent_dispatched(pool, &id, &now_rfc3339()).await {
             finalize_intent_ambiguous(pool, &id, &error).await;
             return Err(error);
@@ -1792,7 +1845,8 @@ pub async fn realize(pool: &SqlitePool, request: RealizeRequest) -> Result<Fixtu
         }
     };
 
-    if let Some(intent_id) = intent_id.as_deref()
+    if !request.defer_intent_finalization
+        && let Some(intent_id) = intent_id.as_deref()
         && let Err(error) =
             update_mutation_intent(pool, intent_id, "SUCCEEDED", None, &now_rfc3339()).await
     {
@@ -1814,10 +1868,129 @@ pub async fn realize(pool: &SqlitePool, request: RealizeRequest) -> Result<Fixtu
     })
 }
 
+async fn quarantined_mutation_status(pool: &SqlitePool) -> Result<Option<Value>> {
+    let generation_rows = sqlx::query(
+        "SELECT mutation_generation, generation_id, fixture_generation,
+                manifest_digest, resource_ids, external_status
+         FROM fixture_mutation_generations
+         WHERE state = 'ACTIVE'
+           AND (external_status <> 'ACTIVE' OR EXISTS (
+               SELECT 1
+               FROM fixture_mutation_intents i
+               WHERE i.mutation_generation = fixture_mutation_generations.mutation_generation
+                 AND i.generation_id = fixture_mutation_generations.generation_id
+                 AND i.status IN ('INTENT', 'DISPATCHED', 'AMBIGUOUS')
+           ))
+         ORDER BY mutation_generation",
+    )
+    .fetch_all(pool)
+    .await?;
+    let intent_rows = sqlx::query(
+        "SELECT intent_id, operation, mutation_generation, generation_id,
+                fixture_generation, status, error, created_at, updated_at
+         FROM fixture_mutation_intents
+         WHERE status IN ('INTENT', 'DISPATCHED', 'AMBIGUOUS')
+         ORDER BY created_at, intent_id",
+    )
+    .fetch_all(pool)
+    .await?;
+    if generation_rows.is_empty() && intent_rows.is_empty() {
+        return Ok(None);
+    }
+
+    let intents = intent_rows
+        .iter()
+        .map(|row| {
+            Ok(json!({
+                "intent_id": row.try_get::<String, _>("intent_id")?,
+                "operation": row.try_get::<String, _>("operation")?,
+                "mutation_generation": row.try_get::<Option<i64>, _>("mutation_generation")?,
+                "generation_id": row.try_get::<Option<String>, _>("generation_id")?,
+                "fixture_generation": row.try_get::<Option<i64>, _>("fixture_generation")?,
+                "status": row.try_get::<String, _>("status")?,
+                "error": row.try_get::<Option<String>, _>("error")?,
+                "created_at": row.try_get::<String, _>("created_at")?,
+                "updated_at": row.try_get::<String, _>("updated_at")?
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut resource_ids = BTreeSet::new();
+    let quarantined_generations = generation_rows
+        .iter()
+        .map(|row| {
+            let raw_ids: String = row.try_get("resource_ids")?;
+            let ids = serde_json::from_str::<Vec<String>>(&raw_ids).unwrap_or_default();
+            resource_ids.extend(ids.iter().cloned());
+            let mutation_generation: i64 = row.try_get("mutation_generation")?;
+            let generation_id: String = row.try_get("generation_id")?;
+            let generation_intents = intent_rows
+                .iter()
+                .filter(|intent| {
+                    intent
+                        .try_get::<Option<i64>, _>("mutation_generation")
+                        .ok()
+                        .flatten()
+                        == Some(mutation_generation)
+                        && intent
+                            .try_get::<Option<String>, _>("generation_id")
+                            .ok()
+                            .flatten()
+                            .as_deref()
+                            == Some(generation_id.as_str())
+                })
+                .map(|intent| {
+                    Ok(json!({
+                        "intent_id": intent.try_get::<String, _>("intent_id")?,
+                        "operation": intent.try_get::<String, _>("operation")?,
+                        "status": intent.try_get::<String, _>("status")?,
+                        "error": intent.try_get::<Option<String>, _>("error")?,
+                        "created_at": intent.try_get::<String, _>("created_at")?,
+                        "updated_at": intent.try_get::<String, _>("updated_at")?
+                    }))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(json!({
+                "mutation_generation": mutation_generation,
+                "generation_id": generation_id,
+                "fixture_generation": row.try_get::<i64, _>("fixture_generation")?,
+                "manifest_digest": row.try_get::<String, _>("manifest_digest")?,
+                "external_status": row.try_get::<String, _>("external_status")?,
+                "resource_ids": ids,
+                "intents": generation_intents
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let first_generation = generation_rows.first();
+    Ok(Some(json!({
+        "schema": "foxtail.release-fixture-mutation-status/v1",
+        "status": "QUARANTINED",
+        "fixture_generation": first_generation
+            .map(|row| row.try_get::<i64, _>("fixture_generation"))
+            .transpose()?,
+        "mutation_generation": first_generation
+            .map(|row| row.try_get::<i64, _>("mutation_generation"))
+            .transpose()?,
+        "mutation_generation_id": first_generation
+            .map(|row| row.try_get::<String, _>("generation_id"))
+            .transpose()?,
+        "manifest_digest": first_generation
+            .and_then(|row| row.try_get::<String, _>("manifest_digest").ok())
+            .filter(|digest| !digest.is_empty()),
+        "targets": [],
+        "active_faults": [],
+        "resource_ids": resource_ids.into_iter().collect::<Vec<_>>(),
+        "intents": intents,
+        "quarantined_generations": quarantined_generations
+    })))
+}
+
 /// Return the qualification-only mutation state.  This intentionally has a
 /// separate gate from the read-only fixture status route.
 pub async fn mutation_status(pool: &SqlitePool) -> Result<Vec<u8>> {
     ensure_isolated_qualification()?;
+    if let Some(quarantined) = quarantined_mutation_status(pool).await? {
+        return canonical_bytes(&quarantined);
+    }
     let row = sqlx::query(
         "SELECT generation, manifest_digest, mutation_generation, mutation_generation_id
          FROM fixture_realizations WHERE singleton_id = 1",
@@ -2348,6 +2521,26 @@ pub async fn recreate(pool: &SqlitePool, request: RecreateRequest) -> Result<Vec
         finalize_intent_ambiguous(pool, &intent_id, &error).await;
         return Err(error);
     }
+    let new_intent_id = match begin_mutation_intent(
+        pool,
+        "recreate",
+        IntentContext {
+            mutation_generation: Some(predicted_mutation_generation),
+            generation_id: Some(&predicted_generation_id),
+            fixture_generation: Some(predicted_generation),
+            target_id: None,
+        },
+        &serde_json::to_value(&request)?,
+        &created_at,
+    )
+    .await
+    {
+        Ok(intent_id) => intent_id,
+        Err(error) => {
+            finalize_intent_ambiguous(pool, &intent_id, &error).await;
+            return Err(error);
+        }
+    };
     let mut new_identity = None;
     let operation_result = async {
         let snapshot = realize(
@@ -2372,6 +2565,9 @@ pub async fn recreate(pool: &SqlitePool, request: RecreateRequest) -> Result<Vec
                     .and_then(Value::as_str)
                     .map(str::to_string),
                 force_new: true,
+                reuse_intent_id: Some(new_intent_id.clone()),
+                defer_intent_finalization: true,
+                allowed_intent_ids: vec![intent_id.clone(), new_intent_id.clone()],
             },
         )
         .await;
@@ -2505,22 +2701,31 @@ pub async fn recreate(pool: &SqlitePool, request: RecreateRequest) -> Result<Vec
     .await;
     match operation_result {
         Ok(receipt_bytes) => {
-            match update_mutation_intent(pool, &intent_id, "SUCCEEDED", None, &now_rfc3339()).await
+            if let Err(error) =
+                update_mutation_intent(pool, &intent_id, "SUCCEEDED", None, &now_rfc3339()).await
             {
-                Ok(()) => Ok(receipt_bytes),
-                Err(error) => {
-                    if let Some((new_mutation_generation, new_generation_id)) = &new_identity {
-                        mark_generation_ambiguous(
-                            pool,
-                            *new_mutation_generation,
-                            new_generation_id,
-                        )
+                if let Some((new_mutation_generation, new_generation_id)) = &new_identity {
+                    mark_generation_ambiguous(pool, old_mutation_generation, &old_generation_id)
                         .await;
-                    }
-                    finalize_intent_ambiguous(pool, &intent_id, &error).await;
-                    Err(error)
+                    mark_generation_ambiguous(pool, *new_mutation_generation, new_generation_id)
+                        .await;
                 }
+                finalize_intent_ambiguous(pool, &intent_id, &error).await;
+                finalize_intent_ambiguous(pool, &new_intent_id, &error).await;
+                return Err(error);
             }
+            if let Err(error) =
+                update_mutation_intent(pool, &new_intent_id, "SUCCEEDED", None, &now_rfc3339())
+                    .await
+            {
+                if let Some((new_mutation_generation, new_generation_id)) = &new_identity {
+                    mark_generation_ambiguous(pool, *new_mutation_generation, new_generation_id)
+                        .await;
+                }
+                finalize_intent_ambiguous(pool, &new_intent_id, &error).await;
+                return Err(error);
+            }
+            Ok(receipt_bytes)
         }
         Err(error) => {
             if let Some((new_mutation_generation, new_generation_id)) = &new_identity {
@@ -2528,6 +2733,7 @@ pub async fn recreate(pool: &SqlitePool, request: RecreateRequest) -> Result<Vec
                 mark_generation_ambiguous(pool, *new_mutation_generation, new_generation_id).await;
             }
             finalize_intent_ambiguous(pool, &intent_id, &error).await;
+            finalize_intent_ambiguous(pool, &new_intent_id, &error).await;
             Err(error)
         }
     }
@@ -3633,6 +3839,9 @@ pub async fn execute_fixture_cli_command(
                     endpoint_url,
                     localstack_version,
                     force_new: false,
+                    reuse_intent_id: None,
+                    defer_intent_finalization: false,
+                    allowed_intent_ids: Vec::new(),
                 },
             )
             .await?,
