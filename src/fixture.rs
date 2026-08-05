@@ -17,6 +17,13 @@ const HISTORY_DAYS: i64 = 14;
 const DAY_SECONDS: i64 = 86_400;
 const HOUR_SECONDS: i64 = 3_600;
 const DEGRADED_MISSING_DAY: i64 = 6;
+const NETWORK_IN_BASE: f64 = 10_000.0;
+const NETWORK_OUT_BASE: f64 = 20_000.0;
+const NETWORK_PER_DAY_INCREMENT: f64 = 100.0;
+const LOW_CPU_MAX_EXCLUSIVE: f64 = 15.0;
+const BUSY_CPU_MIN_EXCLUSIVE: f64 = 75.0;
+const OPTIMIZED_CPU_MIN_INCLUSIVE: f64 = 15.0;
+const OPTIMIZED_CPU_MAX_INCLUSIVE: f64 = 75.0;
 const FORBIDDEN_POLICY_KEYS: [&str; 9] = [
     "Required",
     "Stretch",
@@ -53,6 +60,47 @@ pub const REALIZED_CONTROL_IDS: [&str; 5] = [
     "ec2-resize-negative-001",
 ];
 pub const MUTATION_CONTROL_IDS: [&str; 2] = ["ec2-mutation-stop-001", "ec2-mutation-resize-001"];
+
+#[derive(Debug, Clone, Copy)]
+struct MaterializationProfile {
+    control_id: &'static str,
+    cpu_value: f64,
+    cost_amount: f64,
+    missing_cpu_day: Option<i64>,
+}
+
+const MATERIALIZATION_PROFILES: [MaterializationProfile; 5] = [
+    MaterializationProfile {
+        control_id: "ec2-idle-positive-001",
+        cpu_value: 5.0,
+        cost_amount: 1.0,
+        missing_cpu_day: None,
+    },
+    MaterializationProfile {
+        control_id: "ec2-idle-negative-001",
+        cpu_value: 85.0,
+        cost_amount: 1.1,
+        missing_cpu_day: None,
+    },
+    MaterializationProfile {
+        control_id: "ec2-idle-degraded-001",
+        cpu_value: 7.0,
+        cost_amount: 1.2,
+        missing_cpu_day: Some(DEGRADED_MISSING_DAY),
+    },
+    MaterializationProfile {
+        control_id: "ec2-resize-positive-001",
+        cpu_value: 6.0,
+        cost_amount: 1.3,
+        missing_cpu_day: None,
+    },
+    MaterializationProfile {
+        control_id: "ec2-resize-negative-001",
+        cpu_value: 40.0,
+        cost_amount: 1.4,
+        missing_cpu_day: None,
+    },
+];
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -160,8 +208,8 @@ pub fn definition_value() -> Value {
             "ec2.idle.complete-history",
             "idle utilization with complete public history",
             json!({
-                "cloudwatch": {"namespace": "AWS/EC2", "metric_name": "CPUUtilization", "required_history_days": 14},
-                "cost_explorer": {"metric": "UnblendedCost", "required_history_days": 14},
+                "cloudwatch": {"namespace": "AWS/EC2", "metric_name": "CPUUtilization", "required_history_days": HISTORY_DAYS},
+                "cost_explorer": {"metric": "UnblendedCost", "required_history_days": HISTORY_DAYS},
                 "topology": "independently-observable"
             }),
         ),
@@ -171,8 +219,8 @@ pub fn definition_value() -> Value {
             "ec2.busy.complete-history",
             "busy utilization is not an idle candidate",
             json!({
-                "cloudwatch": {"namespace": "AWS/EC2", "metric_name": "CPUUtilization", "required_history_days": 14},
-                "cost_explorer": {"metric": "UnblendedCost", "required_history_days": 14},
+                "cloudwatch": {"namespace": "AWS/EC2", "metric_name": "CPUUtilization", "required_history_days": HISTORY_DAYS},
+                "cost_explorer": {"metric": "UnblendedCost", "required_history_days": HISTORY_DAYS},
                 "topology": "independently-observable"
             }),
         ),
@@ -182,8 +230,8 @@ pub fn definition_value() -> Value {
             "ec2.idle.scoped-missing-day",
             "idle utilization with a declared incomplete evidence window",
             json!({
-                "cloudwatch": {"namespace": "AWS/EC2", "metric_name": "CPUUtilization", "required_history_days": 14, "degradation": "scoped-missing-day"},
-                "cost_explorer": {"metric": "UnblendedCost", "required_history_days": 14},
+                "cloudwatch": {"namespace": "AWS/EC2", "metric_name": "CPUUtilization", "required_history_days": HISTORY_DAYS, "degradation": "scoped-missing-day"},
+                "cost_explorer": {"metric": "UnblendedCost", "required_history_days": HISTORY_DAYS},
                 "topology": "independently-observable"
             }),
         ),
@@ -193,7 +241,7 @@ pub fn definition_value() -> Value {
             "ec2.resize.fresh-compatible-recommendation",
             "current instance identity has fresh resize evidence",
             json!({
-                "cloudwatch": {"namespace": "AWS/EC2", "metric_name": "CPUUtilization", "required_history_days": 14},
+                "cloudwatch": {"namespace": "AWS/EC2", "metric_name": "CPUUtilization", "required_history_days": HISTORY_DAYS},
                 "compute_optimizer": {"service": "ec2", "fresh": true, "identity_bound": true}
             }),
         ),
@@ -203,7 +251,7 @@ pub fn definition_value() -> Value {
             "ec2.resize.no-compatible-recommendation",
             "current instance identity has no compatible resize action",
             json!({
-                "cloudwatch": {"namespace": "AWS/EC2", "metric_name": "CPUUtilization", "required_history_days": 14},
+                "cloudwatch": {"namespace": "AWS/EC2", "metric_name": "CPUUtilization", "required_history_days": HISTORY_DAYS},
                 "compute_optimizer": {"service": "ec2", "fresh": true, "identity_bound": true}
             }),
         ),
@@ -243,18 +291,10 @@ pub fn definition_value() -> Value {
         "clock_contract": {
             "timezone": "UTC",
             "bucket": "complete-utc-day",
-            "required_history_days": 14,
+            "required_history_days": HISTORY_DAYS,
             "reuse_ttl_hours": 24
         },
-        "generation_rules": {
-            "resource_source": "LocalStack EC2 inventory",
-            "resource_order": "stable resource id order with deterministic CPU-role assignment",
-            "metric_surface": ["AWS/EC2/CPUUtilization", "AWS/EC2/NetworkIn", "AWS/EC2/NetworkOut"],
-            "cost_surface": ["CostExplorer.UnblendedCost", "CostExplorer.UsageQuantity"],
-            "recommendation_surface": ["ComputeOptimizer.GetEC2InstanceRecommendations"],
-            "history_days": 14,
-            "required_ec2_resources": 5
-        },
+        "generation_rules": generation_rules_value(),
         "control_ids": CONTROL_IDS,
         "controls": controls
     })
@@ -277,6 +317,56 @@ fn control_definition(
     })
 }
 
+fn materialization_profile(control_id: &str) -> Result<&'static MaterializationProfile> {
+    MATERIALIZATION_PROFILES
+        .iter()
+        .find(|profile| profile.control_id == control_id)
+        .ok_or_else(|| anyhow!("unknown realized control '{control_id}'"))
+}
+
+fn generation_rules_value() -> Value {
+    let control_order = MATERIALIZATION_PROFILES
+        .iter()
+        .map(|profile| profile.control_id)
+        .collect::<Vec<_>>();
+    json!({
+        "resource_source": "LocalStack EC2 inventory",
+        "resource_order": "ascending resource id order",
+        "assignment": {
+            "selection": "first five EC2 resources after ascending id sort",
+            "control_order": control_order,
+            "mapping": "one resource per control in control order"
+        },
+        "metric_surface": ["AWS/EC2/CPUUtilization", "AWS/EC2/NetworkIn", "AWS/EC2/NetworkOut"],
+        "cost_surface": ["CostExplorer.UnblendedCost", "CostExplorer.UsageQuantity"],
+        "recommendation_surface": ["ComputeOptimizer.GetEC2InstanceRecommendations"],
+        "history_days": HISTORY_DAYS,
+        "history": {
+            "days": HISTORY_DAYS,
+            "offset_formula": "-(day * 86400 + 3600)",
+            "offset_seconds": history_offsets().into_iter().collect::<Vec<_>>()
+        },
+        "evidence_profiles": MATERIALIZATION_PROFILES.iter().map(|profile| json!({
+            "control_id": profile.control_id,
+            "cpu_value": profile.cpu_value,
+            "cost_amount": profile.cost_amount,
+            "missing_cpu_day": profile.missing_cpu_day
+        })).collect::<Vec<_>>(),
+        "network_profile": {
+            "network_in_base": NETWORK_IN_BASE,
+            "network_out_base": NETWORK_OUT_BASE,
+            "per_day_increment": NETWORK_PER_DAY_INCREMENT
+        },
+        "cpu_predicates": {
+            "low_max_exclusive": LOW_CPU_MAX_EXCLUSIVE,
+            "busy_min_exclusive": BUSY_CPU_MIN_EXCLUSIVE,
+            "optimized_min_inclusive": OPTIMIZED_CPU_MIN_INCLUSIVE,
+            "optimized_max_inclusive": OPTIMIZED_CPU_MAX_INCLUSIVE
+        },
+        "required_ec2_resources": MATERIALIZATION_PROFILES.len()
+    })
+}
+
 pub fn canonical_definition() -> Result<(Vec<u8>, String)> {
     let (mut bytes, digest) = validate_document(&definition_value(), "digest")?;
     let mut value: Value = serde_json::from_slice(&bytes)?;
@@ -288,6 +378,27 @@ pub fn canonical_definition() -> Result<(Vec<u8>, String)> {
 pub fn definition_with_digest() -> Result<Value> {
     let (bytes, _) = canonical_definition()?;
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// Account identity used by both the fixture manifest and the public AWS-like
+/// handlers.  A caller may repeat this scope explicitly, but cannot publish a
+/// fixture under an identity the public surfaces will not return.
+pub fn authoritative_account_id() -> &'static str {
+    DEFAULT_ACCOUNT_ID
+}
+
+pub fn resolve_account_id(requested: Option<&str>) -> Result<String> {
+    let configured = authoritative_account_id();
+    match requested.map(str::trim) {
+        None => Ok(configured.to_string()),
+        Some("") => bail!("account_id must not be empty"),
+        Some(value) if value != configured => bail!(
+            "requested account_id '{}' does not match public AWS account '{}'",
+            value,
+            configured
+        ),
+        Some(value) => Ok(value.to_string()),
+    }
 }
 
 pub fn validate_version(version: Option<&str>) -> Result<()> {
@@ -398,10 +509,10 @@ pub async fn realize(pool: &SqlitePool, request: RealizeRequest) -> Result<Fixtu
     .await
     .context("read EC2 estate for fixture realization")?;
 
-    if rows.len() < REALIZED_CONTROL_IDS.len() {
+    if rows.len() < MATERIALIZATION_PROFILES.len() {
         bail!(
             "fixture realization requires at least {} EC2 resources; found {}",
-            REALIZED_CONTROL_IDS.len(),
+            MATERIALIZATION_PROFILES.len(),
             rows.len()
         )
     }
@@ -443,12 +554,7 @@ pub async fn realize(pool: &SqlitePool, request: RealizeRequest) -> Result<Fixtu
     }
 
     let assigned = assign_realized_resources(&resources);
-    let account_id = request
-        .account_id
-        .unwrap_or_else(|| DEFAULT_ACCOUNT_ID.to_string());
-    if account_id.trim().is_empty() {
-        bail!("account_id must not be empty")
-    }
+    let account_id = resolve_account_id(request.account_id.as_deref())?;
     let endpoint_url = request
         .endpoint_url
         .or_else(|| std::env::var("AWS_ENDPOINT_URL").ok())
@@ -662,10 +768,10 @@ struct ManifestContext<'a> {
 }
 
 fn assign_realized_resources(resources: &[ResourceIdentity]) -> BTreeMap<String, ResourceIdentity> {
-    REALIZED_CONTROL_IDS
+    MATERIALIZATION_PROFILES
         .iter()
-        .zip(resources.iter().take(REALIZED_CONTROL_IDS.len()))
-        .map(|(control_id, resource)| ((*control_id).to_string(), resource.clone()))
+        .zip(resources.iter().take(MATERIALIZATION_PROFILES.len()))
+        .map(|(profile, resource)| (profile.control_id.to_string(), resource.clone()))
         .collect()
 }
 
@@ -690,6 +796,7 @@ async fn materialize_control_evidence(
     control_id: &str,
     resource_id: &str,
 ) -> Result<()> {
+    let profile = materialization_profile(control_id)?;
     sqlx::query("DELETE FROM metrics WHERE resource_id = ?")
         .bind(resource_id)
         .execute(&mut **tx)
@@ -699,36 +806,17 @@ async fn materialize_control_evidence(
         .execute(&mut **tx)
         .await?;
 
-    let cpu_value = match control_id {
-        "ec2-idle-positive-001" => 5.0,
-        "ec2-idle-negative-001" => 85.0,
-        "ec2-idle-degraded-001" => 7.0,
-        "ec2-resize-positive-001" => 6.0,
-        "ec2-resize-negative-001" => 40.0,
-        _ => bail!("cannot materialize unknown realized control '{control_id}'"),
-    };
-    let cost_amount = match control_id {
-        "ec2-idle-positive-001" => 1.00,
-        "ec2-idle-negative-001" => 1.10,
-        "ec2-idle-degraded-001" => 1.20,
-        "ec2-resize-positive-001" => 1.30,
-        "ec2-resize-negative-001" => 1.40,
-        _ => bail!("cannot materialize unknown realized control '{control_id}'"),
-    };
-
     for day in 0..HISTORY_DAYS {
         let offset = -(day * DAY_SECONDS + HOUR_SECONDS);
-        let skip_degraded_cpu =
-            control_id == "ec2-idle-degraded-001" && day == DEGRADED_MISSING_DAY;
-        if !skip_degraded_cpu {
-            insert_metric(tx, resource_id, "CPUUtilization", offset, cpu_value).await?;
+        if profile.missing_cpu_day != Some(day) {
+            insert_metric(tx, resource_id, "CPUUtilization", offset, profile.cpu_value).await?;
         }
         insert_metric(
             tx,
             resource_id,
             "NetworkIn",
             offset,
-            10_000.0 + (day as f64 * 100.0),
+            NETWORK_IN_BASE + (day as f64 * NETWORK_PER_DAY_INCREMENT),
         )
         .await?;
         insert_metric(
@@ -736,7 +824,7 @@ async fn materialize_control_evidence(
             resource_id,
             "NetworkOut",
             offset,
-            20_000.0 + (day as f64 * 100.0),
+            NETWORK_OUT_BASE + (day as f64 * NETWORK_PER_DAY_INCREMENT),
         )
         .await?;
         sqlx::query(
@@ -745,7 +833,7 @@ async fn materialize_control_evidence(
         )
         .bind(resource_id)
         .bind(offset)
-        .bind(cost_amount)
+        .bind(profile.cost_amount)
         .execute(&mut **tx)
         .await?;
     }
@@ -845,6 +933,7 @@ async fn load_estate_resources(
 fn validate_realized_controls(assigned: &BTreeMap<String, EstateResource>) -> Result<()> {
     let expected_offsets = history_offsets();
     for (control_id, resource) in assigned {
+        let profile = materialization_profile(control_id)?;
         let cpu_offsets = resource
             .metrics
             .iter()
@@ -859,10 +948,9 @@ fn validate_realized_controls(assigned: &BTreeMap<String, EstateResource>) -> Re
             .map(|cost| cost.seconds_from_now)
             .collect::<BTreeSet<_>>();
         if cost_offsets != expected_offsets
-            || resource
-                .costs
-                .iter()
-                .any(|cost| !cost.amount.is_finite() || cost.amount <= 0.0)
+            || resource.costs.iter().any(|cost| {
+                !cost.amount.is_finite() || cost.amount <= 0.0 || cost.amount != profile.cost_amount
+            })
         {
             bail!("{control_id} does not have complete positive cost evidence")
         }
@@ -872,27 +960,42 @@ fn validate_realized_controls(assigned: &BTreeMap<String, EstateResource>) -> Re
         if !average_cpu.is_finite() {
             bail!("{control_id} has a non-finite CPUUtilization average")
         }
+        if resource.metrics.iter().any(|metric| {
+            metric.namespace == "AWS/EC2"
+                && metric.metric_name == "CPUUtilization"
+                && metric.value != profile.cpu_value
+        }) {
+            bail!("{control_id} has a CPUUtilization value outside its published profile")
+        }
+        let expected_missing_offsets = profile
+            .missing_cpu_day
+            .map(|day| -(day * DAY_SECONDS + HOUR_SECONDS))
+            .into_iter()
+            .collect::<Vec<_>>();
         match control_id.as_str() {
             "ec2-idle-positive-001" | "ec2-resize-positive-001" => {
-                if average_cpu >= 15.0 || cpu_offsets != expected_offsets {
+                if average_cpu >= LOW_CPU_MAX_EXCLUSIVE || cpu_offsets != expected_offsets {
                     bail!("{control_id} is not a complete low-utilization control")
                 }
             }
             "ec2-idle-negative-001" => {
-                if average_cpu <= 75.0 || cpu_offsets != expected_offsets {
+                if average_cpu <= BUSY_CPU_MIN_EXCLUSIVE || cpu_offsets != expected_offsets {
                     bail!("{control_id} is not a complete busy-utilization control")
                 }
             }
             "ec2-idle-degraded-001" => {
-                if average_cpu >= 15.0
+                if average_cpu >= LOW_CPU_MAX_EXCLUSIVE
                     || cpu_offsets.len() != (HISTORY_DAYS - 1) as usize
-                    || missing_history_offsets(resource).len() != 1
+                    || missing_history_offsets(resource) != expected_missing_offsets
                 {
                     bail!("{control_id} does not have exactly one scoped missing CPU history day")
                 }
             }
             "ec2-resize-negative-001" => {
-                if !(15.0..=75.0).contains(&average_cpu) || cpu_offsets != expected_offsets {
+                if !(OPTIMIZED_CPU_MIN_INCLUSIVE..=OPTIMIZED_CPU_MAX_INCLUSIVE)
+                    .contains(&average_cpu)
+                    || cpu_offsets != expected_offsets
+                {
                     bail!("{control_id} is not a complete optimized resize control")
                 }
             }
@@ -997,7 +1100,7 @@ fn build_manifest(context: ManifestContext<'_>) -> Result<Value> {
                     "cost-explorer.get-cost-and-usage",
                     "compute-optimizer.get-ec2-instance-recommendations"
                 ],
-                "clock": {"anchor": anchor.to_rfc3339_opts(SecondsFormat::Secs, true), "required_history_days": 14},
+                "clock": {"anchor": anchor.to_rfc3339_opts(SecondsFormat::Secs, true), "required_history_days": HISTORY_DAYS},
                 "metric": {"namespace": "AWS/EC2", "metric_name": "CPUUtilization"},
                 "cost": {"metric": "UnblendedCost"}
             })
@@ -1048,7 +1151,7 @@ fn build_manifest(context: ManifestContext<'_>) -> Result<Value> {
         "clock": {
             "anchor": anchor.to_rfc3339_opts(SecondsFormat::Secs, true),
             "bucket": "complete-utc-day",
-            "required_history_days": 14,
+            "required_history_days": HISTORY_DAYS,
             "reusable_until": reusable_until.to_rfc3339_opts(SecondsFormat::Secs, true)
         },
         "generation": generation,
@@ -1222,11 +1325,67 @@ mod tests {
             ("/clock_contract/reuse_ttl_hours", json!(48)),
             ("/control_ids/0", json!("ec2-other-control")),
             ("/generation_rules/history_days", json!(30)),
+            (
+                "/generation_rules/assignment/selection",
+                json!("last five EC2 resources after ascending id sort"),
+            ),
+            (
+                "/generation_rules/evidence_profiles/0/cpu_value",
+                json!(6.0),
+            ),
+            (
+                "/generation_rules/evidence_profiles/2/missing_cpu_day",
+                json!(7),
+            ),
+            ("/generation_rules/history/offset_seconds/0", json!(-7200)),
         ] {
             let mut changed = definition.clone();
             set_pointer(&mut changed, path, replacement);
             assert_ne!(canonical_digest(&changed).unwrap(), baseline, "{path}");
         }
+    }
+
+    #[test]
+    fn definition_serializes_implementation_owned_materialization_profiles() {
+        let definition = definition_with_digest().unwrap();
+        let profiles = definition["generation_rules"]["evidence_profiles"]
+            .as_array()
+            .unwrap();
+        assert_eq!(profiles.len(), MATERIALIZATION_PROFILES.len());
+        assert_eq!(
+            definition["generation_rules"]["assignment"]["control_order"],
+            json!(
+                MATERIALIZATION_PROFILES
+                    .iter()
+                    .map(|profile| profile.control_id)
+                    .collect::<Vec<_>>()
+            )
+        );
+        assert_eq!(
+            definition["generation_rules"]["history"]["offset_seconds"],
+            json!(history_offsets().into_iter().collect::<Vec<_>>())
+        );
+        for (serialized, profile) in profiles.iter().zip(MATERIALIZATION_PROFILES) {
+            assert_eq!(serialized["control_id"], profile.control_id);
+            assert_eq!(serialized["cpu_value"], profile.cpu_value);
+            assert_eq!(serialized["cost_amount"], profile.cost_amount);
+            assert_eq!(
+                serialized["missing_cpu_day"],
+                json!(profile.missing_cpu_day)
+            );
+        }
+    }
+
+    #[test]
+    fn account_scope_defaults_to_and_accepts_authoritative_public_identity() {
+        assert_eq!(
+            resolve_account_id(None).unwrap(),
+            authoritative_account_id()
+        );
+        assert_eq!(
+            resolve_account_id(Some(authoritative_account_id())).unwrap(),
+            authoritative_account_id()
+        );
     }
 
     fn set_pointer(value: &mut Value, pointer: &str, replacement: Value) {
@@ -1325,6 +1484,52 @@ mod tests {
         assert_eq!(snapshot.manifest_bytes, golden);
         let manifest: Value = serde_json::from_slice(&snapshot.manifest_bytes).unwrap();
         assert!(validate_policy_fields(&manifest, "$").is_ok());
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn mismatched_account_scope_fails_before_materialization_or_commit() {
+        let path = std::env::temp_dir().join(format!(
+            "foxtail-fixture-account-mismatch-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let pool = crate::db::init(&format!("sqlite:{}", path.display()))
+            .await
+            .unwrap();
+        for index in 0..5 {
+            sqlx::query(
+                "INSERT INTO resources (id, resource_type, region, scenario, tags)
+                 VALUES (?, 'ec2', 'us-east-1', 'Baseline', '{}')",
+            )
+            .bind(format!("i-account-mismatch-{index}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let error = realize(
+            &pool,
+            RealizeRequest {
+                account_id: Some("999999999999".to_string()),
+                ..RealizeRequest::default()
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("does not match public AWS account"));
+
+        let metric_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM metrics")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let cost_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cost_records")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(metric_count, 0);
+        assert_eq!(cost_count, 0);
+        assert_eq!(read_state(&pool).await.unwrap().status, "ABSENT");
         pool.close().await;
     }
 

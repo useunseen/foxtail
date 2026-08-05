@@ -22,6 +22,13 @@
 - [x] Make the CLI smoke mandatory: seed five EC2 rows in its isolated migrated copy and assert identity-matched CloudWatch history, Cost Explorer resource groups, and Compute Optimizer findings without a skip path.
 - Verification completed with `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets --all-features -- -D warnings`, `bash -n scripts/verify_cli_interop.sh`, the pinned Draft 2020-12 validator, and the mandatory isolated AWS CLI smoke. A live LocalStack deployment is not available in this checkout; that remains an environment gap separate from the local proof.
 
+## Release Qualification Fixture v1 Second Frozen Review Results
+
+- [x] Publish implementation-owned assignment, materialization profiles, history offsets, network formulas, CPU predicates, and required resource rules through `generation_rules`; regenerate definition/manifest goldens and digest-sensitive tests.
+- [x] Resolve fixture account scope from the same authoritative public account identity; reject explicit mismatches before any materialization transaction and verify default/explicit matching parity against public Compute Optimizer identities.
+- [x] Extend the mandatory CLI smoke to query Resource Groups Tagging for every realized manifest ARN and assert exact ARN identity plus the deterministic `Name` tag.
+- Verification completed with `cargo fmt --all -- --check`, `cargo test` (69 tests plus integration suites), `cargo clippy --all-targets --all-features -- -D warnings`, the pinned Draft 2020-12 validator, `bash -n scripts/verify_cli_interop.sh`, `git diff --check`, and the mandatory isolated AWS CLI smoke. The smoke passed exact Resource Groups Tagging ARN/Name checks for all five realized controls. A live LocalStack deployment remains an environment gap.
+
 - [x] Diagnose why AWS CLI `ce get-cost-and-usage --group-by Type=DIMENSION,Key=USAGE_TYPE` fails validation.
 - [x] Add `USAGE_TYPE` as a supported Cost Explorer grouping dimension.
 - [x] Return AWS-style mock usage type keys and `UsageQuantity` metrics for grouped cost responses.

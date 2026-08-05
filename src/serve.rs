@@ -159,6 +159,7 @@ struct GetResourcesRequest {
     pagination_token: Option<String>,
     resources_per_page: Option<u64>,
     tags_per_page: Option<u64>,
+    #[serde(rename = "ResourceARNList")]
     resource_arn_list: Option<Vec<String>>,
     resource_type_filters: Option<Vec<String>>,
     tag_filters: Option<Vec<TagFilterInput>>,
@@ -1692,7 +1693,7 @@ fn canonical_cur_operation(target: &str) -> Option<&str> {
 }
 
 fn mock_account_id() -> &'static str {
-    "123456789012"
+    fixture::authoritative_account_id()
 }
 
 fn resource_arn(resource_type: &str, region: &str, resource_id: &str) -> String {
@@ -6287,6 +6288,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fixture_account_scope_matches_public_compute_optimizer_identities() {
+        let pool = test_pool().await;
+        seed_empty_fixture_ec2_estate(&pool, 5).await;
+        let app = build_app(pool.clone());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_mock/fixture/realize")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"version":"release-qualification-v1","account_id":"{}","clock_anchor":"2026-08-05T00:00:00Z"}}"#,
+                        fixture::authoritative_account_id()
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let realization = response_json(response).await;
+        let manifest_identities = realization["manifest"]["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|resource| {
+                (
+                    resource["resource_id"].as_str().unwrap().to_string(),
+                    resource["aws_identity"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            realization["manifest"]["environment"]["account_id"],
+            fixture::authoritative_account_id()
+        );
+
+        let recommendations = response_json(
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-amz-json-1.0")
+                    .header(
+                        "x-amz-target",
+                        "ComputeOptimizerService.GetEC2InstanceRecommendations",
+                    )
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        let public_identities = recommendations["instanceRecommendations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|recommendation| {
+                let arn = recommendation["instanceArn"].as_str().unwrap().to_string();
+                (arn.rsplit('/').next().unwrap().to_string(), arn)
+            })
+            .filter(|(resource_id, _)| manifest_identities.contains_key(resource_id))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(public_identities, manifest_identities);
+    }
+
+    #[tokio::test]
     async fn fixture_realization_requires_admin_token_when_configured() {
         let pool = test_pool().await;
         seed_empty_fixture_ec2_estate(&pool, 5).await;
@@ -7407,6 +7476,47 @@ mod tests {
                 .contains(":instance/")
         );
         assert_eq!(body["PaginationToken"], "1");
+    }
+
+    #[tokio::test]
+    async fn tagging_get_resources_filters_exact_resource_arn_list() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO resources (id, resource_type, region, scenario, tags)
+             VALUES
+             ('i-a', 'ec2', 'us-east-1', 'Baseline', '{\"Name\":\"api-a\"}'),
+             ('i-b', 'ec2', 'us-east-1', 'Baseline', '{\"Name\":\"api-b\"}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let requested_arn = resource_arn("ec2", "us-east-1", "i-b");
+        let app = build_app(pool);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-amz-json-1.1")
+                    .header(
+                        "x-amz-target",
+                        "ResourceGroupsTaggingAPI_20170126.GetResources",
+                    )
+                    .body(Body::from(
+                        json!({"ResourceARNList": [requested_arn]}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        let mappings = body["ResourceTagMappingList"].as_array().unwrap();
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0]["ResourceARN"], requested_arn);
+        assert_eq!(mappings[0]["Tags"][0]["Value"], "api-b");
     }
 
     #[tokio::test]

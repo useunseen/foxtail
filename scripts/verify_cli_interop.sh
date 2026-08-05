@@ -60,6 +60,7 @@ FIXTURE_SEED_IDS=(
 for fixture_id in "${FIXTURE_SEED_IDS[@]}"; do
   sqlite3 "$TMP_DB" "INSERT OR IGNORE INTO resources (id, resource_type, region, scenario, tags) VALUES ('$fixture_id', 'ec2', 'us-east-1', 'Baseline', '{\"Name\":\"$fixture_id\"}');"
 done
+sqlite3 "$TMP_DB" "UPDATE resources SET tags = '{\"Name\":' || char(34) || id || char(34) || '}' WHERE resource_type = 'ec2';"
 FIXTURE_EC2_COUNT="$(sqlite3 "$TMP_DB" "SELECT COUNT(*) FROM resources WHERE resource_type = 'ec2';")"
 if [[ "$FIXTURE_EC2_COUNT" -lt 5 ]]; then
   echo "fixture seed did not produce five EC2 resources" >&2
@@ -219,6 +220,38 @@ for resource in payload["manifest"]["resources"]:
     print(f'{resource["resource_id"]}\t{resource["control_id"]}')
 PY
 )"
+FIXTURE_ARNS="$(FIXTURE_REALIZATION="$FIXTURE_REALIZATION" python3 - <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ["FIXTURE_REALIZATION"])
+for resource in payload["manifest"]["resources"]:
+    print(f'{resource["resource_id"]}\t{resource["aws_identity"]}')
+PY
+)"
+
+while IFS=$'\t' read -r fixture_id fixture_arn; do
+  [[ -z "$fixture_id" ]] && continue
+  TAGGED_FIXTURE="$(aws_json resourcegroupstaggingapi get-resources \
+    --resource-arn-list "$fixture_arn")"
+  TAGGED_FIXTURE="$TAGGED_FIXTURE" FIXTURE_ID="$fixture_id" FIXTURE_ARN="$fixture_arn" python3 - <<'PY'
+import json
+import os
+
+fixture_id = os.environ["FIXTURE_ID"]
+fixture_arn = os.environ["FIXTURE_ARN"]
+mappings = json.loads(os.environ["TAGGED_FIXTURE"]).get("ResourceTagMappingList", [])
+if len(mappings) != 1 or mappings[0].get("ResourceARN") != fixture_arn:
+    raise SystemExit(f"tagging inventory did not return exact identity {fixture_id}")
+tags = {
+    tag.get("Key"): tag.get("Value")
+    for tag in mappings[0].get("Tags", [])
+}
+if tags.get("Name") != fixture_id:
+    raise SystemExit(f"tagging inventory returned the wrong Name tag for {fixture_id}")
+PY
+done <<<"$FIXTURE_ARNS"
+log_step "Verified release fixture: identity- and tag-matched Resource Groups inventory"
 
 while IFS=$'\t' read -r fixture_id control_id; do
   [[ -z "$fixture_id" ]] && continue

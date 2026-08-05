@@ -87,7 +87,7 @@ pub enum FixtureCommands {
         /// RFC3339 UTC anchor for deterministic evidence windows.
         #[arg(long)]
         clock_anchor: Option<String>,
-        /// AWS account scope to publish in the manifest.
+        /// AWS account scope; must match the public mock account identity.
         #[arg(long)]
         account_id: Option<String>,
         /// AWS region; must match the discovered EC2 estate.

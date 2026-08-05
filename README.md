@@ -167,7 +167,9 @@ The manifest binds the definition digest, generator and LocalStack provenance,
 clock anchor, AWS account/region scope, realized identities, public evidence
 declarations, and the two deferred mutation controls. The ordinary AWS-compatible
 inventory, CloudWatch, Cost Explorer, and Compute Optimizer routes remain the
-authoritative evidence surfaces.
+authoritative evidence surfaces. The default public account scope is
+`123456789012`; an explicit fixture `account_id` must match it so manifest ARNs
+and public identities cannot diverge.
 
 ## Supported AWS-Compatible Commands
 
