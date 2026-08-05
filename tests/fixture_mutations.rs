@@ -469,6 +469,39 @@ async fn cleanup_failure_quarantines_every_returned_id_as_ambiguous() {
 }
 
 #[tokio::test]
+async fn orphan_intent_only_quarantine_status_is_schema_valid() {
+    fixture::with_isolated_qualification(async {
+        let pool = seeded_pool().await;
+        sqlx::query(
+            "INSERT INTO fixture_mutation_intents
+             (intent_id, operation, request_bytes, status, error, created_at, updated_at)
+             VALUES ('orphan-intent-001', 'realize', ?, 'AMBIGUOUS',
+                     'orphaned mutation intent requires reconciliation',
+                     '2026-08-06T00:00:00Z', '2026-08-06T00:00:00Z')",
+        )
+        .bind(b"{}".as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let status: Value =
+            serde_json::from_slice(&fixture::mutation_status(&pool).await.unwrap()).unwrap();
+        assert_eq!(status["status"], "QUARANTINED");
+        assert!(
+            status["quarantined_generations"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(status["intents"].as_array().unwrap().len(), 1);
+        assert_eq!(status["resource_ids"].as_array().unwrap().len(), 0);
+        validate_emitted_schema("status", &status);
+        pool.close().await;
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn lost_or_empty_run_instances_identity_reconciles_without_duplicate_replay() {
     for (endpoint, generation) in [
         ("mock://lost-response-1", 901_i64),

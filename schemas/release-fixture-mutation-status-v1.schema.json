@@ -77,9 +77,12 @@
         "required": ["resource_ids", "intents", "quarantined_generations"],
         "properties": {
           "targets": {"maxItems": 0},
-          "active_faults": {"maxItems": 0},
-          "quarantined_generations": {"minItems": 1}
-        }
+          "active_faults": {"maxItems": 0}
+        },
+        "anyOf": [
+          {"properties": {"quarantined_generations": {"minItems": 1}}},
+          {"properties": {"intents": {"minItems": 1}}}
+        ]
       }
     }
   ],
