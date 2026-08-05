@@ -18,7 +18,7 @@ use aws_sdk_ec2::types::{
 use aws_smithy_http_client::Builder as HttpClientBuilder;
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration as StdDuration;
 use tokio::time::sleep;
@@ -203,12 +203,6 @@ pub struct ObservedInstance {
 pub enum ExternalTerminationState {
     Terminated,
     NotFound,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ExternalTerminationEvidence {
-    pub resource_id: String,
-    pub state: ExternalTerminationState,
 }
 
 #[derive(Debug)]
@@ -860,9 +854,12 @@ impl Ec2MutationBackend {
     pub async fn terminate_all(
         &self,
         target_ids: &[String],
-    ) -> Result<Vec<ExternalTerminationEvidence>> {
+    ) -> Result<BTreeMap<String, ExternalTerminationState>> {
+        if target_ids.iter().collect::<BTreeSet<_>>().len() != target_ids.len() {
+            bail!("mutation termination target IDs must be unique");
+        }
         if target_ids.is_empty() {
-            return Ok(Vec::new());
+            return Ok(BTreeMap::new());
         }
         if let BackendKind::Mock(state) = self.backend.as_ref() {
             let cleanup_delay_ms = {
@@ -882,10 +879,7 @@ impl Ec2MutationBackend {
             }
             return Ok(target_ids
                 .iter()
-                .map(|resource_id| ExternalTerminationEvidence {
-                    resource_id: resource_id.clone(),
-                    state: ExternalTerminationState::NotFound,
-                })
+                .map(|resource_id| (resource_id.clone(), ExternalTerminationState::NotFound))
                 .collect());
         }
         self.aws_client()
@@ -896,13 +890,10 @@ impl Ec2MutationBackend {
             .context("terminate disposable mutation targets")?;
         let deadline = Utc::now() + Duration::seconds(30);
         loop {
-            let mut evidence = Vec::with_capacity(target_ids.len());
+            let mut evidence = BTreeMap::new();
             for target_id in target_ids {
                 if let Some(state) = self.verify_destroyed(target_id).await? {
-                    evidence.push(ExternalTerminationEvidence {
-                        resource_id: target_id.clone(),
-                        state,
-                    });
+                    evidence.insert(target_id.clone(), state);
                 }
             }
             if evidence.len() == target_ids.len() {

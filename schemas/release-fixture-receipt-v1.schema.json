@@ -138,21 +138,12 @@
       },
       "additionalProperties": false
     },
-    "external_termination": {
-      "type": "object",
-      "required": ["resource_id", "state"],
-      "properties": {
-        "resource_id": {"type": "string", "minLength": 1},
-        "state": {"enum": ["terminated", "not-found"]}
-      },
-      "additionalProperties": false
-    },
     "external_termination_evidence": {
-      "type": "array",
-      "minItems": 4,
-      "maxItems": 4,
-      "uniqueItems": true,
-      "items": {"$ref": "#/$defs/external_termination"}
+      "type": "object",
+      "minProperties": 4,
+      "maxProperties": 4,
+      "propertyNames": {"type": "string", "minLength": 1},
+      "additionalProperties": {"enum": ["terminated", "not-found"]}
     },
     "public_absence": {
       "type": "object",

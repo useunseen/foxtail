@@ -281,12 +281,23 @@ async fn mock_backend_reconciles_all_four_scenarios_and_public_absence() {
         )
         .unwrap();
         assert_eq!(destroy["public_inventory_absence"]["all_absent"], true);
-        let external_termination = destroy["external_ec2_termination"].as_array().unwrap();
+        let external_termination = destroy["external_ec2_termination"].as_object().unwrap();
+        let expected_target_ids = targets
+            .iter()
+            .map(|target| target["resource_id"].as_str().unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(external_termination.len(), mutation::CATALOGUE.len());
+        assert_eq!(
+            external_termination
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected_target_ids
+        );
         assert!(
             external_termination
-                .iter()
-                .all(|target| target["state"] == "not-found")
+                .values()
+                .all(|state| state == "not-found")
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
@@ -384,15 +395,36 @@ async fn external_termination_requires_terminal_state_or_not_found() {
             .await
             .is_err()
     );
-    backend
-        .terminate_all(
-            &targets
-                .iter()
-                .map(|(_, observed)| observed.resource_id.clone())
-                .collect::<Vec<_>>(),
-        )
-        .await
-        .unwrap();
+    let target_ids = targets
+        .iter()
+        .map(|(_, observed)| observed.resource_id.clone())
+        .collect::<Vec<_>>();
+    let evidence = backend.terminate_all(&target_ids).await.unwrap();
+    assert_eq!(evidence.len(), target_ids.len());
+    assert_eq!(
+        evidence
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        target_ids
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+    );
+    assert!(
+        evidence
+            .values()
+            .all(|state| *state == mutation::ExternalTerminationState::NotFound)
+    );
+    let duplicate_target_ids = vec![target_ids[0].clone(), target_ids[0].clone()];
+    assert!(
+        backend
+            .terminate_all(&duplicate_target_ids)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("target IDs must be unique")
+    );
 }
 
 #[tokio::test]
@@ -1536,12 +1568,27 @@ async fn native_cli_dispatch_covers_mutation_lifecycle_and_stale_failure() {
             "foxtail.release-fixture-recreate-receipt/v1"
         );
         assert_eq!(recreated["status"], "RECREATED");
+        let prior_target_ids = recreated["prior"]["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|target| target["resource_id"].as_str().unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        let prior_termination = recreated["prior"]["external_ec2_termination"]
+            .as_object()
+            .unwrap();
+        assert_eq!(prior_termination.len(), mutation::CATALOGUE.len());
         assert_eq!(
-            recreated["prior"]["external_ec2_termination"]
-                .as_array()
-                .unwrap()
-                .len(),
-            mutation::CATALOGUE.len()
+            prior_termination
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            prior_target_ids
+        );
+        assert!(
+            prior_termination
+                .values()
+                .all(|state| state == "not-found" || state == "terminated")
         );
         validate_emitted_schema("receipt", &recreated);
         let mut missing_termination_proof = recreated.clone();
@@ -1550,6 +1597,33 @@ async fn native_cli_dispatch_covers_mutation_lifecycle_and_stale_failure() {
             .unwrap()
             .remove("external_ec2_termination");
         assert_schema_rejects("receipt", &missing_termination_proof);
+        let mut omitted_prior_target = recreated.clone();
+        let omitted_prior_id = omitted_prior_target["prior"]["external_ec2_termination"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .next()
+            .cloned()
+            .unwrap();
+        omitted_prior_target["prior"]["external_ec2_termination"]
+            .as_object_mut()
+            .unwrap()
+            .remove(&omitted_prior_id);
+        assert_schema_rejects("receipt", &omitted_prior_target);
+        let prior_ids = recreated["prior"]["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|target| target["resource_id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        let mut contradictory_prior_target = recreated.clone();
+        contradictory_prior_target["prior"]["external_ec2_termination"] = serde_json::json!([
+            {"resource_id": prior_ids[0], "state": "terminated"},
+            {"resource_id": prior_ids[0], "state": "not-found"},
+            {"resource_id": prior_ids[1], "state": "not-found"},
+            {"resource_id": prior_ids[2], "state": "not-found"}
+        ]);
+        assert_schema_rejects("receipt", &contradictory_prior_target);
 
         let current_authority = authority_from_state(&fixture::read_state(&pool).await.unwrap());
         let destroyed: Value = serde_json::from_slice(
@@ -1569,26 +1643,54 @@ async fn native_cli_dispatch_covers_mutation_lifecycle_and_stale_failure() {
         );
         assert_eq!(destroyed["status"], "DESTROYED");
         assert_eq!(destroyed["public_inventory_absence"]["all_absent"], true);
-        assert_eq!(
-            destroyed["external_ec2_termination"]
-                .as_array()
-                .unwrap()
-                .len(),
-            mutation::CATALOGUE.len()
-        );
-        validate_emitted_schema("receipt", &destroyed);
-        let mut duplicate_termination_evidence = destroyed.clone();
-        let termination_evidence = duplicate_termination_evidence["external_ec2_termination"]
+        let destroyed_target_ids = destroyed["targets_destroyed"]
             .as_array()
             .unwrap()
-            .clone();
-        duplicate_termination_evidence["external_ec2_termination"] = serde_json::json!([
-            termination_evidence[0].clone(),
-            termination_evidence[0].clone(),
-            termination_evidence[2].clone(),
-            termination_evidence[3].clone()
+            .iter()
+            .map(|target| target["resource_id"].as_str().unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        let destroyed_termination = destroyed["external_ec2_termination"].as_object().unwrap();
+        assert_eq!(destroyed_termination.len(), mutation::CATALOGUE.len());
+        assert_eq!(
+            destroyed_termination
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            destroyed_target_ids
+        );
+        assert!(
+            destroyed_termination
+                .values()
+                .all(|state| state == "not-found" || state == "terminated")
+        );
+        validate_emitted_schema("receipt", &destroyed);
+        let mut omitted_destroy_target = destroyed.clone();
+        let omitted_destroy_id = omitted_destroy_target["external_ec2_termination"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .next()
+            .cloned()
+            .unwrap();
+        omitted_destroy_target["external_ec2_termination"]
+            .as_object_mut()
+            .unwrap()
+            .remove(&omitted_destroy_id);
+        assert_schema_rejects("receipt", &omitted_destroy_target);
+        let destroyed_ids = destroyed["targets_destroyed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|target| target["resource_id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        let mut contradictory_destroy_target = destroyed.clone();
+        contradictory_destroy_target["external_ec2_termination"] = serde_json::json!([
+            {"resource_id": destroyed_ids[0], "state": "terminated"},
+            {"resource_id": destroyed_ids[0], "state": "not-found"},
+            {"resource_id": destroyed_ids[1], "state": "not-found"},
+            {"resource_id": destroyed_ids[2], "state": "not-found"}
         ]);
-        assert_schema_rejects("receipt", &duplicate_termination_evidence);
+        assert_schema_rejects("receipt", &contradictory_destroy_target);
         let mut contradictory_absence_count = destroyed.clone();
         contradictory_absence_count["public_inventory_absence"]["absent_count"] = 0.into();
         assert_schema_rejects("receipt", &contradictory_absence_count);

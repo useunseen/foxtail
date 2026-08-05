@@ -194,7 +194,9 @@ current generation, mutation-generation id, and exact manifest digest. Fault
 receipts return one-use reset tokens; stale, duplicate, malformed, or
 ambiguous requests fail without changing state. The `destroy` receipt proves
 all generation-owned identities are absent from public Resource Groups
-inventory and all active faults have been reset.
+inventory and all active faults have been reset. Recreate and destroy receipts
+encode `external_ec2_termination` as an identity-keyed object: each exact EC2
+target ID appears once with a `terminated` or service-level `not-found` value.
 
 Example authority-bound lifecycle (values come from `fixture manifest`):
 

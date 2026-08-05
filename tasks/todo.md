@@ -53,7 +53,7 @@ Invariant: qualification mutations can affect only fresh, manifest-bound, one-us
 
 ## Issue #5 Standards Repair Results
 
-- [x] Require prior-generation EC2 termination evidence, unique evidence entries, and a truthful four-identity public-inventory absence count in the receipt schema; add negative coverage for missing proof, duplicate evidence, and contradictory counts.
+- [x] Require prior-generation EC2 termination evidence keyed by each exact target identity, with a truthful four-identity public-inventory absence count in the receipt schema; add negative coverage for missing proof, omitted targets, contradictory duplicate IDs, and contradictory counts.
 - [x] Make the LocalStack EC2 terminal check fail closed on transport, authentication, malformed JSON, wrong identity/state, and non-`InvalidInstanceID.NotFound` service errors; add backend coverage for running/stopped/error observations.
 - Deterministic verification completed with `cargo test -q` (72 unit, 2 API-contract, 19 mutation integration, 3 wrapper tests), `cargo clippy --all-targets --all-features -- -D warnings`, `cargo fmt --all -- --check`, `python3 scripts/validate_release_fixture.py --negative`, `bash -n scripts/verify_cli_interop.sh`, and `git diff --check`. Parent-verified fresh LocalStack 4.14.0 smoke using `AWS_ENDPOINT_URL=http://127.0.0.1:4566`, `FOXTAIL_MUTATION_AMI_ID=ami-760aaa0f`, test credentials, and `us-east-1` passed the tightened EC2 terminal/not-found parser, recreate/destroy lifecycle, zero retired Resource Groups Tagging mappings, and all downstream CLI checks.
 
