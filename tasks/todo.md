@@ -44,6 +44,13 @@ Invariant: qualification mutations can affect only fresh, manifest-bound, one-us
 - [x] Make the CLI smoke use one database/generation, alternate CLI/HTTP fault/reset channels across all four targets, recreate and destroy both generations, verify EC2/Tagging absence, and validate every mutation status/receipt with executable Draft 2020-12 schemas.
 - Verification completed with `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test -q` (71 unit, 2 API-contract, 14 mutation integration, 3 wrapper tests), `python3 scripts/validate_release_fixture.py --negative`, `bash -n scripts/verify_cli_interop.sh`, and `git diff --check`. Live LocalStack smoke remains an environment-dependent gate; the strict absence path requires Describe to return a service-level not-found response.
 
+## Issue #5 Final Live Repair Results
+
+- [x] Make the deterministic failed-realize test inject a pre-dispatch EC2 failure through the mock boundary instead of depending on an unavailable localhost port.
+- [x] Poll only the EC2 state while stopping a running resize target, retain strict final state/type reconciliation, and send the documented `InstanceType` modify field without the duplicate `Attribute` field that makes LocalStack clear the type.
+- Verification completed with `cargo fmt --all`, the focused pre-dispatch, four-scenario mock, and mutation lifecycle tests, and a live LocalStack 4.14.0 run using `AWS_ENDPOINT_URL=http://127.0.0.1:4566`, `FOXTAIL_MUTATION_AMI_ID=ami-760aaa0f`, test credentials, and `us-east-1`. The live run passed realization, all four fault/reset cycles, and public state/type checks. It then stopped at authority-bound recreate because LocalStack continues returning the four terminated old identities instead of a service-level not-found response; the existing strict absence contract therefore remains unverified in that environment.
+- [ ] Full proof: rerun the complete live smoke against an EC2-compatible endpoint that removes terminated identities from public Describe results, then record the successful recreate/destroy absence receipt.
+
 ## Issue #5 Implementation Results
 
 - Added a migration-backed disposable mutation ledger with four generation-owned EC2 targets (stop, resize, stop-recovery, and resize-restoration), manifest/status/identity exposure, complete-estate fingerprinting, and canonical persisted operation receipts.

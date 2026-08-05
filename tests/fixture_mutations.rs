@@ -296,20 +296,20 @@ async fn mock_backend_reconciles_all_four_scenarios_and_public_absence() {
 }
 
 #[tokio::test]
-async fn failed_external_realize_is_durable_and_fail_closed() {
+async fn pre_dispatch_realize_failure_is_durable_and_fail_closed() {
     fixture::with_isolated_qualification(async {
         let pool = seeded_pool().await;
         let error = fixture::realize(
             &pool,
             RealizeRequest {
-                endpoint_url: Some("http://127.0.0.1:1".to_string()),
+                endpoint_url: Some("mock://pre-dispatch".to_string()),
                 ..RealizeRequest::default()
             },
         )
         .await
         .unwrap_err()
         .to_string();
-        assert!(error.contains("mutation") || error.contains("EC2"));
+        assert!(error.contains("before dispatch"));
         assert_eq!(fixture::read_state(&pool).await.unwrap().status, "ABSENT");
         assert_eq!(
             sqlx::query_scalar::<_, i64>(

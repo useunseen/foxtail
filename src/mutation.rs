@@ -12,8 +12,8 @@ use aws_sdk_ec2::config::{Credentials, Region};
 use aws_sdk_ec2::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_ec2::operation::describe_instances::DescribeInstancesError;
 use aws_sdk_ec2::types::{
-    AttributeValue, Filter, Instance, InstanceAttributeName, InstanceStateName, InstanceType,
-    ResourceType, Tag, TagSpecification,
+    AttributeValue, Filter, Instance, InstanceStateName, InstanceType, ResourceType, Tag,
+    TagSpecification,
 };
 use aws_smithy_http_client::Builder as HttpClientBuilder;
 use chrono::{Duration, Utc};
@@ -219,6 +219,7 @@ impl std::error::Error for ProvisionFailure {}
 #[derive(Default)]
 struct MockState {
     instances: BTreeMap<String, ObservedInstance>,
+    fail_dispatch: bool,
     fail_setup_at: Option<usize>,
     fail_cleanup: bool,
     launch_count: usize,
@@ -255,6 +256,7 @@ impl Ec2MutationBackend {
                         .strip_prefix("fail-setup-")
                         .or_else(|| mock_key.strip_prefix("fail-cleanup-setup-"))
                         .and_then(|value| value.parse::<usize>().ok());
+                    let fail_dispatch = mock_key == "pre-dispatch";
                     let lost_response_at = mock_key
                         .strip_prefix("lost-response-")
                         .and_then(|value| value.parse::<usize>().ok());
@@ -265,6 +267,7 @@ impl Ec2MutationBackend {
                         .strip_prefix("slow-cleanup-")
                         .and_then(|value| value.parse::<u64>().ok());
                     Arc::new(Mutex::new(MockState {
+                        fail_dispatch,
                         fail_setup_at,
                         fail_cleanup: mock_key == "fail-cleanup"
                             || mock_key.starts_with("fail-cleanup-setup-"),
@@ -388,6 +391,9 @@ impl Ec2MutationBackend {
                     .map_err(|_| anyhow!("mock mutation state lock poisoned"))?;
                 if state.instances.contains_key(&resource_id) {
                     return Ok(resource_id);
+                }
+                if state.fail_dispatch {
+                    bail!("injected EC2 RunInstances failure before dispatch");
                 }
                 state
                     .instances
@@ -705,13 +711,11 @@ impl Ec2MutationBackend {
                         .send()
                         .await
                         .context("stop target before resize")?;
-                    self.wait_for_instance(target_id, "stopped", &before.instance_type)
-                        .await?;
+                    self.wait_for_instance_state(target_id, "stopped").await?;
                 }
                 self.aws_client()
                     .modify_instance_attribute()
                     .instance_id(target_id)
-                    .attribute(InstanceAttributeName::InstanceType)
                     .instance_type(
                         AttributeValue::builder()
                             .value(scenario.terminal_type)
@@ -758,7 +762,6 @@ impl Ec2MutationBackend {
             self.aws_client()
                 .modify_instance_attribute()
                 .instance_id(target_id)
-                .attribute(InstanceAttributeName::InstanceType)
                 .instance_type(
                     AttributeValue::builder()
                         .value(scenario.initial_type)
@@ -906,6 +909,28 @@ impl Ec2MutationBackend {
             if Utc::now() >= deadline {
                 bail!(
                     "timed out waiting for target {target_id}: expected {expected_state}:{expected_type}, observed {}:{}",
+                    observed.instance_state,
+                    observed.instance_type
+                )
+            }
+            sleep(StdDuration::from_millis(200)).await;
+        }
+    }
+
+    async fn wait_for_instance_state(
+        &self,
+        target_id: &str,
+        expected_state: &str,
+    ) -> Result<ObservedInstance> {
+        let deadline = Utc::now() + Duration::seconds(30);
+        loop {
+            let observed = self.describe_instance(target_id).await?;
+            if observed.instance_state == expected_state {
+                return Ok(observed);
+            }
+            if Utc::now() >= deadline {
+                bail!(
+                    "timed out waiting for target {target_id}: expected state {expected_state}, observed {}:{}",
                     observed.instance_state,
                     observed.instance_type
                 )
