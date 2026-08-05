@@ -13,6 +13,22 @@ use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 use std::collections::{BTreeMap, BTreeSet};
 
+const HISTORY_DAYS: i64 = 14;
+const DAY_SECONDS: i64 = 86_400;
+const HOUR_SECONDS: i64 = 3_600;
+const DEGRADED_MISSING_DAY: i64 = 6;
+const FORBIDDEN_POLICY_KEYS: [&str; 9] = [
+    "Required",
+    "Stretch",
+    "required",
+    "stretch",
+    "expected_finding",
+    "expected_findings",
+    "authoritative_expected_finding",
+    "authoritative_finding",
+    "finding",
+];
+
 pub const FIXTURE_VERSION: &str = "release-qualification-v1";
 pub const DEFINITION_SCHEMA: &str = "foxtail.release-fixture-definition/v1";
 pub const MANIFEST_SCHEMA: &str = "foxtail.release-fixture-manifest/v1";
@@ -99,6 +115,7 @@ pub fn canonical_digest(value: &Value) -> Result<String> {
 
 /// Validate a persisted/document value without silently rewriting its digest.
 pub fn validate_document(value: &Value, digest_field: &str) -> Result<(Vec<u8>, String)> {
+    validate_policy_fields(value, "$")?;
     let actual = canonical_digest(value)?;
     if let Some(declared) = value.get(digest_field).and_then(Value::as_str)
         && declared != actual
@@ -112,6 +129,27 @@ pub fn validate_document(value: &Value, digest_field: &str) -> Result<(Vec<u8>, 
     }
     let bytes = canonical_bytes(value)?;
     Ok((bytes, actual))
+}
+
+fn validate_policy_fields(value: &Value, path: &str) -> Result<()> {
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object {
+                let child_path = format!("{path}.{key}");
+                if FORBIDDEN_POLICY_KEYS.contains(&key.as_str()) {
+                    bail!("forbidden policy field at {child_path}");
+                }
+                validate_policy_fields(child, &child_path)?;
+            }
+        }
+        Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                validate_policy_fields(child, &format!("{path}[{index}]"))?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 pub fn definition_value() -> Value {
@@ -351,16 +389,10 @@ pub async fn realize(pool: &SqlitePool, request: RealizeRequest) -> Result<Fixtu
     let anchor = parse_anchor(request.clock_anchor.as_deref())?;
 
     let rows = sqlx::query(
-        "SELECT id, region, scenario,
-                (SELECT AVG(m.value) FROM metrics m
-                  WHERE m.resource_id = r.id
-                    AND m.namespace = 'AWS/EC2'
-                    AND m.metric_name = 'CPUUtilization') AS avg_cpu,
-                (SELECT COUNT(*) FROM metrics m WHERE m.resource_id = r.id) AS metric_count,
-                (SELECT COUNT(*) FROM cost_records c WHERE c.resource_id = r.id) AS cost_record_count
-         FROM resources r
-         WHERE r.resource_type = 'ec2'
-         ORDER BY r.id ASC",
+        "SELECT id, region, scenario
+         FROM resources
+         WHERE resource_type = 'ec2'
+         ORDER BY id ASC",
     )
     .fetch_all(pool)
     .await
@@ -374,16 +406,13 @@ pub async fn realize(pool: &SqlitePool, request: RealizeRequest) -> Result<Fixtu
         )
     }
 
-    let mut resources = rows
+    let resources = rows
         .into_iter()
         .map(|row| {
-            Ok(EstateResource {
+            Ok(ResourceIdentity {
                 id: row.try_get("id")?,
                 region: row.try_get("region")?,
                 scenario: row.try_get("scenario")?,
-                avg_cpu: row.try_get("avg_cpu")?,
-                metric_count: row.try_get("metric_count")?,
-                cost_record_count: row.try_get("cost_record_count")?,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -413,13 +442,6 @@ pub async fn realize(pool: &SqlitePool, request: RealizeRequest) -> Result<Fixtu
         )
     }
 
-    resources.sort_by(|left, right| {
-        left.avg_cpu
-            .partial_cmp(&right.avg_cpu)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| left.id.cmp(&right.id))
-    });
-
     let assigned = assign_realized_resources(&resources);
     let account_id = request
         .account_id
@@ -438,25 +460,46 @@ pub async fn realize(pool: &SqlitePool, request: RealizeRequest) -> Result<Fixtu
     let source_revision =
         std::env::var("FOXTAIL_SOURCE_REVISION").unwrap_or_else(|_| "unknown".to_string());
 
+    let mut tx = pool.begin().await?;
+    for (control_id, resource) in &assigned {
+        materialize_control_evidence(&mut tx, control_id, &resource.id).await?;
+    }
+
+    let observed_resources = load_estate_resources(&mut tx, &resources).await?;
+    let observed_by_id = observed_resources
+        .iter()
+        .map(|resource| (resource.id.clone(), resource.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let assigned_observed = assigned
+        .iter()
+        .map(|(control_id, resource)| {
+            let observed = observed_by_id.get(&resource.id).cloned().ok_or_else(|| {
+                anyhow!("materialized fixture resource {} disappeared", resource.id)
+            })?;
+            Ok((control_id.clone(), observed))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    validate_realized_controls(&assigned_observed)?;
+
     let generation = sqlx::query_scalar::<_, i64>(
         "SELECT generation FROM fixture_realizations WHERE singleton_id = 1",
     )
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?
     .unwrap_or(0)
         + 1;
 
-    let read_only_fingerprint = estate_fingerprint(&assigned, &region, &account_id, false)?;
-    let complete_map = resources
-        .iter()
-        .map(|resource| (resource.id.clone(), resource.clone()))
+    let read_only_fingerprint = estate_fingerprint(&assigned_observed, &region, &account_id)?;
+    let complete_map = observed_resources
+        .into_iter()
+        .map(|resource| (resource.id.clone(), resource))
         .collect::<BTreeMap<_, _>>();
-    let complete_fingerprint = estate_fingerprint(&complete_map, &region, &account_id, true)?;
+    let complete_fingerprint = estate_fingerprint(&complete_map, &region, &account_id)?;
 
     let manifest_without_digest = build_manifest(ManifestContext {
         definition_digest: &definition_digest,
-        assigned: &assigned,
-        complete_resources: &resources,
+        assigned: &assigned_observed,
+        complete_resources: &complete_map,
         region: &region,
         account_id: &account_id,
         endpoint_url: &endpoint_url,
@@ -469,7 +512,6 @@ pub async fn realize(pool: &SqlitePool, request: RealizeRequest) -> Result<Fixtu
     })?;
     let (manifest_bytes, manifest_digest) = with_digest(&manifest_without_digest)?;
 
-    let mut tx = pool.begin().await?;
     sqlx::query(
         "INSERT INTO fixture_realizations
            (singleton_id, definition_bytes, definition_digest, manifest_bytes, manifest_digest,
@@ -572,6 +614,27 @@ fn sort_json(value: &Value) -> Value {
 }
 
 #[derive(Debug, Clone)]
+struct ResourceIdentity {
+    id: String,
+    region: String,
+    scenario: String,
+}
+
+#[derive(Debug, Clone)]
+struct MetricObservation {
+    namespace: String,
+    metric_name: String,
+    seconds_from_now: i64,
+    value: f64,
+}
+
+#[derive(Debug, Clone)]
+struct CostObservation {
+    seconds_from_now: i64,
+    amount: f64,
+}
+
+#[derive(Debug, Clone)]
 struct EstateResource {
     id: String,
     region: String,
@@ -579,12 +642,14 @@ struct EstateResource {
     avg_cpu: Option<f64>,
     metric_count: i64,
     cost_record_count: i64,
+    metrics: Vec<MetricObservation>,
+    costs: Vec<CostObservation>,
 }
 
 struct ManifestContext<'a> {
     definition_digest: &'a str,
     assigned: &'a BTreeMap<String, EstateResource>,
-    complete_resources: &'a [EstateResource],
+    complete_resources: &'a BTreeMap<String, EstateResource>,
     region: &'a str,
     account_id: &'a str,
     endpoint_url: &'a str,
@@ -596,19 +661,245 @@ struct ManifestContext<'a> {
     complete_fingerprint: &'a str,
 }
 
-fn assign_realized_resources(resources: &[EstateResource]) -> BTreeMap<String, EstateResource> {
-    let indices = [
-        0usize,
-        resources.len() - 1,
-        resources.len().saturating_sub(2),
-        1,
-        2,
-    ];
+fn assign_realized_resources(resources: &[ResourceIdentity]) -> BTreeMap<String, ResourceIdentity> {
     REALIZED_CONTROL_IDS
         .iter()
-        .zip(indices)
-        .map(|(control_id, index)| ((*control_id).to_string(), resources[index].clone()))
+        .zip(resources.iter().take(REALIZED_CONTROL_IDS.len()))
+        .map(|(control_id, resource)| ((*control_id).to_string(), resource.clone()))
         .collect()
+}
+
+fn history_offsets() -> BTreeSet<i64> {
+    (0..HISTORY_DAYS)
+        .map(|day| -(day * DAY_SECONDS + HOUR_SECONDS))
+        .collect()
+}
+
+fn missing_history_offsets(resource: &EstateResource) -> Vec<i64> {
+    let observed = resource
+        .metrics
+        .iter()
+        .filter(|metric| metric.namespace == "AWS/EC2" && metric.metric_name == "CPUUtilization")
+        .map(|metric| metric.seconds_from_now)
+        .collect::<BTreeSet<_>>();
+    history_offsets().difference(&observed).copied().collect()
+}
+
+async fn materialize_control_evidence(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    control_id: &str,
+    resource_id: &str,
+) -> Result<()> {
+    sqlx::query("DELETE FROM metrics WHERE resource_id = ?")
+        .bind(resource_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM cost_records WHERE resource_id = ?")
+        .bind(resource_id)
+        .execute(&mut **tx)
+        .await?;
+
+    let cpu_value = match control_id {
+        "ec2-idle-positive-001" => 5.0,
+        "ec2-idle-negative-001" => 85.0,
+        "ec2-idle-degraded-001" => 7.0,
+        "ec2-resize-positive-001" => 6.0,
+        "ec2-resize-negative-001" => 40.0,
+        _ => bail!("cannot materialize unknown realized control '{control_id}'"),
+    };
+    let cost_amount = match control_id {
+        "ec2-idle-positive-001" => 1.00,
+        "ec2-idle-negative-001" => 1.10,
+        "ec2-idle-degraded-001" => 1.20,
+        "ec2-resize-positive-001" => 1.30,
+        "ec2-resize-negative-001" => 1.40,
+        _ => bail!("cannot materialize unknown realized control '{control_id}'"),
+    };
+
+    for day in 0..HISTORY_DAYS {
+        let offset = -(day * DAY_SECONDS + HOUR_SECONDS);
+        let skip_degraded_cpu =
+            control_id == "ec2-idle-degraded-001" && day == DEGRADED_MISSING_DAY;
+        if !skip_degraded_cpu {
+            insert_metric(tx, resource_id, "CPUUtilization", offset, cpu_value).await?;
+        }
+        insert_metric(
+            tx,
+            resource_id,
+            "NetworkIn",
+            offset,
+            10_000.0 + (day as f64 * 100.0),
+        )
+        .await?;
+        insert_metric(
+            tx,
+            resource_id,
+            "NetworkOut",
+            offset,
+            20_000.0 + (day as f64 * 100.0),
+        )
+        .await?;
+        sqlx::query(
+            "INSERT INTO cost_records (resource_id, seconds_from_now, amount)
+             VALUES (?, ?, ?)",
+        )
+        .bind(resource_id)
+        .bind(offset)
+        .bind(cost_amount)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn insert_metric(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    resource_id: &str,
+    metric_name: &str,
+    seconds_from_now: i64,
+    value: f64,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO metrics (resource_id, namespace, metric_name, seconds_from_now, value)
+         VALUES (?, 'AWS/EC2', ?, ?, ?)",
+    )
+    .bind(resource_id)
+    .bind(metric_name)
+    .bind(seconds_from_now)
+    .bind(value)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn load_estate_resources(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    identities: &[ResourceIdentity],
+) -> Result<Vec<EstateResource>> {
+    let mut resources = Vec::with_capacity(identities.len());
+    for identity in identities {
+        let metric_rows = sqlx::query(
+            "SELECT namespace, metric_name, seconds_from_now, value
+             FROM metrics
+             WHERE resource_id = ?
+             ORDER BY namespace, metric_name, seconds_from_now",
+        )
+        .bind(&identity.id)
+        .fetch_all(&mut **tx)
+        .await?;
+        let metrics = metric_rows
+            .into_iter()
+            .map(|row| {
+                Ok(MetricObservation {
+                    namespace: row.try_get("namespace")?,
+                    metric_name: row.try_get("metric_name")?,
+                    seconds_from_now: row.try_get("seconds_from_now")?,
+                    value: row.try_get("value")?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let cost_rows = sqlx::query(
+            "SELECT seconds_from_now, amount
+             FROM cost_records
+             WHERE resource_id = ?
+             ORDER BY seconds_from_now",
+        )
+        .bind(&identity.id)
+        .fetch_all(&mut **tx)
+        .await?;
+        let costs = cost_rows
+            .into_iter()
+            .map(|row| {
+                Ok(CostObservation {
+                    seconds_from_now: row.try_get("seconds_from_now")?,
+                    amount: row.try_get("amount")?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let cpu_values = metrics
+            .iter()
+            .filter(|metric| {
+                metric.namespace == "AWS/EC2" && metric.metric_name == "CPUUtilization"
+            })
+            .map(|metric| metric.value)
+            .collect::<Vec<_>>();
+        let avg_cpu = if cpu_values.is_empty() {
+            None
+        } else {
+            Some(cpu_values.iter().sum::<f64>() / cpu_values.len() as f64)
+        };
+        resources.push(EstateResource {
+            id: identity.id.clone(),
+            region: identity.region.clone(),
+            scenario: identity.scenario.clone(),
+            avg_cpu,
+            metric_count: metrics.len() as i64,
+            cost_record_count: costs.len() as i64,
+            metrics,
+            costs,
+        });
+    }
+    Ok(resources)
+}
+
+fn validate_realized_controls(assigned: &BTreeMap<String, EstateResource>) -> Result<()> {
+    let expected_offsets = history_offsets();
+    for (control_id, resource) in assigned {
+        let cpu_offsets = resource
+            .metrics
+            .iter()
+            .filter(|metric| {
+                metric.namespace == "AWS/EC2" && metric.metric_name == "CPUUtilization"
+            })
+            .map(|metric| metric.seconds_from_now)
+            .collect::<BTreeSet<_>>();
+        let cost_offsets = resource
+            .costs
+            .iter()
+            .map(|cost| cost.seconds_from_now)
+            .collect::<BTreeSet<_>>();
+        if cost_offsets != expected_offsets
+            || resource
+                .costs
+                .iter()
+                .any(|cost| !cost.amount.is_finite() || cost.amount <= 0.0)
+        {
+            bail!("{control_id} does not have complete positive cost evidence")
+        }
+        let average_cpu = resource
+            .avg_cpu
+            .ok_or_else(|| anyhow!("{control_id} has no CPUUtilization evidence"))?;
+        if !average_cpu.is_finite() {
+            bail!("{control_id} has a non-finite CPUUtilization average")
+        }
+        match control_id.as_str() {
+            "ec2-idle-positive-001" | "ec2-resize-positive-001" => {
+                if average_cpu >= 15.0 || cpu_offsets != expected_offsets {
+                    bail!("{control_id} is not a complete low-utilization control")
+                }
+            }
+            "ec2-idle-negative-001" => {
+                if average_cpu <= 75.0 || cpu_offsets != expected_offsets {
+                    bail!("{control_id} is not a complete busy-utilization control")
+                }
+            }
+            "ec2-idle-degraded-001" => {
+                if average_cpu >= 15.0
+                    || cpu_offsets.len() != (HISTORY_DAYS - 1) as usize
+                    || missing_history_offsets(resource).len() != 1
+                {
+                    bail!("{control_id} does not have exactly one scoped missing CPU history day")
+                }
+            }
+            "ec2-resize-negative-001" => {
+                if !(15.0..=75.0).contains(&average_cpu) || cpu_offsets != expected_offsets {
+                    bail!("{control_id} is not a complete optimized resize control")
+                }
+            }
+            _ => bail!("unexpected realized control '{control_id}'"),
+        }
+    }
+    Ok(())
 }
 
 fn resource_arn(region: &str, account_id: &str, resource_id: &str) -> String {
@@ -619,7 +910,6 @@ fn estate_fingerprint(
     resources: &BTreeMap<String, EstateResource>,
     region: &str,
     account_id: &str,
-    complete: bool,
 ) -> Result<String> {
     let rows = resources
         .iter()
@@ -630,9 +920,16 @@ fn estate_fingerprint(
                 "resource_type": "ec2",
                 "region": resource.region,
                 "scenario": resource.scenario,
-                "metric_count": resource.metric_count,
-                "cost_record_count": resource.cost_record_count,
-                "complete": complete
+                "metrics": resource.metrics.iter().map(|metric| json!({
+                    "namespace": metric.namespace,
+                    "metric_name": metric.metric_name,
+                    "seconds_from_now": metric.seconds_from_now,
+                    "value": metric.value
+                })).collect::<Vec<_>>(),
+                "cost_records": resource.costs.iter().map(|cost| json!({
+                    "seconds_from_now": cost.seconds_from_now,
+                    "amount": cost.amount
+                })).collect::<Vec<_>>()
             })
         })
         .collect::<Vec<_>>();
@@ -673,7 +970,15 @@ fn build_manifest(context: ManifestContext<'_>) -> Result<Value> {
                 "observed": {
                     "metric_count": resource.metric_count,
                     "cost_record_count": resource.cost_record_count,
-                    "average_cpu": resource.avg_cpu
+                    "average_cpu": resource.avg_cpu,
+                    "metric_names": resource.metrics.iter().map(|metric| metric.metric_name.clone()).collect::<BTreeSet<_>>(),
+                    "cpu_offsets": resource.metrics.iter()
+                        .filter(|metric| metric.metric_name == "CPUUtilization")
+                        .map(|metric| metric.seconds_from_now)
+                        .collect::<BTreeSet<_>>(),
+                    "cost_offsets": resource.costs.iter()
+                        .map(|cost| cost.seconds_from_now)
+                        .collect::<BTreeSet<_>>()
                 }
             })
         })
@@ -686,7 +991,7 @@ fn build_manifest(context: ManifestContext<'_>) -> Result<Value> {
                 "control_id": control_id,
                 "resource_id": resource.id,
                 "surfaces": [
-                    "ec2.describe-instances",
+                    "resourcegroupstaggingapi.get-resources",
                     "cloudwatch.list-metrics",
                     "cloudwatch.get-metric-statistics",
                     "cost-explorer.get-cost-and-usage",
@@ -769,21 +1074,24 @@ fn role_and_intent(control_id: &str) -> (&'static str, &'static str) {
 }
 
 fn evidence_declaration(control_id: &str, resource: &EstateResource) -> Value {
+    let missing_cpu_offsets = missing_history_offsets(resource);
     let mut evidence = json!({
-        "cloudwatch_complete_days": 14,
-        "cost_complete_days": 14,
-        "topology": "independently-observable"
+        "cloudwatch_complete_days": HISTORY_DAYS - missing_cpu_offsets.len() as i64,
+        "cloudwatch_expected_days": HISTORY_DAYS,
+        "cloudwatch_missing_offsets": missing_cpu_offsets,
+        "cost_complete_days": resource.costs.iter().map(|cost| cost.seconds_from_now).collect::<BTreeSet<_>>().len(),
+        "cost_expected_days": HISTORY_DAYS,
+        "topology": "independently-observable",
+        "observed_metric_count": resource.metric_count,
+        "observed_cost_record_count": resource.cost_record_count
     });
     if control_id == "ec2-idle-degraded-001" {
-        evidence["cloudwatch_complete_days"] = json!(13);
         evidence["degradation"] = json!("scoped-missing-day");
     }
     if control_id.starts_with("ec2-resize") {
         evidence["recommendation_bound_to_current_type"] = json!(true);
-        evidence["recommendation_fresh"] = json!(true);
+        evidence["recommendation_observed_within_days"] = json!(HISTORY_DAYS);
     }
-    evidence["observed_metric_count"] = json!(resource.metric_count);
-    evidence["observed_cost_record_count"] = json!(resource.cost_record_count);
     evidence
 }
 
@@ -953,6 +1261,16 @@ mod tests {
     }
 
     #[test]
+    fn validation_rejects_forbidden_policy_fields_at_any_depth() {
+        let mut definition = definition_with_digest().unwrap();
+        definition["controls"][0]["evidence"]["expected_finding"] = json!("over_provisioned");
+        let error = validate_document(&definition, "digest")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("forbidden policy field"));
+    }
+
+    #[test]
     fn definition_matches_checked_in_canonical_golden() {
         let (bytes, _) = canonical_definition().unwrap();
         let golden = include_bytes!("../tests/fixtures/release-qualification-v1.definition.json");
@@ -968,6 +1286,46 @@ mod tests {
         assert_eq!(canonical, bytes.strip_suffix(b"\n").unwrap_or(bytes));
         assert_eq!(value["digest"], digest);
         assert_eq!(value["resources"].as_array().unwrap().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn generated_manifest_matches_checked_in_canonical_golden() {
+        let path = std::env::temp_dir().join(format!(
+            "foxtail-fixture-golden-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let pool = crate::db::init(&format!("sqlite:{}", path.display()))
+            .await
+            .unwrap();
+        for index in 0..5 {
+            sqlx::query(
+                "INSERT INTO resources (id, resource_type, region, scenario, tags)
+                 VALUES (?, 'ec2', 'us-east-1', 'Baseline', '{}')",
+            )
+            .bind(format!("i-empty-fixture-{index}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let snapshot = realize(
+            &pool,
+            RealizeRequest {
+                clock_anchor: Some("2026-08-05T00:00:00Z".to_string()),
+                account_id: Some(DEFAULT_ACCOUNT_ID.to_string()),
+                region: Some(DEFAULT_REGION.to_string()),
+                endpoint_url: Some(DEFAULT_LOCALSTACK_ENDPOINT.to_string()),
+                localstack_version: Some("unknown".to_string()),
+                ..RealizeRequest::default()
+            },
+        )
+        .await
+        .unwrap();
+        let golden = include_bytes!("../tests/fixtures/release-qualification-v1.manifest.json");
+        let golden = golden.strip_suffix(b"\n").unwrap_or(golden);
+        assert_eq!(snapshot.manifest_bytes, golden);
+        let manifest: Value = serde_json::from_slice(&snapshot.manifest_bytes).unwrap();
+        assert!(validate_policy_fields(&manifest, "$").is_ok());
+        pool.close().await;
     }
 
     #[test]

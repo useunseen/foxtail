@@ -44,51 +44,6 @@ pub fn build_app(pool: SqlitePool) -> Router {
         .route("/_mock/fixture/status", get(fixture_status_handler))
         .route("/_mock/fixture/manifest", get(fixture_manifest_handler))
         .route("/_mock/fixture/identities", get(fixture_identities_handler))
-        .route("/_mock/fixture-definition", get(fixture_definition_handler))
-        .route("/_mock/fixture-manifest", get(fixture_manifest_handler))
-        .route("/_mock/fixture-identities", get(fixture_identities_handler))
-        .route("/_mock/fixture-status", get(fixture_status_handler))
-        .route(
-            "/_mock/fixture",
-            get(fixture_status_handler).post(fixture_realize_handler),
-        )
-        .route(
-            "/_mock/release-fixture/definition",
-            get(fixture_definition_handler),
-        )
-        .route(
-            "/_mock/release-fixture/realize",
-            post(fixture_realize_handler),
-        )
-        .route("/_mock/release-fixture/status", get(fixture_status_handler))
-        .route(
-            "/_mock/release-fixture/manifest",
-            get(fixture_manifest_handler),
-        )
-        .route(
-            "/_mock/release-fixture/identities",
-            get(fixture_identities_handler),
-        )
-        .route(
-            "/_mock/release-qualification/definition",
-            get(fixture_definition_handler),
-        )
-        .route(
-            "/_mock/release-qualification/realize",
-            post(fixture_realize_handler),
-        )
-        .route(
-            "/_mock/release-qualification/status",
-            get(fixture_status_handler),
-        )
-        .route(
-            "/_mock/release-qualification/manifest",
-            get(fixture_manifest_handler),
-        )
-        .route(
-            "/_mock/release-qualification/identities",
-            get(fixture_identities_handler),
-        )
         .route("/_mock/dashboard/data", get(dashboard_data_handler))
         .route(
             "/_mock/dashboard/resources",
@@ -2455,13 +2410,20 @@ fn ensure_admin_authorized(
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty());
 
+    ensure_admin_authorized_with_expected(headers, expected.as_deref())
+}
+
+fn ensure_admin_authorized_with_expected(
+    headers: &HeaderMap,
+    expected: Option<&str>,
+) -> std::result::Result<(), Box<axum::response::Response>> {
     if let Some(token) = expected {
         let provided = headers
             .get(ADMIN_TOKEN_HEADER)
             .and_then(|value| value.to_str().ok())
             .map(str::trim);
 
-        if provided != Some(token.as_str()) {
+        if provided != Some(token) {
             return Err(Box::new(
                 (
                     StatusCode::UNAUTHORIZED,
@@ -2813,8 +2775,16 @@ async fn fixture_definition_handler(
 
 async fn fixture_realize_handler(
     State(pool): State<SqlitePool>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> axum::response::Response {
+    if let Err(response) = ensure_admin_authorized(&headers) {
+        return *response;
+    }
+    fixture_realize_response(pool, body).await
+}
+
+async fn fixture_realize_response(pool: SqlitePool, body: Bytes) -> axum::response::Response {
     let request = match fixture::parse_json_request(&body) {
         Ok(request) => request,
         Err(error) => return fixture_error_response(StatusCode::BAD_REQUEST, error.to_string()),
@@ -6007,6 +5977,7 @@ async fn handle_get_metric_data(
 mod tests {
     use super::*;
     use axum::body::{Body, to_bytes};
+    use axum::extract::Extension;
     use axum::http::Request;
     use serde_json::Value;
     use tower::ServiceExt;
@@ -6110,6 +6081,32 @@ mod tests {
         }
     }
 
+    async fn seed_empty_fixture_ec2_estate(pool: &SqlitePool, count: usize) {
+        for index in 0..count {
+            let resource_id = format!("i-empty-fixture-{index}");
+            sqlx::query(
+                "INSERT INTO resources (id, resource_type, region, scenario, tags)
+                 VALUES (?, 'ec2', 'us-east-1', 'Baseline', '{}')",
+            )
+            .bind(resource_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    async fn fixture_realize_with_test_token(
+        State(pool): State<SqlitePool>,
+        Extension(expected): Extension<String>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> axum::response::Response {
+        if let Err(response) = ensure_admin_authorized_with_expected(&headers, Some(&expected)) {
+            return *response;
+        }
+        fixture_realize_response(pool, body).await
+    }
+
     #[tokio::test]
     async fn fixture_definition_is_canonical_and_status_is_absent_before_realization() {
         let pool = test_pool().await;
@@ -6131,7 +6128,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/_mock/release-fixture/status")
+                    .uri("/_mock/fixture/status")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -6228,6 +6225,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fixture_realization_materializes_and_validates_empty_ec2_rows() {
+        let pool = test_pool().await;
+        seed_empty_fixture_ec2_estate(&pool, 5).await;
+        let app = build_app(pool.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_mock/fixture/realize")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"version":"release-qualification-v1","clock_anchor":"2026-08-05T00:00:00Z"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let realization = response_json(response).await;
+        let resources = realization["manifest"]["resources"].as_array().unwrap();
+        assert_eq!(resources.len(), fixture::REALIZED_CONTROL_IDS.len());
+        for resource in resources {
+            assert!(resource["observed"]["metric_count"].as_i64().unwrap() > 0);
+            assert_eq!(resource["observed"]["cost_record_count"], 14);
+            assert!(
+                !resource["observed"]["metric_names"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        let degraded = resources
+            .iter()
+            .find(|resource| resource["control_id"] == "ec2-idle-degraded-001")
+            .unwrap();
+        assert_eq!(degraded["evidence"]["cloudwatch_complete_days"], 13);
+        assert_eq!(
+            degraded["evidence"]["cloudwatch_missing_offsets"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let metric_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM metrics WHERE resource_id = 'i-empty-fixture-0'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let cost_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM cost_records WHERE resource_id = 'i-empty-fixture-0'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(metric_rows, 42);
+        assert_eq!(cost_rows, 14);
+    }
+
+    #[tokio::test]
+    async fn fixture_realization_requires_admin_token_when_configured() {
+        let pool = test_pool().await;
+        seed_empty_fixture_ec2_estate(&pool, 5).await;
+        let app = Router::new()
+            .route(
+                "/_mock/fixture/realize",
+                post(fixture_realize_with_test_token),
+            )
+            .layer(Extension("fixture-secret".to_string()))
+            .with_state(pool.clone());
+        let request_body = Body::from(
+            r#"{"version":"release-qualification-v1","clock_anchor":"2026-08-05T00:00:00Z"}"#,
+        );
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_mock/fixture/realize")
+                    .header("content-type", "application/json")
+                    .body(request_body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let status = fixture::read_state(&pool).await.unwrap();
+        assert_eq!(status.status, "ABSENT");
+
+        let authorized = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_mock/fixture/realize")
+                    .header("content-type", "application/json")
+                    .header(ADMIN_TOKEN_HEADER, "fixture-secret")
+                    .body(Body::from(
+                        r#"{"version":"release-qualification-v1","clock_anchor":"2026-08-05T00:00:00Z"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authorized.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn fixture_realization_rejects_incomplete_estate_without_partial_state() {
         let pool = test_pool().await;
         seed_fixture_ec2_estate(&pool, 4).await;
@@ -6237,7 +6344,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/_mock/release-fixture/realize")
+                    .uri("/_mock/fixture/realize")
                     .body(Body::empty())
                     .unwrap(),
             )

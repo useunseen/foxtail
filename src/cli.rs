@@ -64,11 +64,7 @@ pub enum Commands {
         address: String,
     },
     /// Publish and inspect the versioned release-qualification fixture.
-    #[command(
-        name = "fixture",
-        visible_alias = "release-qualification",
-        alias = "release-fixture"
-    )]
+    #[command(name = "fixture")]
     Fixture {
         #[command(subcommand)]
         command: FixtureCommands,

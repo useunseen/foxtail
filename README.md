@@ -144,11 +144,12 @@ curl http://127.0.0.1:8080/_mock/status
 
 ### Release-Qualification Fixture v1
 
-The release-qualification fixture is a deterministic, read-only tracer bullet for
-the five positive, negative, and degraded controls declared by the v1 contract.
-It does not mutate or reset the generated estate. The definition is available
-before realization; the manifest and realized identities are published only
-after a successful realization.
+The release-qualification fixture is a deterministic tracer bullet for the five
+positive, negative, and degraded controls declared by the v1 contract. Realize
+it against a disposable LocalStack copy: realization materializes the fixture's
+public metric and cost evidence for five EC2 identities, while the source estate
+is never changed. The definition is available before realization; the manifest
+and realized identities are published only after a successful realization.
 
 The native CLI and local HTTP routes expose the same canonical JSON documents:
 

@@ -96,8 +96,21 @@
           "resource_type": {"const": "ec2"},
           "aws_identity": {"type": "string"},
           "scenario": {"type": "string"},
-          "evidence": {"type": "object"},
-          "observed": {"type": "object"}
+          "evidence": {
+            "type": "object",
+            "patternProperties": {
+              "^(Required|Stretch|required|stretch|expected_finding|expected_findings|authoritative_expected_finding|finding)$": false
+            }
+          },
+          "observed": {
+            "type": "object",
+            "patternProperties": {
+              "^(Required|Stretch|required|stretch|expected_finding|expected_findings|authoritative_expected_finding|finding)$": false
+            }
+          }
+        },
+        "patternProperties": {
+          "^(Required|Stretch|required|stretch|expected_finding|expected_findings|authoritative_expected_finding|finding)$": false
         },
         "not": {
           "anyOf": [
@@ -113,7 +126,16 @@
         "additionalProperties": true
       }
     },
-    "evidence_declarations": {"type": "array", "minItems": 5, "items": {"type": "object"}},
+    "evidence_declarations": {
+      "type": "array",
+      "minItems": 5,
+      "items": {
+        "type": "object",
+        "patternProperties": {
+          "^(Required|Stretch|required|stretch|expected_finding|expected_findings|authoritative_expected_finding|finding)$": false
+        }
+      }
+    },
     "control_catalogue": {
       "type": "array",
       "minItems": 7,
@@ -124,6 +146,9 @@
           "control_id": {"type": "string"},
           "role": {"enum": ["positive", "negative", "degraded", "mutation"]}
         },
+        "patternProperties": {
+          "^(Required|Stretch|required|stretch|expected_finding|expected_findings|authoritative_expected_finding|finding)$": false
+        },
         "not": {
           "anyOf": [
             {"required": ["Required"]},
@@ -138,7 +163,15 @@
         "additionalProperties": true
       }
     },
-    "fault_profiles": {"type": "array", "items": {"type": "object"}},
+    "fault_profiles": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "patternProperties": {
+          "^(Required|Stretch|required|stretch|expected_finding|expected_findings|authoritative_expected_finding|finding)$": false
+        }
+      }
+    },
     "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
   },
   "not": {
@@ -149,6 +182,7 @@
       {"required": ["stretch"]},
       {"required": ["expected_finding"]},
       {"required": ["expected_findings"]},
+      {"required": ["authoritative_expected_finding"]},
       {"required": ["finding"]}
     ]
   },

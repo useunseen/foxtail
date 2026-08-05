@@ -62,7 +62,7 @@ async fn main() -> Result<()> {
 fn is_native_command(args: &[OsString]) -> bool {
     matches!(
         args.first().and_then(|arg| arg.to_str()),
-        Some("gen" | "serve" | "fixture" | "release-fixture" | "release-qualification")
+        Some("gen" | "serve" | "fixture")
     )
 }
 

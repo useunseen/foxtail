@@ -77,7 +77,15 @@
           "service": {"const": "ec2"},
           "scenario_intent": {"type": "string"},
           "realization_intent": {"type": "string"},
-          "evidence": {"type": "object"}
+          "evidence": {
+            "type": "object",
+            "patternProperties": {
+              "^(Required|Stretch|required|stretch|expected_finding|expected_findings|authoritative_expected_finding|finding)$": false
+            }
+          }
+        },
+        "patternProperties": {
+          "^(Required|Stretch|required|stretch|expected_finding|expected_findings|authoritative_expected_finding|finding)$": false
         },
         "not": {
           "anyOf": [
@@ -87,6 +95,7 @@
             {"required": ["stretch"]},
             {"required": ["expected_finding"]},
             {"required": ["expected_findings"]},
+            {"required": ["authoritative_expected_finding"]},
             {"required": ["finding"]}
           ]
         },
@@ -103,6 +112,7 @@
       {"required": ["stretch"]},
       {"required": ["expected_finding"]},
       {"required": ["expected_findings"]},
+      {"required": ["authoritative_expected_finding"]},
       {"required": ["finding"]}
     ]
   },
