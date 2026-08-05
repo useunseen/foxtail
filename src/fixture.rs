@@ -640,24 +640,98 @@ async fn validate_mutation_authority(
     if active != Some(mutation_generation) {
         bail!("mutation generation is not active")
     }
-    let ambiguous: i64 = sqlx::query_scalar(
+    let nonterminal_or_ambiguous: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM fixture_mutation_intents
-         WHERE mutation_generation = ? AND status = 'AMBIGUOUS'",
+         WHERE mutation_generation = ? AND status IN ('INTENT', 'DISPATCHED', 'AMBIGUOUS')",
     )
     .bind(mutation_generation)
     .fetch_one(pool)
     .await?;
-    if ambiguous != 0 {
+    if nonterminal_or_ambiguous != 0 {
         bail!(
-            "mutation generation has an ambiguous external operation; reconcile it before retrying"
+            "mutation generation has a nonterminal or ambiguous external operation; reconcile it before retrying"
         )
     }
+    validate_dispatchable_generation(pool, mutation_generation, &generation_id).await?;
     Ok((
         generation,
         manifest_digest,
         mutation_generation,
         generation_id,
     ))
+}
+
+async fn validate_dispatchable_generation(
+    pool: &SqlitePool,
+    mutation_generation: i64,
+    generation_id: &str,
+) -> Result<()> {
+    let generation = sqlx::query(
+        "SELECT external_status
+         FROM fixture_mutation_generations
+         WHERE mutation_generation = ? AND generation_id = ? AND state = 'ACTIVE'",
+    )
+    .bind(mutation_generation)
+    .bind(generation_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| anyhow!("mutation generation is not active"))?;
+    let external_status: String = generation.try_get("external_status")?;
+    if external_status != "ACTIVE" {
+        bail!(
+            "mutation generation external status is '{}'; public readiness is not dispatchable",
+            external_status
+        );
+    }
+
+    let rows = sqlx::query(
+        "SELECT control_id, target_kind, setup_fault_kind, retired_at,
+                external_identity_verified
+         FROM fixture_mutation_resources
+         WHERE mutation_generation = ? AND generation_id = ?",
+    )
+    .bind(mutation_generation)
+    .bind(generation_id)
+    .fetch_all(pool)
+    .await?;
+    if rows.len() != mutation::CATALOGUE.len()
+        || rows.iter().any(|row| {
+            row.try_get::<Option<String>, _>("retired_at")
+                .ok()
+                .flatten()
+                .is_some()
+                || row
+                    .try_get::<i64, _>("external_identity_verified")
+                    .unwrap_or(0)
+                    != 1
+        })
+    {
+        bail!("mutation generation requires exactly four non-retired externally verified targets");
+    }
+    let observed = rows
+        .iter()
+        .map(|row| {
+            Ok((
+                row.try_get::<String, _>("control_id")?,
+                row.try_get::<String, _>("target_kind")?,
+                row.try_get::<String, _>("setup_fault_kind")?,
+            ))
+        })
+        .collect::<Result<std::collections::BTreeSet<_>>>()?;
+    let expected = mutation::CATALOGUE
+        .iter()
+        .map(|scenario| {
+            (
+                scenario.control_id.to_string(),
+                scenario.target_kind.as_str().to_string(),
+                scenario.setup_fault_kind.as_str().to_string(),
+            )
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    if observed != expected {
+        bail!("mutation generation targets do not match the canonical catalogue");
+    }
+    Ok(())
 }
 
 async fn mutation_target_values(pool: &SqlitePool, mutation_generation: i64) -> Result<Vec<Value>> {
@@ -720,11 +794,13 @@ async fn mutation_backend_for_generation(
     let region: String = row.try_get("region")?;
     let account_id: String = row.try_get("account_id")?;
     let external_status: String = row.try_get("external_status")?;
-    if external_status == "AMBIGUOUS" {
+    if external_status != "ACTIVE" {
         bail!(
-            "mutation generation has an ambiguous external operation; reconcile it before retrying"
+            "mutation generation external status is '{}'; public readiness is not dispatchable",
+            external_status
         )
     }
+    validate_dispatchable_generation(pool, mutation_generation, generation_id).await?;
     mutation::Ec2MutationBackend::connect(&endpoint_url, &region, &account_id).await
 }
 
@@ -840,6 +916,122 @@ async fn create_mutation_generation(
     Ok(targets)
 }
 
+async fn quarantine_provisioned_generation(
+    pool: &SqlitePool,
+    context: MutationGenerationContext<'_>,
+    returned_ids: &[String],
+    error: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO fixture_mutation_generations
+         (mutation_generation, generation_id, fixture_generation, manifest_digest,
+          complete_estate_fingerprint, state, resource_ids, public_absence,
+          endpoint_url, region, account_id, external_status, created_at)
+         VALUES (?, ?, ?, '', '', 'ACTIVE', ?, NULL, ?, ?, ?, 'AMBIGUOUS', ?)",
+    )
+    .bind(context.mutation_generation)
+    .bind(context.generation_id)
+    .bind(context.fixture_generation)
+    .bind(serde_json::to_string(returned_ids)?)
+    .bind(context.endpoint_url)
+    .bind(context.region)
+    .bind(context.account_id)
+    .bind(context.anchor)
+    .execute(pool)
+    .await
+    .context("persist quarantined mutation generation")?;
+    sqlx::query(
+        "UPDATE fixture_mutation_intents
+         SET error = ?, updated_at = ?
+         WHERE mutation_generation = ? AND generation_id = ?
+           AND status IN ('INTENT', 'DISPATCHED')",
+    )
+    .bind(error)
+    .bind(now_rfc3339())
+    .bind(context.mutation_generation)
+    .bind(context.generation_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn compensate_realization_failure(
+    pool: &SqlitePool,
+    intent_id: &str,
+    backend: &mutation::Ec2MutationBackend,
+    context: MutationGenerationContext<'_>,
+    provisioned: &[(mutation::MutationScenario, mutation::ObservedInstance)],
+    original_error: &anyhow::Error,
+) {
+    let ids = provisioned
+        .iter()
+        .map(|(_, observed)| observed.resource_id.clone())
+        .collect::<Vec<_>>();
+    let cleanup_result = backend.terminate_all(&ids).await;
+    let mut absence_error = None;
+    if cleanup_result.is_ok() {
+        for id in &ids {
+            match backend.verify_absent(id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    absence_error = Some(anyhow!("public target {id} remains visible"));
+                    break;
+                }
+                Err(error) => {
+                    absence_error = Some(error);
+                    break;
+                }
+            }
+        }
+    }
+    if let Err(cleanup_error) = cleanup_result {
+        let error = format!(
+            "post-provision finalization ambiguous; returned_ids={ids:?}; original_error={original_error}; cleanup_error={cleanup_error}"
+        );
+        let quarantine = quarantine_provisioned_generation(pool, context, &ids, &error).await;
+        let intent_error = match quarantine {
+            Ok(()) => error,
+            Err(quarantine_error) => format!("{error}; quarantine_error={quarantine_error}"),
+        };
+        let _ = update_mutation_intent(
+            pool,
+            intent_id,
+            "AMBIGUOUS",
+            Some(&intent_error),
+            &now_rfc3339(),
+        )
+        .await;
+        return;
+    }
+    if let Some(absence_error) = absence_error {
+        let error = format!(
+            "post-provision finalization ambiguous; returned_ids={ids:?}; original_error={original_error}; absence_error={absence_error}"
+        );
+        let quarantine = quarantine_provisioned_generation(pool, context, &ids, &error).await;
+        let intent_error = match quarantine {
+            Ok(()) => error,
+            Err(quarantine_error) => format!("{error}; quarantine_error={quarantine_error}"),
+        };
+        let _ = update_mutation_intent(
+            pool,
+            intent_id,
+            "AMBIGUOUS",
+            Some(&intent_error),
+            &now_rfc3339(),
+        )
+        .await;
+        return;
+    }
+    let _ = update_mutation_intent(
+        pool,
+        intent_id,
+        "FAILED",
+        Some(&original_error.to_string()),
+        &now_rfc3339(),
+    )
+    .await;
+}
+
 async fn active_fault_values(
     pool: &SqlitePool,
     mutation_generation: Option<i64>,
@@ -908,17 +1100,16 @@ async fn begin_mutation_intent(
     let mut tx = pool.begin().await?;
     let active: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM fixture_mutation_intents
-         WHERE status IN ('INTENT', 'DISPATCHED') AND operation = ?
+         WHERE status IN ('INTENT', 'DISPATCHED', 'AMBIGUOUS')
            AND COALESCE(mutation_generation, -1) = COALESCE(?, -1)",
     )
-    .bind(operation)
     .bind(context.mutation_generation)
     .fetch_one(&mut *tx)
     .await?;
     if active != 0 {
         bail!("mutation operation '{operation}' is already in progress")
     }
-    sqlx::query(
+    let insert = sqlx::query(
         "INSERT INTO fixture_mutation_intents
          (intent_id, operation, mutation_generation, generation_id, fixture_generation,
           target_id, request_bytes, status, created_at, updated_at)
@@ -934,7 +1125,13 @@ async fn begin_mutation_intent(
     .bind(created_at)
     .bind(created_at)
     .execute(&mut *tx)
-    .await?;
+    .await;
+    if let Err(error) = insert {
+        if error.to_string().to_ascii_lowercase().contains("unique") {
+            bail!("mutation generation already has a nonterminal operation");
+        }
+        return Err(error.into());
+    }
     tx.commit().await?;
     Ok(intent_id)
 }
@@ -982,6 +1179,33 @@ async fn mark_intent_dispatched(
         bail!("mutation intent {intent_id} is not dispatchable")
     }
     Ok(())
+}
+
+async fn finalize_intent_ambiguous(pool: &SqlitePool, intent_id: &str, error: &anyhow::Error) {
+    let _ = update_mutation_intent(
+        pool,
+        intent_id,
+        "AMBIGUOUS",
+        Some(&error.to_string()),
+        &now_rfc3339(),
+    )
+    .await;
+}
+
+async fn mark_generation_ambiguous(
+    pool: &SqlitePool,
+    mutation_generation: i64,
+    generation_id: &str,
+) {
+    let _ = sqlx::query(
+        "UPDATE fixture_mutation_generations
+         SET external_status = 'AMBIGUOUS'
+         WHERE mutation_generation = ? AND generation_id = ? AND state = 'ACTIVE'",
+    )
+    .bind(mutation_generation)
+    .bind(generation_id)
+    .execute(pool)
+    .await;
 }
 
 fn parse_application_time(raw: Option<&str>) -> Result<String> {
@@ -1133,25 +1357,31 @@ pub async fn realize(pool: &SqlitePool, request: RealizeRequest) -> Result<Fixtu
     let isolated = is_isolated_qualification();
     let request_value = serde_json::to_value(&request)?;
 
-    // Realization is a read-only lookup when an authority-bound singleton is
-    // already present and no explicit recreation was requested. This keeps
-    // CLI/HTTP reads byte-identical without provisioning another generation.
-    if !request.force_new
-        && request.clock_anchor.is_none()
-        && request.account_id.is_none()
-        && request.region.is_none()
-        && request.endpoint_url.is_none()
-        && request.localstack_version.is_none()
-        && let Some(row) = sqlx::query(
-            "SELECT manifest_digest, generation, mutation_generation_id
-             FROM fixture_realizations WHERE singleton_id = 1",
-        )
-        .fetch_optional(pool)
-        .await?
+    // Ordinary realization remains a read-only lookup.  An isolated active
+    // generation is different: every subsequent realization request, even
+    // one with changed options, must use the authority-bound recreate path.
+    if let Some(row) = sqlx::query(
+        "SELECT manifest_digest, generation, mutation_generation_id
+         FROM fixture_realizations WHERE singleton_id = 1",
+    )
+    .fetch_optional(pool)
+    .await?
     {
         let manifest_digest: String = row.try_get("manifest_digest")?;
         let current_mutation_id: Option<String> = row.try_get("mutation_generation_id")?;
-        if !isolated || current_mutation_id.is_some() {
+        if isolated && current_mutation_id.is_some() && !request.force_new {
+            bail!(
+                "an isolated mutation generation is active; use authority-bound recreate instead of realize"
+            );
+        }
+        if !isolated
+            && !request.force_new
+            && request.clock_anchor.is_none()
+            && request.account_id.is_none()
+            && request.region.is_none()
+            && request.endpoint_url.is_none()
+            && request.localstack_version.is_none()
+        {
             let state = read_state(pool).await?;
             if let Some(manifest_bytes) = state.manifest_bytes {
                 return Ok(FixtureSnapshot {
@@ -1290,7 +1520,10 @@ pub async fn realize(pool: &SqlitePool, request: RealizeRequest) -> Result<Fixtu
             &anchor.to_rfc3339_opts(SecondsFormat::Secs, true),
         )
         .await?;
-        mark_intent_dispatched(pool, &id, &now_rfc3339()).await?;
+        if let Err(error) = mark_intent_dispatched(pool, &id, &now_rfc3339()).await {
+            finalize_intent_ambiguous(pool, &id, &error).await;
+            return Err(error);
+        }
         Some(id)
     } else {
         None
@@ -1308,14 +1541,46 @@ pub async fn realize(pool: &SqlitePool, request: RealizeRequest) -> Result<Fixtu
                 Ok(targets) => Some((backend, targets)),
                 Err(error) => {
                     if let Some(intent_id) = intent_id.as_deref() {
-                        let _ = update_mutation_intent(
-                            pool,
-                            intent_id,
-                            "FAILED",
-                            Some(&error.to_string()),
-                            &now_rfc3339(),
-                        )
-                        .await;
+                        if let Some(failure) = error.downcast_ref::<mutation::ProvisionFailure>() {
+                            let quarantine = quarantine_provisioned_generation(
+                                pool,
+                                MutationGenerationContext {
+                                    fixture_generation: generation,
+                                    mutation_generation,
+                                    generation_id: mutation_generation_id.as_deref().unwrap(),
+                                    region: &region,
+                                    account_id: &account_id,
+                                    endpoint_url: &endpoint_url,
+                                    anchor: &anchor.to_rfc3339_opts(SecondsFormat::Secs, true),
+                                },
+                                &failure.returned_ids,
+                                &error.to_string(),
+                            )
+                            .await;
+                            let intent_error = match quarantine {
+                                Ok(()) => error.to_string(),
+                                Err(quarantine_error) => {
+                                    format!("{error}; quarantine_error={quarantine_error}")
+                                }
+                            };
+                            let _ = update_mutation_intent(
+                                pool,
+                                intent_id,
+                                "AMBIGUOUS",
+                                Some(&intent_error),
+                                &now_rfc3339(),
+                            )
+                            .await;
+                        } else {
+                            let _ = update_mutation_intent(
+                                pool,
+                                intent_id,
+                                "FAILED",
+                                Some(&error.to_string()),
+                                &now_rfc3339(),
+                            )
+                            .await;
+                        }
                     }
                     return Err(error);
                 }
@@ -1338,98 +1603,100 @@ pub async fn realize(pool: &SqlitePool, request: RealizeRequest) -> Result<Fixtu
         None
     };
 
-    let mut tx = pool.begin().await?;
-    for (control_id, resource) in &assigned {
-        materialize_control_evidence(&mut tx, control_id, &resource.id).await?;
-    }
+    let persistence = async {
+        let mut tx = pool.begin().await?;
+        for (control_id, resource) in &assigned {
+            materialize_control_evidence(&mut tx, control_id, &resource.id).await?;
+        }
 
-    let observed_resources = load_estate_resources(&mut tx, &resources).await?;
-    let observed_by_id = observed_resources
-        .iter()
-        .map(|resource| (resource.id.clone(), resource.clone()))
-        .collect::<BTreeMap<_, _>>();
-    let assigned_observed = assigned
-        .iter()
-        .map(|(control_id, resource)| {
-            let observed = observed_by_id.get(&resource.id).cloned().ok_or_else(|| {
-                anyhow!("materialized fixture resource {} disappeared", resource.id)
-            })?;
-            Ok((control_id.clone(), observed))
-        })
-        .collect::<Result<BTreeMap<_, _>>>()?;
-    validate_realized_controls(&assigned_observed)?;
+        let observed_resources = load_estate_resources(&mut tx, &resources).await?;
+        let observed_by_id = observed_resources
+            .iter()
+            .map(|resource| (resource.id.clone(), resource.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let assigned_observed = assigned
+            .iter()
+            .map(|(control_id, resource)| {
+                let observed = observed_by_id.get(&resource.id).cloned().ok_or_else(|| {
+                    anyhow!("materialized fixture resource {} disappeared", resource.id)
+                })?;
+                Ok((control_id.clone(), observed))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        validate_realized_controls(&assigned_observed)?;
 
-    let mutation_targets = if let Some((_, provisioned)) = &provisioned {
-        create_mutation_generation(
-            &mut tx,
-            MutationGenerationContext {
-                fixture_generation: generation,
-                mutation_generation,
-                generation_id: mutation_generation_id.as_deref().unwrap(),
-                region: &region,
-                account_id: &account_id,
-                endpoint_url: &endpoint_url,
-                anchor: &anchor.to_rfc3339_opts(SecondsFormat::Secs, true),
-            },
-            provisioned,
-        )
-        .await?
-    } else {
-        Vec::new()
-    };
-
-    let read_only_fingerprint = estate_fingerprint(&assigned_observed, &region, &account_id)?;
-    let complete_map = observed_resources
-        .into_iter()
-        .map(|resource| (resource.id.clone(), resource))
-        .collect::<BTreeMap<_, _>>();
-    let read_only_complete_fingerprint = estate_fingerprint(&complete_map, &region, &account_id)?;
-    let complete_fingerprint = canonical_digest(&json!({
-        "mutation_generation": mutation_generation,
-        "mutation_generation_id": &mutation_generation_id,
-        "read_only_estate_fingerprint": &read_only_complete_fingerprint,
-        "mutation_targets": &mutation_targets
-    }))?;
-
-    let manifest_without_digest = build_manifest(ManifestContext {
-        definition_digest: &definition_digest,
-        assigned: &assigned_observed,
-        complete_resources: &complete_map,
-        region: &region,
-        account_id: &account_id,
-        endpoint_url: &endpoint_url,
-        localstack_version: &localstack_version,
-        source_revision: &source_revision,
-        anchor,
-        generation,
-        read_only_fingerprint: &read_only_fingerprint,
-        complete_fingerprint: &complete_fingerprint,
-        mutation_generation: if isolated {
-            Some(mutation_generation)
+        let mutation_targets = if let Some((_, provisioned)) = &provisioned {
+            create_mutation_generation(
+                &mut tx,
+                MutationGenerationContext {
+                    fixture_generation: generation,
+                    mutation_generation,
+                    generation_id: mutation_generation_id.as_deref().unwrap(),
+                    region: &region,
+                    account_id: &account_id,
+                    endpoint_url: &endpoint_url,
+                    anchor: &anchor.to_rfc3339_opts(SecondsFormat::Secs, true),
+                },
+                provisioned,
+            )
+            .await?
         } else {
-            None
-        },
-        mutation_generation_id: mutation_generation_id.as_deref(),
-        mutation_targets: &mutation_targets,
-    })?;
-    let (manifest_bytes, manifest_digest) = with_digest(&manifest_without_digest)?;
+            Vec::new()
+        };
 
-    if isolated {
-        sqlx::query(
-            "UPDATE fixture_mutation_generations
+        let read_only_fingerprint = estate_fingerprint(&assigned_observed, &region, &account_id)?;
+        let complete_map = observed_resources
+            .into_iter()
+            .map(|resource| (resource.id.clone(), resource))
+            .collect::<BTreeMap<_, _>>();
+        let read_only_complete_fingerprint =
+            estate_fingerprint(&complete_map, &region, &account_id)?;
+        let complete_fingerprint = canonical_digest(&json!({
+            "mutation_generation": mutation_generation,
+            "mutation_generation_id": &mutation_generation_id,
+            "read_only_estate_fingerprint": &read_only_complete_fingerprint,
+            "mutation_targets": &mutation_targets
+        }))?;
+
+        let manifest_without_digest = build_manifest(ManifestContext {
+            definition_digest: &definition_digest,
+            assigned: &assigned_observed,
+            complete_resources: &complete_map,
+            region: &region,
+            account_id: &account_id,
+            endpoint_url: &endpoint_url,
+            localstack_version: &localstack_version,
+            source_revision: &source_revision,
+            anchor,
+            generation,
+            read_only_fingerprint: &read_only_fingerprint,
+            complete_fingerprint: &complete_fingerprint,
+            mutation_generation: if isolated {
+                Some(mutation_generation)
+            } else {
+                None
+            },
+            mutation_generation_id: mutation_generation_id.as_deref(),
+            mutation_targets: &mutation_targets,
+        })?;
+        let (manifest_bytes, manifest_digest) = with_digest(&manifest_without_digest)?;
+
+        if isolated {
+            sqlx::query(
+                "UPDATE fixture_mutation_generations
              SET manifest_digest = ?, complete_estate_fingerprint = ?, external_status = 'ACTIVE'
              WHERE mutation_generation = ? AND generation_id = ? AND state = 'ACTIVE'",
-        )
-        .bind(&manifest_digest)
-        .bind(&complete_fingerprint)
-        .bind(mutation_generation)
-        .bind(mutation_generation_id.as_deref())
-        .execute(&mut *tx)
-        .await?;
-    }
+            )
+            .bind(&manifest_digest)
+            .bind(&complete_fingerprint)
+            .bind(mutation_generation)
+            .bind(mutation_generation_id.as_deref())
+            .execute(&mut *tx)
+            .await?;
+        }
 
-    sqlx::query(
-        "INSERT INTO fixture_realizations
+        sqlx::query(
+            "INSERT INTO fixture_realizations
            (singleton_id, definition_bytes, definition_digest, manifest_bytes, manifest_digest,
             generation, mutation_generation, mutation_generation_id,
             complete_estate_fingerprint, created_at, updated_at)
@@ -1444,57 +1711,97 @@ pub async fn realize(pool: &SqlitePool, request: RealizeRequest) -> Result<Fixtu
            mutation_generation_id = excluded.mutation_generation_id,
            complete_estate_fingerprint = excluded.complete_estate_fingerprint,
            updated_at = excluded.updated_at",
-    )
-    .bind(&definition_bytes)
-    .bind(&definition_digest)
-    .bind(&manifest_bytes)
-    .bind(&manifest_digest)
-    .bind(generation)
-    .bind(if isolated { mutation_generation } else { 0 })
-    .bind(mutation_generation_id.as_deref())
-    .bind(&complete_fingerprint)
-    .bind(anchor.to_rfc3339_opts(SecondsFormat::Secs, true))
-    .bind(anchor.to_rfc3339_opts(SecondsFormat::Secs, true))
-    .execute(&mut *tx)
-    .await
-    .context("persist fixture realization atomically")?;
-    tx.commit().await?;
+        )
+        .bind(&definition_bytes)
+        .bind(&definition_digest)
+        .bind(&manifest_bytes)
+        .bind(&manifest_digest)
+        .bind(generation)
+        .bind(if isolated { mutation_generation } else { 0 })
+        .bind(mutation_generation_id.as_deref())
+        .bind(&complete_fingerprint)
+        .bind(anchor.to_rfc3339_opts(SecondsFormat::Secs, true))
+        .bind(anchor.to_rfc3339_opts(SecondsFormat::Secs, true))
+        .execute(&mut *tx)
+        .await
+        .context("persist fixture realization atomically")?;
+        tx.commit().await?;
+        Ok::<(Vec<u8>, String, Value), anyhow::Error>((
+            manifest_bytes,
+            manifest_digest,
+            manifest_without_digest,
+        ))
+    }
+    .await;
+
+    let (manifest_bytes, manifest_digest, manifest_without_digest) = match persistence {
+        Ok(value) => value,
+        Err(error) => {
+            if let (Some(intent_id), Some((backend, provisioned))) =
+                (intent_id.as_deref(), provisioned.as_ref())
+            {
+                compensate_realization_failure(
+                    pool,
+                    intent_id,
+                    backend,
+                    MutationGenerationContext {
+                        fixture_generation: generation,
+                        mutation_generation,
+                        generation_id: mutation_generation_id.as_deref().unwrap(),
+                        region: &region,
+                        account_id: &account_id,
+                        endpoint_url: &endpoint_url,
+                        anchor: &anchor.to_rfc3339_opts(SecondsFormat::Secs, true),
+                    },
+                    provisioned,
+                    &error,
+                )
+                .await;
+            }
+            return Err(error);
+        }
+    };
+
+    let response_bytes = (|| {
+        let identities = identity_values(&manifest_without_digest)?;
+        let mutation_identities = mutation_identity_values(&manifest_without_digest)?;
+        let status_bytes = canonical_status_bytes(
+            "REALIZED",
+            &definition_digest,
+            Some(&manifest_digest),
+            Some(generation),
+            &identities,
+            Some(&manifest_without_digest),
+            &[],
+        )?;
+        let identities_bytes = canonical_identities_bytes(
+            "REALIZED",
+            Some(&manifest_digest),
+            &identities,
+            &mutation_identities,
+        )?;
+        Ok::<(Vec<u8>, Vec<u8>), anyhow::Error>((status_bytes, identities_bytes))
+    })();
+    let (status_bytes, identities_bytes) = match response_bytes {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            if let Some(intent_id) = intent_id.as_deref() {
+                finalize_intent_ambiguous(pool, intent_id, &error).await;
+            }
+            return Err(error);
+        }
+    };
 
     if let Some(intent_id) = intent_id.as_deref()
         && let Err(error) =
             update_mutation_intent(pool, intent_id, "SUCCEEDED", None, &now_rfc3339()).await
     {
-        // The external estate and the manifest are already durable. Keep
-        // the intent visibly fail-closed rather than claiming a green
-        // receipt when finalization itself was ambiguous.
-        let _ = update_mutation_intent(
-            pool,
-            intent_id,
-            "AMBIGUOUS",
-            Some(&error.to_string()),
-            &now_rfc3339(),
-        )
-        .await;
+        // The external estate, manifest, and response bytes are already
+        // durable. Keep the intent visibly fail-closed rather than claiming
+        // a green receipt when finalization itself was ambiguous.
+        finalize_intent_ambiguous(pool, intent_id, &error).await;
         return Err(error);
     }
-
-    let identities = identity_values(&manifest_without_digest)?;
-    let mutation_identities = mutation_identity_values(&manifest_without_digest)?;
-    let status_bytes = canonical_status_bytes(
-        "REALIZED",
-        &definition_digest,
-        Some(&manifest_digest),
-        Some(generation),
-        &identities,
-        Some(&manifest_without_digest),
-        &[],
-    )?;
-    let identities_bytes = canonical_identities_bytes(
-        "REALIZED",
-        Some(&manifest_digest),
-        &identities,
-        &mutation_identities,
-    )?;
 
     Ok(FixtureSnapshot {
         definition_bytes,
@@ -1657,143 +1964,141 @@ pub async fn apply_fault(pool: &SqlitePool, request: FaultRequest) -> Result<Vec
         &applied_at,
     )
     .await?;
-    mark_intent_dispatched(pool, &intent_id, &now_rfc3339()).await?;
-    let backend =
-        match mutation_backend_for_generation(pool, mutation_generation, &generation_id).await {
+    if let Err(error) = mark_intent_dispatched(pool, &intent_id, &now_rfc3339()).await {
+        finalize_intent_ambiguous(pool, &intent_id, &error).await;
+        return Err(error);
+    }
+    let operation_result = async {
+        let backend = match mutation_backend_for_generation(
+            pool,
+            mutation_generation,
+            &generation_id,
+        )
+        .await
+        {
             Ok(backend) => backend,
             Err(error) => {
-                let _ = update_mutation_intent(
-                    pool,
-                    &intent_id,
-                    "AMBIGUOUS",
-                    Some(&error.to_string()),
-                    &now_rfc3339(),
-                )
-                .await;
+                finalize_intent_ambiguous(pool, &intent_id, &error).await;
                 return Err(error);
             }
         };
-    let observed = match backend
-        .apply_setup_fault(&target_id, scenario, scenario.setup_fault_kind)
-        .await
-    {
-        Ok(observed) => observed,
-        Err(error) => {
-            let _ = update_mutation_intent(
-                pool,
-                &intent_id,
-                "AMBIGUOUS",
-                Some(&error.to_string()),
-                &now_rfc3339(),
-            )
-            .await;
+        let observed = match backend
+            .apply_setup_fault(&target_id, scenario, scenario.setup_fault_kind)
+            .await
+        {
+            Ok(observed) => observed,
+            Err(error) => {
+                finalize_intent_ambiguous(pool, &intent_id, &error).await;
+                return Err(error);
+            }
+        };
+        if observed.instance_state != terminal_state || observed.instance_type != terminal_type {
+            let error = anyhow!(
+                "public EC2 state after fault was {}:{}, expected {}:{}",
+                observed.instance_state,
+                observed.instance_type,
+                terminal_state,
+                terminal_type
+            );
+            finalize_intent_ambiguous(pool, &intent_id, &error).await;
             return Err(error);
         }
-    };
-    if observed.instance_state != terminal_state || observed.instance_type != terminal_type {
-        let error = anyhow!(
-            "public EC2 state after fault was {}:{}, expected {}:{}",
-            observed.instance_state,
-            observed.instance_type,
-            terminal_state,
-            terminal_type
-        );
-        let _ = update_mutation_intent(
-            pool,
-            &intent_id,
-            "AMBIGUOUS",
-            Some(&error.to_string()),
-            &now_rfc3339(),
+        let mut tx = pool.begin().await?;
+        let updated = sqlx::query(
+            "UPDATE fixture_mutation_resources SET instance_state = ?, instance_type = ?,
+                    external_status = 'FAULTED', external_identity_verified = 1
+             WHERE resource_id = ? AND mutation_generation = ? AND generation_id = ?
+               AND instance_state = ? AND instance_type = ? AND retired_at IS NULL",
         )
-        .await;
-        return Err(error);
-    }
-    let mut tx = pool.begin().await?;
-    let updated = sqlx::query(
-        "UPDATE fixture_mutation_resources SET instance_state = ?, instance_type = ?,
-                external_status = 'FAULTED', external_identity_verified = 1
-         WHERE resource_id = ? AND mutation_generation = ? AND generation_id = ?
-           AND instance_state = ? AND instance_type = ? AND retired_at IS NULL",
-    )
-    .bind(&terminal_state)
-    .bind(&terminal_type)
-    .bind(&target_id)
-    .bind(mutation_generation)
-    .bind(&generation_id)
-    .bind(&prior_state)
-    .bind(&prior_type)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
-    if updated != 1 {
-        let error = anyhow!("fault finalization lost the target row to a concurrent operation");
-        let _ = update_mutation_intent(
-            pool,
-            &intent_id,
-            "AMBIGUOUS",
-            Some(&error.to_string()),
-            &now_rfc3339(),
+        .bind(&terminal_state)
+        .bind(&terminal_type)
+        .bind(&target_id)
+        .bind(mutation_generation)
+        .bind(&generation_id)
+        .bind(&prior_state)
+        .bind(&prior_type)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if updated != 1 {
+            let error = anyhow!("fault finalization lost the target row to a concurrent operation");
+            finalize_intent_ambiguous(pool, &intent_id, &error).await;
+            return Err(error);
+        }
+        sqlx::query(
+            "INSERT INTO fixture_faults
+             (receipt_id, mutation_generation, generation_id, manifest_digest, control_id,
+              target_id, scope, fault_kind, applied_at, reset_token, prior_state,
+              terminal_state, status)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE')",
         )
-        .await;
-        return Err(error);
+        .bind(&receipt_id)
+        .bind(mutation_generation)
+        .bind(&generation_id)
+        .bind(&manifest_digest)
+        .bind(&control_id)
+        .bind(&target_id)
+        .bind(&scope)
+        .bind(&fault_kind)
+        .bind(&applied_at)
+        .bind(&reset_token)
+        .bind(format!("{prior_state}:{prior_type}"))
+        .bind(format!("{terminal_state}:{terminal_type}"))
+        .execute(&mut *tx)
+        .await?;
+        let receipt = json!({
+            "schema": "foxtail.release-fixture-fault-receipt/v1",
+            "operation": "fault",
+            "status": "APPLIED",
+            "receipt_id": receipt_id,
+            "generation": request.authority.generation,
+            "manifest_digest": manifest_digest,
+            "mutation_generation": mutation_generation,
+            "mutation_generation_id": generation_id,
+            "control_id": control_id,
+            "target_id": target_id,
+            "scope": scope,
+            "fault_kind": fault_kind,
+            "applied_at": applied_at,
+            "prior_state": format!("{prior_state}:{prior_type}"),
+            "terminal_state": format!("{terminal_state}:{terminal_type}"),
+            "reset_token": reset_token,
+            "reset_token_use": "one-use"
+        });
+        let receipt_bytes = canonical_receipt(receipt)?;
+        persist_receipt(
+            &mut tx,
+            "fault",
+            &receipt_id,
+            ReceiptContext {
+                mutation_generation: Some(mutation_generation),
+                generation_id: Some(&generation_id),
+                manifest_digest: Some(&manifest_digest),
+            },
+            &receipt_bytes,
+            &applied_at,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok::<Vec<u8>, anyhow::Error>(receipt_bytes)
     }
-    sqlx::query(
-        "INSERT INTO fixture_faults
-         (receipt_id, mutation_generation, generation_id, manifest_digest, control_id,
-          target_id, scope, fault_kind, applied_at, reset_token, prior_state,
-          terminal_state, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE')",
-    )
-    .bind(&receipt_id)
-    .bind(mutation_generation)
-    .bind(&generation_id)
-    .bind(&manifest_digest)
-    .bind(&control_id)
-    .bind(&target_id)
-    .bind(&scope)
-    .bind(&fault_kind)
-    .bind(&applied_at)
-    .bind(&reset_token)
-    .bind(format!("{prior_state}:{prior_type}"))
-    .bind(format!("{terminal_state}:{terminal_type}"))
-    .execute(&mut *tx)
-    .await?;
-    let receipt = json!({
-        "schema": "foxtail.release-fixture-fault-receipt/v1",
-        "operation": "fault",
-        "status": "APPLIED",
-        "receipt_id": receipt_id,
-        "generation": request.authority.generation,
-        "manifest_digest": manifest_digest,
-        "mutation_generation": mutation_generation,
-        "mutation_generation_id": generation_id,
-        "control_id": control_id,
-        "target_id": target_id,
-        "scope": scope,
-        "fault_kind": fault_kind,
-        "applied_at": applied_at,
-        "prior_state": format!("{prior_state}:{prior_type}"),
-        "terminal_state": format!("{terminal_state}:{terminal_type}"),
-        "reset_token": reset_token,
-        "reset_token_use": "one-use"
-    });
-    let receipt_bytes = canonical_receipt(receipt)?;
-    persist_receipt(
-        &mut tx,
-        "fault",
-        &receipt_id,
-        ReceiptContext {
-            mutation_generation: Some(mutation_generation),
-            generation_id: Some(&generation_id),
-            manifest_digest: Some(&manifest_digest),
-        },
-        &receipt_bytes,
-        &applied_at,
-    )
-    .await?;
-    tx.commit().await?;
-    update_mutation_intent(pool, &intent_id, "SUCCEEDED", None, &now_rfc3339()).await?;
-    Ok(receipt_bytes)
+    .await;
+    match operation_result {
+        Ok(receipt_bytes) => {
+            match update_mutation_intent(pool, &intent_id, "SUCCEEDED", None, &now_rfc3339()).await
+            {
+                Ok(()) => Ok(receipt_bytes),
+                Err(error) => {
+                    finalize_intent_ambiguous(pool, &intent_id, &error).await;
+                    Err(error)
+                }
+            }
+        }
+        Err(error) => {
+            finalize_intent_ambiguous(pool, &intent_id, &error).await;
+            Err(error)
+        }
+    }
 }
 
 pub async fn reset_fault(pool: &SqlitePool, request: ResetRequest) -> Result<Vec<u8>> {
@@ -1860,132 +2165,125 @@ pub async fn reset_fault(pool: &SqlitePool, request: ResetRequest) -> Result<Vec
         &reset_at,
     )
     .await?;
-    mark_intent_dispatched(pool, &intent_id, &now_rfc3339()).await?;
-    let backend =
-        match mutation_backend_for_generation(pool, mutation_generation, &generation_id).await {
-            Ok(backend) => backend,
+    if let Err(error) = mark_intent_dispatched(pool, &intent_id, &now_rfc3339()).await {
+        finalize_intent_ambiguous(pool, &intent_id, &error).await;
+        return Err(error);
+    }
+    let operation_result = async {
+        let backend =
+            match mutation_backend_for_generation(pool, mutation_generation, &generation_id).await {
+                Ok(backend) => backend,
+                Err(error) => {
+                    finalize_intent_ambiguous(pool, &intent_id, &error).await;
+                    return Err(error);
+                }
+            };
+        let observed = match backend.reset_setup_fault(&target_id, scenario).await {
+            Ok(observed) => observed,
             Err(error) => {
-                let _ = update_mutation_intent(
-                    pool,
-                    &intent_id,
-                    "AMBIGUOUS",
-                    Some(&error.to_string()),
-                    &now_rfc3339(),
-                )
-                .await;
+                finalize_intent_ambiguous(pool, &intent_id, &error).await;
                 return Err(error);
             }
         };
-    let observed = match backend.reset_setup_fault(&target_id, scenario).await {
-        Ok(observed) => observed,
-        Err(error) => {
-            let _ = update_mutation_intent(
-                pool,
-                &intent_id,
-                "AMBIGUOUS",
-                Some(&error.to_string()),
-                &now_rfc3339(),
-            )
-            .await;
+        if observed.instance_state != initial_state || observed.instance_type != initial_type {
+            let error = anyhow!(
+                "public EC2 state after reset was {}:{}, expected {}:{}",
+                observed.instance_state,
+                observed.instance_type,
+                initial_state,
+                initial_type
+            );
+            finalize_intent_ambiguous(pool, &intent_id, &error).await;
             return Err(error);
         }
-    };
-    if observed.instance_state != initial_state || observed.instance_type != initial_type {
-        let error = anyhow!(
-            "public EC2 state after reset was {}:{}, expected {}:{}",
-            observed.instance_state,
-            observed.instance_type,
-            initial_state,
-            initial_type
-        );
-        let _ = update_mutation_intent(
-            pool,
-            &intent_id,
-            "AMBIGUOUS",
-            Some(&error.to_string()),
-            &now_rfc3339(),
+        let mut tx = pool.begin().await?;
+        let target_updated = sqlx::query(
+            "UPDATE fixture_mutation_resources SET instance_state = ?, instance_type = ?,
+                    external_status = 'RESTORED', external_identity_verified = 1
+             WHERE resource_id = ? AND mutation_generation = ? AND generation_id = ?
+               AND instance_state = ? AND instance_type = ? AND retired_at IS NULL",
         )
-        .await;
-        return Err(error);
-    }
-    let mut tx = pool.begin().await?;
-    let target_updated = sqlx::query(
-        "UPDATE fixture_mutation_resources SET instance_state = ?, instance_type = ?,
-                external_status = 'RESTORED', external_identity_verified = 1
-         WHERE resource_id = ? AND mutation_generation = ? AND generation_id = ?
-           AND instance_state = ? AND instance_type = ? AND retired_at IS NULL",
-    )
-    .bind(&initial_state)
-    .bind(&initial_type)
-    .bind(&target_id)
-    .bind(mutation_generation)
-    .bind(&generation_id)
-    .bind(target.try_get::<String, _>("instance_state")?)
-    .bind(target.try_get::<String, _>("instance_type")?)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
-    let fault_updated = sqlx::query(
-        "UPDATE fixture_faults SET status = 'RESET', reset_at = ?, reset_receipt_id = ?
-         WHERE receipt_id = ? AND mutation_generation = ? AND generation_id = ? AND status = 'ACTIVE'",
-    )
-    .bind(&reset_at)
-    .bind(&reset_receipt_id)
-    .bind(&fault_receipt_id)
-    .bind(mutation_generation)
-    .bind(&generation_id)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
-    if target_updated != 1 || fault_updated != 1 {
-        let error =
-            anyhow!("reset finalization lost the fault or target row to a concurrent operation");
-        let _ = update_mutation_intent(
-            pool,
-            &intent_id,
-            "AMBIGUOUS",
-            Some(&error.to_string()),
-            &now_rfc3339(),
+        .bind(&initial_state)
+        .bind(&initial_type)
+        .bind(&target_id)
+        .bind(mutation_generation)
+        .bind(&generation_id)
+        .bind(target.try_get::<String, _>("instance_state")?)
+        .bind(target.try_get::<String, _>("instance_type")?)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        let fault_updated = sqlx::query(
+            "UPDATE fixture_faults SET status = 'RESET', reset_at = ?, reset_receipt_id = ?
+             WHERE receipt_id = ? AND mutation_generation = ? AND generation_id = ? AND status = 'ACTIVE'",
         )
-        .await;
-        return Err(error);
+        .bind(&reset_at)
+        .bind(&reset_receipt_id)
+        .bind(&fault_receipt_id)
+        .bind(mutation_generation)
+        .bind(&generation_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if target_updated != 1 || fault_updated != 1 {
+            let error =
+                anyhow!("reset finalization lost the fault or target row to a concurrent operation");
+            finalize_intent_ambiguous(pool, &intent_id, &error).await;
+            return Err(error);
+        }
+        let receipt = json!({
+            "schema": "foxtail.release-fixture-reset-receipt/v1",
+            "operation": "reset",
+            "status": "RESET",
+            "receipt_id": reset_receipt_id,
+            "fault_receipt_id": fault_receipt_id,
+            "generation": request.authority.generation,
+            "manifest_digest": manifest_digest,
+            "mutation_generation": mutation_generation,
+            "mutation_generation_id": generation_id,
+            "control_id": control_id,
+            "target_id": target_id,
+            "scope": fault.try_get::<String, _>("scope")?,
+            "fault_kind": fault.try_get::<String, _>("fault_kind")?,
+            "prior_state": prior_terminal_state,
+            "terminal_state": format!("{initial_state}:{initial_type}"),
+            "reset_at": reset_at,
+            "reset_token_consumed": true
+        });
+        let receipt_bytes = canonical_receipt(receipt)?;
+        persist_receipt(
+            &mut tx,
+            "reset",
+            &reset_receipt_id,
+            ReceiptContext {
+                mutation_generation: Some(mutation_generation),
+                generation_id: Some(&generation_id),
+                manifest_digest: Some(&manifest_digest),
+            },
+            &receipt_bytes,
+            &reset_at,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok::<Vec<u8>, anyhow::Error>(receipt_bytes)
     }
-    let receipt = json!({
-        "schema": "foxtail.release-fixture-reset-receipt/v1",
-        "operation": "reset",
-        "status": "RESET",
-        "receipt_id": reset_receipt_id,
-        "fault_receipt_id": fault_receipt_id,
-        "generation": request.authority.generation,
-        "manifest_digest": manifest_digest,
-        "mutation_generation": mutation_generation,
-        "mutation_generation_id": generation_id,
-        "control_id": control_id,
-        "target_id": target_id,
-        "scope": fault.try_get::<String, _>("scope")?,
-        "fault_kind": fault.try_get::<String, _>("fault_kind")?,
-        "prior_state": prior_terminal_state,
-        "terminal_state": format!("{initial_state}:{initial_type}"),
-        "reset_at": reset_at,
-        "reset_token_consumed": true
-    });
-    let receipt_bytes = canonical_receipt(receipt)?;
-    persist_receipt(
-        &mut tx,
-        "reset",
-        &reset_receipt_id,
-        ReceiptContext {
-            mutation_generation: Some(mutation_generation),
-            generation_id: Some(&generation_id),
-            manifest_digest: Some(&manifest_digest),
-        },
-        &receipt_bytes,
-        &reset_at,
-    )
-    .await?;
-    tx.commit().await?;
-    update_mutation_intent(pool, &intent_id, "SUCCEEDED", None, &now_rfc3339()).await?;
-    Ok(receipt_bytes)
+    .await;
+    match operation_result {
+        Ok(receipt_bytes) => {
+            match update_mutation_intent(pool, &intent_id, "SUCCEEDED", None, &now_rfc3339()).await
+            {
+                Ok(()) => Ok(receipt_bytes),
+                Err(error) => {
+                    finalize_intent_ambiguous(pool, &intent_id, &error).await;
+                    Err(error)
+                }
+            }
+        }
+        Err(error) => {
+            finalize_intent_ambiguous(pool, &intent_id, &error).await;
+            Err(error)
+        }
+    }
 }
 
 pub async fn recreate(pool: &SqlitePool, request: RecreateRequest) -> Result<Vec<u8>> {
@@ -2007,6 +2305,17 @@ pub async fn recreate(pool: &SqlitePool, request: RecreateRequest) -> Result<Vec
         .and_then(Value::as_str)
         .map(str::to_string);
     let anchor = request.clock_anchor.clone().or(old_clock_anchor);
+    let active_faults: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fixture_faults
+         WHERE mutation_generation = ? AND generation_id = ? AND status = 'ACTIVE'",
+    )
+    .bind(old_mutation_generation)
+    .bind(&old_generation_id)
+    .fetch_one(pool)
+    .await?;
+    if active_faults != 0 {
+        bail!("cannot realize or recreate while a mutation fault is active; reset it first");
+    }
     let predicted_generation: i64 = sqlx::query_scalar(
         "SELECT COALESCE(MAX(value), 0) + 1 FROM (
             SELECT generation AS value FROM fixture_realizations
@@ -2026,8 +2335,8 @@ pub async fn recreate(pool: &SqlitePool, request: RecreateRequest) -> Result<Vec
         pool,
         "recreate",
         IntentContext {
-            mutation_generation: Some(predicted_mutation_generation),
-            generation_id: Some(&predicted_generation_id),
+            mutation_generation: Some(old_mutation_generation),
+            generation_id: Some(&old_generation_id),
             fixture_generation: Some(predicted_generation),
             target_id: None,
         },
@@ -2035,46 +2344,44 @@ pub async fn recreate(pool: &SqlitePool, request: RecreateRequest) -> Result<Vec
         &created_at,
     )
     .await?;
-    mark_intent_dispatched(pool, &intent_id, &now_rfc3339()).await?;
-    let snapshot = realize(
-        pool,
-        RealizeRequest {
-            version: request.authority.version.clone(),
-            clock_anchor: anchor,
-            account_id: old_environment
-                .get("account_id")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            region: old_environment
-                .get("region")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            endpoint_url: old_environment
-                .get("aws_endpoint_url")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            localstack_version: old_environment
-                .get("localstack_version")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            force_new: true,
-        },
-    )
-    .await;
-    let snapshot = match snapshot {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            let _ = update_mutation_intent(
-                pool,
-                &intent_id,
-                "AMBIGUOUS",
-                Some(&error.to_string()),
-                &now_rfc3339(),
-            )
-            .await;
-            return Err(error);
-        }
-    };
+    if let Err(error) = mark_intent_dispatched(pool, &intent_id, &now_rfc3339()).await {
+        finalize_intent_ambiguous(pool, &intent_id, &error).await;
+        return Err(error);
+    }
+    let mut new_identity = None;
+    let operation_result = async {
+        let snapshot = realize(
+            pool,
+            RealizeRequest {
+                version: request.authority.version.clone(),
+                clock_anchor: anchor,
+                account_id: old_environment
+                    .get("account_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                region: old_environment
+                    .get("region")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                endpoint_url: old_environment
+                    .get("aws_endpoint_url")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                localstack_version: old_environment
+                    .get("localstack_version")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                force_new: true,
+            },
+        )
+        .await;
+        let snapshot = match snapshot {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                finalize_intent_ambiguous(pool, &intent_id, &error).await;
+                return Err(error);
+            }
+        };
     let new_manifest: Value = serde_json::from_slice(&snapshot.manifest_bytes)?;
     let new_targets = new_manifest
         .get("mutation_resources")
@@ -2088,20 +2395,14 @@ pub async fn recreate(pool: &SqlitePool, request: RecreateRequest) -> Result<Vec
         .get("mutation_generation_id")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("recreate did not produce a mutation generation id"))?;
-    if new_mutation_generation != predicted_mutation_generation
-        || new_generation_id != predicted_generation_id
-    {
-        let error = anyhow!("concurrent realization changed the mutation generation allocation");
-        let _ = update_mutation_intent(
-            pool,
-            &intent_id,
-            "AMBIGUOUS",
-            Some(&error.to_string()),
-            &now_rfc3339(),
-        )
-        .await;
-        return Err(error);
-    }
+        new_identity = Some((new_mutation_generation, new_generation_id.to_string()));
+        if new_mutation_generation != predicted_mutation_generation
+            || new_generation_id != predicted_generation_id
+        {
+            let error = anyhow!("concurrent realization changed the mutation generation allocation");
+            finalize_intent_ambiguous(pool, &intent_id, &error).await;
+            return Err(error);
+        }
     let old_ids = old_targets
         .iter()
         .filter_map(|target| target.get("resource_id").and_then(Value::as_str))
@@ -2109,25 +2410,15 @@ pub async fn recreate(pool: &SqlitePool, request: RecreateRequest) -> Result<Vec
         .collect::<Vec<_>>();
     let old_backend =
         mutation_backend_for_generation(pool, old_mutation_generation, &old_generation_id).await?;
-    if let Err(error) = old_backend.terminate_all(&old_ids).await {
-        sqlx::query(
-            "UPDATE fixture_mutation_generations SET external_status = 'AMBIGUOUS'
-             WHERE mutation_generation = ? AND generation_id = ? AND state = 'ACTIVE'",
-        )
-        .bind(new_mutation_generation)
-        .bind(new_generation_id)
-        .execute(pool)
-        .await?;
-        let _ = update_mutation_intent(
-            pool,
-            &intent_id,
-            "AMBIGUOUS",
-            Some(&error.to_string()),
-            &now_rfc3339(),
-        )
-        .await;
-        return Err(error);
-    }
+        if let Err(error) = old_backend.terminate_all(&old_ids).await {
+            let error = anyhow!(
+                "recreate cleanup ambiguous; returned_ids={old_ids:?}; {error}"
+            );
+            mark_generation_ambiguous(pool, old_mutation_generation, &old_generation_id).await;
+            mark_generation_ambiguous(pool, new_mutation_generation, new_generation_id).await;
+            finalize_intent_ambiguous(pool, &intent_id, &error).await;
+            return Err(error);
+        }
     let receipt_id = receipt_id("recreate");
     let receipt = json!({
         "schema": "foxtail.release-fixture-recreate-receipt/v1",
@@ -2149,9 +2440,9 @@ pub async fn recreate(pool: &SqlitePool, request: RecreateRequest) -> Result<Vec
         "created_at": created_at,
         "identities_replaced": true
     });
-    let receipt_bytes = canonical_receipt(receipt)?;
-    let mut tx = pool.begin().await?;
-    let old_retired = sqlx::query(
+        let receipt_bytes = canonical_receipt(receipt)?;
+        let mut tx = pool.begin().await?;
+        let old_retired = sqlx::query(
         "UPDATE fixture_mutation_resources SET retired_at = ?, external_status = 'DESTROYED'
          WHERE mutation_generation = ? AND generation_id = ? AND retired_at IS NULL",
     )
@@ -2161,19 +2452,12 @@ pub async fn recreate(pool: &SqlitePool, request: RecreateRequest) -> Result<Vec
     .execute(&mut *tx)
     .await?
     .rows_affected();
-    if old_retired != old_ids.len() as u64 {
-        let error = anyhow!("recreate lost an old mutation target row during retirement");
-        let _ = update_mutation_intent(
-            pool,
-            &intent_id,
-            "AMBIGUOUS",
-            Some(&error.to_string()),
-            &now_rfc3339(),
-        )
-        .await;
-        return Err(error);
-    }
-    for id in &old_ids {
+        if old_retired != old_ids.len() as u64 {
+            let error = anyhow!("recreate lost an old mutation target row during retirement");
+            finalize_intent_ambiguous(pool, &intent_id, &error).await;
+            return Err(error);
+        }
+        for id in &old_ids {
         sqlx::query("DELETE FROM metrics WHERE resource_id = ?")
             .bind(id)
             .execute(&mut *tx)
@@ -2187,7 +2471,7 @@ pub async fn recreate(pool: &SqlitePool, request: RecreateRequest) -> Result<Vec
             .execute(&mut *tx)
             .await?;
     }
-    sqlx::query(
+        sqlx::query(
         "UPDATE fixture_mutation_generations SET state = 'DESTROYED', external_status = 'DESTROYED',
                 public_absence = ?, destroyed_at = ?
          WHERE mutation_generation = ? AND generation_id = ? AND state = 'ACTIVE'",
@@ -2198,7 +2482,7 @@ pub async fn recreate(pool: &SqlitePool, request: RecreateRequest) -> Result<Vec
     .bind(&old_generation_id)
     .execute(&mut *tx)
     .await?;
-    persist_receipt(
+        persist_receipt(
         &mut tx,
         "recreate",
         &receipt_id,
@@ -2215,9 +2499,38 @@ pub async fn recreate(pool: &SqlitePool, request: RecreateRequest) -> Result<Vec
         &created_at,
     )
     .await?;
-    tx.commit().await?;
-    update_mutation_intent(pool, &intent_id, "SUCCEEDED", None, &now_rfc3339()).await?;
-    Ok(receipt_bytes)
+        tx.commit().await?;
+        Ok::<Vec<u8>, anyhow::Error>(receipt_bytes)
+    }
+    .await;
+    match operation_result {
+        Ok(receipt_bytes) => {
+            match update_mutation_intent(pool, &intent_id, "SUCCEEDED", None, &now_rfc3339()).await
+            {
+                Ok(()) => Ok(receipt_bytes),
+                Err(error) => {
+                    if let Some((new_mutation_generation, new_generation_id)) = &new_identity {
+                        mark_generation_ambiguous(
+                            pool,
+                            *new_mutation_generation,
+                            new_generation_id,
+                        )
+                        .await;
+                    }
+                    finalize_intent_ambiguous(pool, &intent_id, &error).await;
+                    Err(error)
+                }
+            }
+        }
+        Err(error) => {
+            if let Some((new_mutation_generation, new_generation_id)) = &new_identity {
+                mark_generation_ambiguous(pool, old_mutation_generation, &old_generation_id).await;
+                mark_generation_ambiguous(pool, *new_mutation_generation, new_generation_id).await;
+            }
+            finalize_intent_ambiguous(pool, &intent_id, &error).await;
+            Err(error)
+        }
+    }
 }
 
 pub async fn destroy(pool: &SqlitePool, request: DestroyRequest) -> Result<Vec<u8>> {
@@ -2284,22 +2597,19 @@ pub async fn destroy(pool: &SqlitePool, request: DestroyRequest) -> Result<Vec<u
         &destroyed_at,
     )
     .await?;
-    mark_intent_dispatched(pool, &intent_id, &now_rfc3339()).await?;
-    let backend =
-        match mutation_backend_for_generation(pool, mutation_generation, &generation_id).await {
-            Ok(backend) => backend,
-            Err(error) => {
-                let _ = update_mutation_intent(
-                    pool,
-                    &intent_id,
-                    "AMBIGUOUS",
-                    Some(&error.to_string()),
-                    &now_rfc3339(),
-                )
-                .await;
-                return Err(error);
-            }
-        };
+    if let Err(error) = mark_intent_dispatched(pool, &intent_id, &now_rfc3339()).await {
+        finalize_intent_ambiguous(pool, &intent_id, &error).await;
+        return Err(error);
+    }
+    let operation_result = async {
+        let backend =
+            match mutation_backend_for_generation(pool, mutation_generation, &generation_id).await {
+                Ok(backend) => backend,
+                Err(error) => {
+                    finalize_intent_ambiguous(pool, &intent_id, &error).await;
+                    return Err(error);
+                }
+            };
     let mut reset_receipts = Vec::new();
     for fault in &active_faults {
         let fault_receipt_id: String = fault.try_get("receipt_id")?;
@@ -2316,6 +2626,42 @@ pub async fn destroy(pool: &SqlitePool, request: DestroyRequest) -> Result<Vec<u
         let initial_state: String = target.try_get("initial_state")?;
         let initial_type: String = target.try_get("initial_type")?;
         let scenario = mutation::scenario_for_control(&control_id)?;
+        let public_before = match backend.describe_instance(&target_id).await {
+            Ok(observed) => observed,
+            Err(error) => {
+                let _ = update_mutation_intent(
+                    pool,
+                    &intent_id,
+                    "AMBIGUOUS",
+                    Some(&error.to_string()),
+                    &now_rfc3339(),
+                )
+                .await;
+                return Err(error);
+            }
+        };
+        let recorded_terminal_state: String = fault.try_get("terminal_state")?;
+        if format!(
+            "{}:{}",
+            public_before.instance_state, public_before.instance_type
+        ) != recorded_terminal_state
+        {
+            let error = anyhow!(
+                "destroy reset observed public state {}:{} but receipt recorded {}",
+                public_before.instance_state,
+                public_before.instance_type,
+                recorded_terminal_state
+            );
+            let _ = update_mutation_intent(
+                pool,
+                &intent_id,
+                "AMBIGUOUS",
+                Some(&error.to_string()),
+                &now_rfc3339(),
+            )
+            .await;
+            return Err(error);
+        }
         let observed = match backend.reset_setup_fault(&target_id, scenario).await {
             Ok(observed) => observed,
             Err(error) => {
@@ -2364,8 +2710,8 @@ pub async fn destroy(pool: &SqlitePool, request: DestroyRequest) -> Result<Vec<u
             "scope": fault.try_get::<String, _>("scope")?,
             "fault_kind": fault.try_get::<String, _>("fault_kind")?,
             "applied_at": fault.try_get::<String, _>("applied_at")?,
-            "prior_state": fault.try_get::<String, _>("prior_state")?,
-            "terminal_state": fault.try_get::<String, _>("terminal_state")?,
+            "prior_state": format!("{}:{}", public_before.instance_state, public_before.instance_type),
+            "terminal_state": format!("{}:{}", observed.instance_state, observed.instance_type),
             "reset_at": destroyed_at,
             "reset_token_consumed": true
         });
@@ -2529,7 +2875,8 @@ pub async fn destroy(pool: &SqlitePool, request: DestroyRequest) -> Result<Vec<u
         "public_inventory_absence": {
             "checked": true,
             "all_absent": true,
-            "absent_count": absent_count
+            "absent_count": absent_count,
+            "resource_ids": &target_ids
         },
         "destroyed_at": destroyed_at
     });
@@ -2555,9 +2902,26 @@ pub async fn destroy(pool: &SqlitePool, request: DestroyRequest) -> Result<Vec<u
     .bind(&generation_id)
     .execute(&mut *tx)
     .await?;
-    tx.commit().await?;
-    update_mutation_intent(pool, &intent_id, "SUCCEEDED", None, &now_rfc3339()).await?;
-    Ok(receipt_bytes)
+        tx.commit().await?;
+        Ok::<Vec<u8>, anyhow::Error>(receipt_bytes)
+    }
+    .await;
+    match operation_result {
+        Ok(receipt_bytes) => {
+            match update_mutation_intent(pool, &intent_id, "SUCCEEDED", None, &now_rfc3339()).await
+            {
+                Ok(()) => Ok(receipt_bytes),
+                Err(error) => {
+                    finalize_intent_ambiguous(pool, &intent_id, &error).await;
+                    Err(error)
+                }
+            }
+        }
+        Err(error) => {
+            finalize_intent_ambiguous(pool, &intent_id, &error).await;
+            Err(error)
+        }
+    }
 }
 
 pub fn realization_response(snapshot: &FixtureSnapshot) -> Result<Vec<u8>> {

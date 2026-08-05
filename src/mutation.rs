@@ -9,6 +9,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use aws_config::BehaviorVersion;
 use aws_sdk_ec2::Client;
 use aws_sdk_ec2::config::{Credentials, Region};
+use aws_sdk_ec2::error::{ProvideErrorMetadata, SdkError};
+use aws_sdk_ec2::operation::describe_instances::DescribeInstancesError;
 use aws_sdk_ec2::types::{
     AttributeValue, InstanceAttributeName, InstanceStateName, InstanceType, ResourceType, Tag,
     TagSpecification,
@@ -162,9 +164,31 @@ pub struct ObservedInstance {
     pub availability_zone: Option<String>,
 }
 
+#[derive(Debug)]
+pub struct ProvisionFailure {
+    pub returned_ids: Vec<String>,
+    pub cause: String,
+}
+
+impl std::fmt::Display for ProvisionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "mutation cleanup ambiguous; returned_ids={:?}; {}",
+            self.returned_ids, self.cause
+        )
+    }
+}
+
+impl std::error::Error for ProvisionFailure {}
+
 #[derive(Default)]
 struct MockState {
     instances: BTreeMap<String, ObservedInstance>,
+    fail_setup_at: Option<usize>,
+    fail_cleanup: bool,
+    launch_count: usize,
+    fail_setup_target: Option<String>,
 }
 
 enum BackendKind {
@@ -189,7 +213,18 @@ impl Ec2MutationBackend {
                 .lock()
                 .map_err(|_| anyhow!("mock mutation state lock poisoned"))?
                 .entry(mock_key.to_string())
-                .or_insert_with(|| Arc::new(Mutex::new(MockState::default())))
+                .or_insert_with(|| {
+                    let fail_setup_at = mock_key
+                        .strip_prefix("fail-setup-")
+                        .or_else(|| mock_key.strip_prefix("fail-cleanup-setup-"))
+                        .and_then(|value| value.parse::<usize>().ok());
+                    Arc::new(Mutex::new(MockState {
+                        fail_setup_at,
+                        fail_cleanup: mock_key == "fail-cleanup"
+                            || mock_key.starts_with("fail-cleanup-setup-"),
+                        ..MockState::default()
+                    }))
+                })
                 .clone();
             return Ok(Self {
                 backend: Arc::new(BackendKind::Mock(state)),
@@ -235,11 +270,11 @@ impl Ec2MutationBackend {
     ) -> Result<Vec<(MutationScenario, ObservedInstance)>> {
         let mut provisioned = Vec::with_capacity(CATALOGUE.len());
         for scenario in CATALOGUE {
-            match self
-                .provision_target(generation, generation_id, &scenario)
+            let resource_id = match self
+                .launch_target(generation, generation_id, &scenario)
                 .await
             {
-                Ok(observed) => provisioned.push((scenario, observed)),
+                Ok(resource_id) => resource_id,
                 Err(error) => {
                     let ids = provisioned
                         .iter()
@@ -247,25 +282,38 @@ impl Ec2MutationBackend {
                             observed.resource_id.clone()
                         })
                         .collect::<Vec<_>>();
-                    let cleanup = self.terminate_all(&ids).await;
-                    if let Err(cleanup_error) = cleanup {
-                        return Err(error.context(format!(
-                            "mutation provisioning failed; cleanup also failed: {cleanup_error}"
-                        )));
-                    }
-                    return Err(error);
+                    return Err(self
+                        .cleanup_after_provision_failure(&ids, error)
+                        .await
+                        .unwrap_or_else(|cleanup_error| cleanup_error));
+                }
+            };
+            match self.prepare_target(&resource_id, &scenario).await {
+                Ok(observed) => provisioned.push((scenario, observed)),
+                Err(error) => {
+                    let mut ids = provisioned
+                        .iter()
+                        .map(|(_, observed): &(MutationScenario, ObservedInstance)| {
+                            observed.resource_id.clone()
+                        })
+                        .collect::<Vec<_>>();
+                    ids.push(resource_id);
+                    return Err(self
+                        .cleanup_after_provision_failure(&ids, error)
+                        .await
+                        .unwrap_or_else(|cleanup_error| cleanup_error));
                 }
             }
         }
         Ok(provisioned)
     }
 
-    async fn provision_target(
+    async fn launch_target(
         &self,
         generation: i64,
         generation_id: &str,
         scenario: &MutationScenario,
-    ) -> Result<ObservedInstance> {
+    ) -> Result<String> {
         if let BackendKind::Mock(state) = self.backend.as_ref() {
             let resource_id = resource_id_hint(generation, scenario.target_kind);
             let observed = ObservedInstance {
@@ -280,8 +328,14 @@ impl Ec2MutationBackend {
             if state.instances.contains_key(&resource_id) {
                 bail!("mock mutation target {resource_id} already exists")
             }
-            state.instances.insert(resource_id, observed.clone());
-            return Ok(observed);
+            state
+                .instances
+                .insert(resource_id.clone(), observed.clone());
+            state.launch_count += 1;
+            if state.fail_setup_at == Some(state.launch_count) {
+                state.fail_setup_target = Some(resource_id.clone());
+            }
+            return Ok(resource_id);
         }
         let image_id =
             std::env::var(MUTATION_AMI_ENV).unwrap_or_else(|_| DEFAULT_MUTATION_AMI_ID.to_string());
@@ -327,21 +381,88 @@ impl Ec2MutationBackend {
             .and_then(|instance| instance.instance_id())
             .ok_or_else(|| anyhow!("run-instances returned no instance identity"))?
             .to_string();
+        Ok(resource_id)
+    }
+
+    async fn prepare_target(
+        &self,
+        resource_id: &str,
+        scenario: &MutationScenario,
+    ) -> Result<ObservedInstance> {
+        if let BackendKind::Mock(state) = self.backend.as_ref() {
+            let mut state = state
+                .lock()
+                .map_err(|_| anyhow!("mock mutation state lock poisoned"))?;
+            if state.fail_setup_target.as_deref() == Some(resource_id) {
+                state.fail_setup_target = None;
+                bail!("injected mutation setup failure for {resource_id}");
+            }
+            let target = state
+                .instances
+                .get_mut(resource_id)
+                .ok_or_else(|| anyhow!("public EC2 describe returned no target '{resource_id}'"))?;
+            if target.instance_state != scenario.initial_state
+                || target.instance_type != scenario.initial_type
+            {
+                bail!(
+                    "mock mutation launch state for {resource_id} was {}:{}, expected {}:{}",
+                    target.instance_state,
+                    target.instance_type,
+                    scenario.initial_state,
+                    scenario.initial_type
+                );
+            }
+            return Ok(target.clone());
+        }
         let observed = self
-            .wait_for_instance(&resource_id, "running", scenario.initial_type)
+            .wait_for_instance(resource_id, "running", scenario.initial_type)
             .await?;
         if scenario.initial_state == "stopped" {
             self.aws_client()
                 .stop_instances()
-                .instance_ids(&resource_id)
+                .instance_ids(resource_id)
                 .send()
                 .await
                 .context("stop initial stopped mutation target")?;
-            self.wait_for_instance(&resource_id, "stopped", scenario.initial_type)
+            self.wait_for_instance(resource_id, "stopped", scenario.initial_type)
                 .await
         } else {
             Ok(observed)
         }
+    }
+
+    async fn cleanup_after_provision_failure(
+        &self,
+        ids: &[String],
+        error: anyhow::Error,
+    ) -> Result<anyhow::Error> {
+        if ids.is_empty() {
+            return Ok(error);
+        }
+        if let Err(cleanup_error) = self.terminate_all(ids).await {
+            return Err(anyhow::Error::new(ProvisionFailure {
+                returned_ids: ids.to_vec(),
+                cause: format!("setup_error={error}; cleanup_error={cleanup_error}"),
+            }));
+        }
+        for id in ids {
+            match self.verify_absent(id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(anyhow::Error::new(ProvisionFailure {
+                        returned_ids: ids.to_vec(),
+                        cause: format!("target {id} remains publicly visible"),
+                    }));
+                }
+                Err(absence_error) => {
+                    return Err(anyhow::Error::new(ProvisionFailure {
+                        returned_ids: ids.to_vec(),
+                        cause: format!("absence_error={absence_error}"),
+                    }));
+                }
+            }
+        }
+        Ok(error.context(format!("returned_ids={ids:?}; public_absence_proven")))
     }
 
     pub async fn apply_setup_fault(
@@ -525,7 +646,6 @@ impl Ec2MutationBackend {
 
     pub async fn verify_absent(&self, target_id: &str) -> Result<bool> {
         match self.describe_instance(target_id).await {
-            Ok(observed) if observed.instance_state == "terminated" => Ok(true),
             Ok(_) => Ok(false),
             Err(error) if is_not_found_error(&error) => Ok(true),
             Err(error) => Err(error),
@@ -540,6 +660,9 @@ impl Ec2MutationBackend {
             let mut state = state
                 .lock()
                 .map_err(|_| anyhow!("mock mutation state lock poisoned"))?;
+            if state.fail_cleanup {
+                bail!("injected mutation cleanup failure");
+            }
             for target_id in target_ids {
                 state.instances.remove(target_id);
             }
@@ -556,7 +679,6 @@ impl Ec2MutationBackend {
             let mut absent = true;
             for target_id in target_ids {
                 match self.describe_instance(target_id).await {
-                    Ok(observed) if observed.instance_state == "terminated" => {}
                     Ok(_) => absent = false,
                     Err(error) if is_not_found_error(&error) => {}
                     Err(error) => return Err(error),
@@ -598,6 +720,17 @@ impl Ec2MutationBackend {
 }
 
 fn is_not_found_error(error: &anyhow::Error) -> bool {
+    if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<SdkError<DescribeInstancesError>>()
+            .and_then(|sdk_error| sdk_error.as_service_error())
+            .and_then(|service_error| service_error.code())
+            .is_some_and(|code| {
+                code.contains("NotFound") || code.contains("not found") || code == "NoSuchEntity"
+            })
+    }) {
+        return true;
+    }
     let message = error.to_string().to_ascii_lowercase();
     message.contains("no target")
         || message.contains("notfound")
