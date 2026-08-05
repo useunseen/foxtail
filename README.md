@@ -126,6 +126,11 @@ These are for local debugging and control, not AWS parity:
 
 - `GET /_mock/status`
 - `POST /_mock/scenario`
+- `GET /_mock/fixture/definition`
+- `POST /_mock/fixture/realize`
+- `GET /_mock/fixture/status`
+- `GET /_mock/fixture/manifest`
+- `GET /_mock/fixture/identities`
 - `GET /_mock/dashboard/data`
 - `GET /_mock/dashboard/resources`
 - `GET /_mock/dashboard/trends/cloudwatch`
@@ -136,6 +141,32 @@ Example:
 ```bash
 curl http://127.0.0.1:8080/_mock/status
 ```
+
+### Release-Qualification Fixture v1
+
+The release-qualification fixture is a deterministic, read-only tracer bullet for
+the five positive, negative, and degraded controls declared by the v1 contract.
+It does not mutate or reset the generated estate. The definition is available
+before realization; the manifest and realized identities are published only
+after a successful realization.
+
+The native CLI and local HTTP routes expose the same canonical JSON documents:
+
+~~~~bash
+target/debug/foxtail fixture definition
+target/debug/foxtail fixture realize
+curl http://127.0.0.1:8080/_mock/fixture/definition
+curl http://127.0.0.1:8080/_mock/fixture/status
+curl -X POST http://127.0.0.1:8080/_mock/fixture/realize \
+  -H 'content-type: application/json' \
+  -d '{"version":"release-qualification-v1"}'
+~~~~
+
+The manifest binds the definition digest, generator and LocalStack provenance,
+clock anchor, AWS account/region scope, realized identities, public evidence
+declarations, and the two deferred mutation controls. The ordinary AWS-compatible
+inventory, CloudWatch, Cost Explorer, and Compute Optimizer routes remain the
+authoritative evidence surfaces.
 
 ## Supported AWS-Compatible Commands
 

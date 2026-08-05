@@ -1,5 +1,26 @@
 # Cost Explorer USAGE_TYPE Grouping Work
 
+# Release Qualification Fixture v1
+
+- [x] Add canonical fixture definition/manifest model, serializer, SHA-256 digest boundary, schemas, and checked-in goldens.
+- [x] Add atomic persisted realization state derived from the current EC2 estate, with deterministic five-control catalogue and public evidence declarations.
+- [x] Add shared CLI and HTTP definition/realize/status/manifest/identities flows with fail-closed version/input handling and byte/digest parity.
+- [x] Add focused unit/integration/schema/golden tests plus AWS CLI observation smoke coverage; update README and script docs.
+- [x] Run formatting, full tests, clippy, and feasible interoperability checks; record review evidence and residual environment gaps.
+
+## Release Qualification Fixture v1 Results
+
+- The v1 definition and manifest are canonical compact UTF-8 JSON with recursively sorted object keys and SHA-256 digests that exclude only the document's own top-level digest.
+- Realization persists exact definition/manifest bytes in a singleton SQLite row, binds the manifest to the active definition digest and generation, and publishes five deterministic read-only EC2 control identities plus two deferred mutation declarations.
+- Native fixture (and release-qualification aliases) and local HTTP routes return the same bytes for definition, realization, status, manifest, and identities; unknown versions, malformed JSON, and unknown request fields fail closed.
+- Verification completed successfully:
+  - cargo fmt --all -- --check
+  - cargo test
+  - cargo clippy --all-targets --all-features -- -D warnings
+  - bash -n scripts/verify_cli_interop.sh
+  - scripts/verify_cli_interop.sh against a temporary migrated five-EC2 seed, including CLI/HTTP parity and AWS CLI inventory, metrics, cost, recommendation, and history checks
+- The smoke script was not run against a live LocalStack deployment in this checkout; it uses the existing script's seeded database contract and requires loopback access when run in the sandbox.
+
 - [x] Diagnose why AWS CLI `ce get-cost-and-usage --group-by Type=DIMENSION,Key=USAGE_TYPE` fails validation.
 - [x] Add `USAGE_TYPE` as a supported Cost Explorer grouping dimension.
 - [x] Return AWS-style mock usage type keys and `UsageQuantity` metrics for grouped cost responses.

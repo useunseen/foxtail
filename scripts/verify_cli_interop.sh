@@ -90,6 +90,96 @@ aws_json() {
   aws --output json --endpoint-url "$ENDPOINT" "$@"
 }
 
+FIXTURE_DEFINITION="$(curl -fsS "$ENDPOINT/_mock/fixture/definition?version=release-qualification-v1")"
+FIXTURE_STATUS="$(curl -fsS "$ENDPOINT/_mock/fixture/status")"
+CLI_FIXTURE_DEFINITION="$("$BIN" --database-url "sqlite:$TMP_DB" fixture definition)"
+CLI_FIXTURE_STATUS="$("$BIN" --database-url "sqlite:$TMP_DB" fixture status)"
+if [[ "$CLI_FIXTURE_DEFINITION" != "$FIXTURE_DEFINITION" ]]; then
+  echo "fixture definition CLI/HTTP bytes differ" >&2
+  exit 1
+fi
+if [[ "$CLI_FIXTURE_STATUS" != "$FIXTURE_STATUS" ]]; then
+  echo "fixture status CLI/HTTP bytes differ" >&2
+  exit 1
+fi
+FIXTURE_DEFINITION="$FIXTURE_DEFINITION" FIXTURE_STATUS="$FIXTURE_STATUS" python3 - <<'PY'
+import json
+import os
+
+definition = json.loads(os.environ["FIXTURE_DEFINITION"])
+status = json.loads(os.environ["FIXTURE_STATUS"])
+if definition.get("schema") != "foxtail.release-fixture-definition/v1":
+    raise SystemExit("fixture definition schema mismatch")
+if not definition.get("digest", "").startswith("sha256:"):
+    raise SystemExit("fixture definition digest missing")
+if status.get("status") != "ABSENT":
+    raise SystemExit("fresh fixture state should be ABSENT")
+PY
+log_step "Verified release fixture: definition and pre-realization status"
+
+FIXTURE_EC2_COUNT="$(sqlite3 "$TMP_DB" "SELECT COUNT(*) FROM resources WHERE resource_type = 'ec2';")"
+if [[ "$FIXTURE_EC2_COUNT" -ge 5 ]]; then
+  FIXTURE_ANCHOR="2026-08-05T00:00:00Z"
+  CLI_DB="$TMP_DIR/cli-fixture.db"
+  sqlite3 "$TMP_DB" ".backup '$CLI_DB'" >/dev/null
+  FIXTURE_REALIZATION="$(curl -fsS -X POST "$ENDPOINT/_mock/fixture/realize" \
+    -H 'content-type: application/json' \
+    -d "{\"version\":\"release-qualification-v1\",\"clock_anchor\":\"$FIXTURE_ANCHOR\"}")"
+  CLI_REALIZATION="$("$BIN" --database-url "sqlite:$CLI_DB" fixture realize \
+    --clock-anchor "$FIXTURE_ANCHOR")"
+  if [[ "$CLI_REALIZATION" != "$FIXTURE_REALIZATION" ]]; then
+    echo "fixture realization CLI/HTTP bytes differ" >&2
+    exit 1
+  fi
+  FIXTURE_REALIZATION="$FIXTURE_REALIZATION" python3 - <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ["FIXTURE_REALIZATION"])
+manifest = payload.get("manifest", {})
+if manifest.get("schema") != "foxtail.release-fixture-manifest/v1":
+    raise SystemExit("fixture manifest schema mismatch")
+if payload.get("manifest_digest") != manifest.get("digest"):
+    raise SystemExit("fixture manifest digest mismatch")
+resources = manifest.get("resources", [])
+if len(resources) != 5:
+    raise SystemExit("fixture realization did not publish five read-only controls")
+PY
+  log_step "Verified release fixture: realization manifest and digest"
+  FIXTURE_STATUS_REALIZED="$(curl -fsS "$ENDPOINT/_mock/fixture/status")"
+  FIXTURE_MANIFEST="$(curl -fsS "$ENDPOINT/_mock/fixture/manifest")"
+  FIXTURE_IDENTITIES="$(curl -fsS "$ENDPOINT/_mock/fixture/identities")"
+  CLI_FIXTURE_STATUS_REALIZED="$("$BIN" --database-url "sqlite:$TMP_DB" fixture status)"
+  CLI_FIXTURE_MANIFEST="$("$BIN" --database-url "sqlite:$TMP_DB" fixture manifest)"
+  CLI_FIXTURE_IDENTITIES="$("$BIN" --database-url "sqlite:$TMP_DB" fixture identities)"
+  if [[ "$CLI_FIXTURE_STATUS_REALIZED" != "$FIXTURE_STATUS_REALIZED" \
+    || "$CLI_FIXTURE_MANIFEST" != "$FIXTURE_MANIFEST" \
+    || "$CLI_FIXTURE_IDENTITIES" != "$FIXTURE_IDENTITIES" ]]; then
+    echo "fixture persisted document CLI/HTTP bytes differ" >&2
+    exit 1
+  fi
+  log_step "Verified release fixture: persisted CLI/HTTP status, manifest, and identity parity"
+  FIXTURE_IDS="$(FIXTURE_REALIZATION="$FIXTURE_REALIZATION" python3 - <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ["FIXTURE_REALIZATION"])
+for resource in payload["manifest"]["resources"]:
+    print(resource["resource_id"])
+PY
+)"
+  while IFS= read -r fixture_id; do
+    [[ -z "$fixture_id" ]] && continue
+    aws_json cloudwatch list-metrics \
+      --namespace AWS/EC2 \
+      --metric-name CPUUtilization \
+      --dimensions "Name=InstanceId,Value=$fixture_id" >/dev/null
+  done <<<"$FIXTURE_IDS"
+  log_step "Verified release fixture: public CloudWatch observation for every realized identity"
+else
+  log_step "Skipped release fixture realization smoke: seed has fewer than five EC2 resources"
+fi
+
 SERVICE_DIMENSIONS="$(aws_json ce get-dimension-values \
   --time-period "Start=$CE_START_DAY,End=$CE_END_DAY" \
   --dimension SERVICE)"

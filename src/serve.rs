@@ -16,6 +16,7 @@ use std::net::SocketAddr;
 use tracing::{debug, info, warn};
 
 use crate::cli::Scenario;
+use crate::fixture;
 use crate::generator;
 use crate::handlers::{aws, cloudwatch as cw, cost_explorer as ce};
 use crate::metrics::{self, MetricQueryParams};
@@ -38,6 +39,56 @@ pub fn build_app(pool: SqlitePool) -> Router {
     Router::new()
         .route("/", post(aws_handler))
         .route("/_mock/status", get(status_handler))
+        .route("/_mock/fixture/definition", get(fixture_definition_handler))
+        .route("/_mock/fixture/realize", post(fixture_realize_handler))
+        .route("/_mock/fixture/status", get(fixture_status_handler))
+        .route("/_mock/fixture/manifest", get(fixture_manifest_handler))
+        .route("/_mock/fixture/identities", get(fixture_identities_handler))
+        .route("/_mock/fixture-definition", get(fixture_definition_handler))
+        .route("/_mock/fixture-manifest", get(fixture_manifest_handler))
+        .route("/_mock/fixture-identities", get(fixture_identities_handler))
+        .route("/_mock/fixture-status", get(fixture_status_handler))
+        .route(
+            "/_mock/fixture",
+            get(fixture_status_handler).post(fixture_realize_handler),
+        )
+        .route(
+            "/_mock/release-fixture/definition",
+            get(fixture_definition_handler),
+        )
+        .route(
+            "/_mock/release-fixture/realize",
+            post(fixture_realize_handler),
+        )
+        .route("/_mock/release-fixture/status", get(fixture_status_handler))
+        .route(
+            "/_mock/release-fixture/manifest",
+            get(fixture_manifest_handler),
+        )
+        .route(
+            "/_mock/release-fixture/identities",
+            get(fixture_identities_handler),
+        )
+        .route(
+            "/_mock/release-qualification/definition",
+            get(fixture_definition_handler),
+        )
+        .route(
+            "/_mock/release-qualification/realize",
+            post(fixture_realize_handler),
+        )
+        .route(
+            "/_mock/release-qualification/status",
+            get(fixture_status_handler),
+        )
+        .route(
+            "/_mock/release-qualification/manifest",
+            get(fixture_manifest_handler),
+        )
+        .route(
+            "/_mock/release-qualification/identities",
+            get(fixture_identities_handler),
+        )
         .route("/_mock/dashboard/data", get(dashboard_data_handler))
         .route(
             "/_mock/dashboard/resources",
@@ -84,6 +135,11 @@ struct CloudWatchQuery {
 struct ScenarioRequest {
     scenario: Scenario,
     resource_id: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct FixtureVersionQuery {
+    version: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2703,12 +2759,102 @@ async fn status_handler(State(pool): State<SqlitePool>) -> impl IntoResponse {
         .await
         .unwrap_or(0);
 
+    let fixture_status = fixture::read_state(&pool)
+        .await
+        .ok()
+        .and_then(|state| serde_json::from_slice::<Value>(&state.status_bytes).ok())
+        .unwrap_or_else(|| json!({"status": "UNAVAILABLE"}));
+
     Json(json!({
         "status": "online",
         "resource_count": res_count,
         "metric_count": metric_count,
-        "version": env!("CARGO_PKG_VERSION")
+        "version": env!("CARGO_PKG_VERSION"),
+        "fixture": fixture_status
     }))
+}
+
+fn fixture_document_response(status: StatusCode, bytes: Vec<u8>) -> axum::response::Response {
+    (
+        status,
+        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+        bytes,
+    )
+        .into_response()
+}
+
+fn fixture_error_response(
+    status: StatusCode,
+    message: impl Into<String>,
+) -> axum::response::Response {
+    let payload = json!({
+        "schema": "foxtail.release-fixture-error/v1",
+        "error": "fixture_request_failed",
+        "message": message.into()
+    });
+    fixture_document_response(
+        status,
+        fixture::canonical_bytes(&payload)
+            .unwrap_or_else(|_| b"{\"error\":\"fixture_request_failed\"}".to_vec()),
+    )
+}
+
+async fn fixture_definition_handler(
+    Query(query): Query<FixtureVersionQuery>,
+) -> axum::response::Response {
+    if let Err(error) = fixture::validate_version(query.version.as_deref()) {
+        return fixture_error_response(StatusCode::BAD_REQUEST, error.to_string());
+    }
+    match fixture::canonical_definition() {
+        Ok((bytes, _)) => fixture_document_response(StatusCode::OK, bytes),
+        Err(error) => fixture_error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
+}
+
+async fn fixture_realize_handler(
+    State(pool): State<SqlitePool>,
+    body: Bytes,
+) -> axum::response::Response {
+    let request = match fixture::parse_json_request(&body) {
+        Ok(request) => request,
+        Err(error) => return fixture_error_response(StatusCode::BAD_REQUEST, error.to_string()),
+    };
+    if let Err(error) = fixture::validate_version(request.version.as_deref()) {
+        return fixture_error_response(StatusCode::BAD_REQUEST, error.to_string());
+    }
+    match fixture::realize(&pool, request).await {
+        Ok(snapshot) => match fixture::realization_response(&snapshot) {
+            Ok(bytes) => fixture_document_response(StatusCode::OK, bytes),
+            Err(error) => {
+                fixture_error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+            }
+        },
+        Err(error) => fixture_error_response(StatusCode::UNPROCESSABLE_ENTITY, error.to_string()),
+    }
+}
+
+async fn fixture_status_handler(State(pool): State<SqlitePool>) -> axum::response::Response {
+    match fixture::read_state(&pool).await {
+        Ok(state) => fixture_document_response(StatusCode::OK, state.status_bytes),
+        Err(error) => fixture_error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
+}
+
+async fn fixture_manifest_handler(State(pool): State<SqlitePool>) -> axum::response::Response {
+    match fixture::read_state(&pool).await {
+        Ok(state) => match state.manifest_bytes {
+            Some(bytes) => fixture_document_response(StatusCode::OK, bytes),
+            None => fixture_error_response(StatusCode::NOT_FOUND, "fixture has not been realized"),
+        },
+        Err(error) => fixture_error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
+}
+
+async fn fixture_identities_handler(State(pool): State<SqlitePool>) -> axum::response::Response {
+    match fixture::read_state(&pool).await {
+        Ok(state) => fixture_document_response(StatusCode::OK, state.identities_bytes),
+        Err(error) => fixture_error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
 }
 
 fn normalize_query_value(value: Option<String>) -> Option<String> {
@@ -5925,6 +6071,254 @@ mod tests {
         let body = response_json(response).await;
         assert_eq!(body["resource_count"], 1);
         assert_eq!(body["metric_count"], 1);
+    }
+
+    async fn seed_fixture_ec2_estate(pool: &SqlitePool, count: usize) {
+        for index in 0..count {
+            let resource_id = format!("i-fixture-{index}");
+            sqlx::query(
+                "INSERT INTO resources (id, resource_type, region, scenario, tags)
+                 VALUES (?, 'ec2', 'us-east-1', 'Baseline', '{}')",
+            )
+            .bind(&resource_id)
+            .execute(pool)
+            .await
+            .unwrap();
+            for (offset, value) in [
+                (-14 * 86400, 8.0 + index as f64),
+                (-3600, 12.0 + index as f64),
+            ] {
+                sqlx::query(
+                    "INSERT INTO metrics (resource_id, namespace, metric_name, seconds_from_now, value)
+                     VALUES (?, 'AWS/EC2', 'CPUUtilization', ?, ?)",
+                )
+                .bind(&resource_id)
+                .bind(offset)
+                .bind(value)
+                .execute(pool)
+                .await
+                .unwrap();
+            }
+            sqlx::query(
+                "INSERT INTO cost_records (resource_id, seconds_from_now, amount)
+                 VALUES (?, -86400, 1.25)",
+            )
+            .bind(&resource_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn fixture_definition_is_canonical_and_status_is_absent_before_realization() {
+        let pool = test_pool().await;
+        let app = build_app(pool);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/_mock/fixture/definition?version=release-qualification-v1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), fixture::canonical_definition().unwrap().0);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/_mock/release-fixture/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["status"], "ABSENT");
+        assert!(body["manifest_digest"].is_null());
+    }
+
+    #[tokio::test]
+    async fn fixture_realization_persists_exact_manifest_and_public_identities() {
+        let pool = test_pool().await;
+        seed_fixture_ec2_estate(&pool, 5).await;
+        let app = build_app(pool);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_mock/fixture/realize")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"version":"release-qualification-v1","clock_anchor":"2026-08-05T00:00:00Z"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let realization = response_json(response).await;
+        assert_eq!(realization["manifest"]["schema"], fixture::MANIFEST_SCHEMA);
+        let manifest_digest = realization["manifest_digest"].as_str().unwrap();
+        assert_eq!(manifest_digest, realization["manifest"]["digest"]);
+        assert_eq!(
+            realization["manifest"]["resources"]
+                .as_array()
+                .unwrap()
+                .len(),
+            fixture::REALIZED_CONTROL_IDS.len()
+        );
+
+        let manifest_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/_mock/fixture/manifest")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(manifest_response.status(), StatusCode::OK);
+        let manifest = response_json(manifest_response).await;
+        assert_eq!(manifest["digest"], manifest_digest);
+        let roles = manifest["control_catalogue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|control| control["role"].as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            roles,
+            BTreeSet::from(["degraded", "mutation", "negative", "positive"])
+        );
+        for resource in manifest["resources"].as_array().unwrap() {
+            let resource_id = resource["resource_id"].as_str().unwrap();
+            assert!(resource_id.starts_with("i-fixture-"));
+            assert!(
+                resource["aws_identity"]
+                    .as_str()
+                    .unwrap()
+                    .contains(resource_id)
+            );
+        }
+
+        let identities = response_json(
+            app.oneshot(
+                Request::builder()
+                    .uri("/_mock/fixture/identities")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(identities["manifest_digest"], manifest_digest);
+        assert_eq!(
+            identities["resource_ids"].as_array().unwrap().len(),
+            fixture::REALIZED_CONTROL_IDS.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn fixture_realization_rejects_incomplete_estate_without_partial_state() {
+        let pool = test_pool().await;
+        seed_fixture_ec2_estate(&pool, 4).await;
+        let app = build_app(pool);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_mock/release-fixture/realize")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let status = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/_mock/fixture/status")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status["status"], "ABSENT");
+        let manifest = app
+            .oneshot(
+                Request::builder()
+                    .uri("/_mock/fixture/manifest")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(manifest.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn fixture_unknown_version_fails_closed() {
+        let pool = test_pool().await;
+        let app = build_app(pool);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/_mock/fixture/definition?version=release-qualification-v99")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn fixture_realization_rejects_unknown_input_without_writing_state() {
+        let pool = test_pool().await;
+        seed_fixture_ec2_estate(&pool, 5).await;
+        let app = build_app(pool);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_mock/fixture/realize")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"version":"release-qualification-v1","unexpected":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let status = response_json(
+            app.oneshot(
+                Request::builder()
+                    .uri("/_mock/fixture/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status["status"], "ABSENT");
     }
 
     #[tokio::test]
