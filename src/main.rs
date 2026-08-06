@@ -91,39 +91,7 @@ async fn run_native(command: Commands, database_url: &str) -> Result<()> {
 }
 
 async fn run_fixture_command(pool: sqlx::SqlitePool, command: FixtureCommands) -> Result<()> {
-    let bytes = match command {
-        FixtureCommands::Definition { version } => {
-            foxtail::fixture::validate_version(Some(&version))?;
-            foxtail::fixture::canonical_definition()?.0
-        }
-        FixtureCommands::Realize {
-            version,
-            clock_anchor,
-            account_id,
-            region,
-            endpoint_url,
-            localstack_version,
-        } => foxtail::fixture::realization_response(
-            &foxtail::fixture::realize(
-                &pool,
-                foxtail::fixture::RealizeRequest {
-                    version: Some(version),
-                    clock_anchor,
-                    account_id,
-                    region,
-                    endpoint_url,
-                    localstack_version,
-                },
-            )
-            .await?,
-        )?,
-        FixtureCommands::Status => foxtail::fixture::read_state(&pool).await?.status_bytes,
-        FixtureCommands::Manifest => foxtail::fixture::read_state(&pool)
-            .await?
-            .manifest_bytes
-            .ok_or_else(|| anyhow::anyhow!("fixture has not been realized"))?,
-        FixtureCommands::Identities => foxtail::fixture::read_state(&pool).await?.identities_bytes,
-    };
+    let bytes = foxtail::fixture::execute_fixture_cli_command(&pool, command).await?;
     print!("{}", foxtail::fixture::cli_bytes_to_string(&bytes)?);
     Ok(())
 }

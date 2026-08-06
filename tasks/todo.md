@@ -1,3 +1,69 @@
+# Issue #5: Disposable Mutation Generations
+
+Pinned base: `b524be1d738d12e816b584ea0238113545118cf8`
+
+Invariant: qualification mutations can affect only fresh, manifest-bound, one-use EC2 targets inside an explicitly isolated qualification environment; every transition is auditable, stale or ambiguous authority fails closed, and destruction is complete only after public inventory proves old identities absent and no injected fault remains.
+
+## Acceptance Map
+
+- [x] Distinct targets: fixture lifecycle/persistence owns separate stop, resize, stop-recovery, and resize-restoration targets; manifest/status and public inventory consume their identities; existing read-only controls remain compatible; prove four unique mutation identities with no reuse or read-only overlap.
+- [x] Recreation identity: isolated recreation provisions a new mutation-generation identity, new public EC2 IDs, regenerated manifest digest, and retires the old public identities while preserving definition/read-only identity.
+- [x] Supported controls: CLI parsing/execution and HTTP routes expose status, fault, reset, recreate, and destroy through the same fixture domain operations.
+- [x] Fault receipts: fault application binds exact manifest digest, mutation control, target/scope, setup fault kind, application time, and one-use reset token; public EC2 state/type is reconciled before commit.
+- [x] Reset/cleanup receipts: reset and destruction enumerate exact faults/targets acted on plus their prior and terminal state; targeted reset is guarded by the recorded terminal state.
+- [x] Isolation gate: every mutating fixture operation requires an explicit isolated-qualification environment signal in addition to existing HTTP admin authentication; ordinary realization remains declared-only and read-only.
+- [x] Destruction proof: cleanup removes generation-owned resources and evidence, resets every active fault, records exact EC2 termination evidence, proves old identities are absent from Foxtail's public inventory, and records the absence receipt.
+- [x] Fail closed: duplicate, stale-generation, wrong-manifest, wrong-control/target, malformed, unknown-field, and ambiguous external operations are rejected without private-state repair or scope expansion.
+- [x] Full proof: focused Rust unit/integration tests cover the lifecycle and deterministic mock boundary, and the complete LocalStack smoke passes with a valid mutation AMI/endpoint.
+
+## Execution Plan
+
+- [x] Give one Luna worker ownership of the coherent fixture lifecycle slice, schemas/goldens, migration, CLI/HTTP surfaces, documentation, tests, and commits.
+- [ ] Inspect the Luna handoff and frozen committed diff against every acceptance criterion.
+- [ ] Run frozen-head code review against the pinned base and return validated repair findings to the same Luna worker.
+- [ ] Run broad formatting, test, clippy, schema, and interoperability verification once on the repair candidate.
+- [ ] Record review evidence, residual gaps, commit IDs, and final acceptance outcome below.
+
+## Issue #5 Review
+
+- Implementation complete; frozen-head review remains with the parent agent.
+
+## Issue #5 Repair Results
+
+- Added a typed canonical mutation catalogue and a single EC2 boundary. Isolated generations use the AWS SDK against the configured endpoint and reconcile returned IDs, states, and instance types; a deterministic `mock://` backend exercises the same lifecycle in tests.
+- Ordinary `fixture realize` with an unset or invalid qualification value keeps mutation controls declared-only, writes no mutation ledger, and performs no external dispatch. Mutation operations persist an intent before dispatch and finalize only after public reconciliation and affected-row guards.
+- Fault, reset, recreate, and destroy now dispatch through the external boundary. Recreate records exact `terminated`/service-level not-found evidence for every prior target before retiring its ledger; destroy resets active faults, records the same external evidence, and proves public Resource Groups inventory absence.
+- Verification completed with `cargo fmt --all -- --check`, `cargo test -q` (71 unit, 2 API-contract, 14 mutation integration, 3 wrapper tests), `cargo clippy --all-targets --all-features -- -D warnings`, the pinned Draft 2020-12 validator, `bash -n scripts/verify_cli_interop.sh`, and `git diff --check`. Real LocalStack/EC2 smoke remains pending a live endpoint and valid `FOXTAIL_MUTATION_AMI_ID`.
+
+## Issue #5 Second Frozen Repair Results
+
+- [x] Serialize all lifecycle operations per generation with a partial unique index and fail-closed validation; reject every subsequent isolated `realize` until authority-bound `recreate` is used.
+- [x] Record every launched public target before setup, include the current and earlier IDs in cleanup/quarantine, compensate post-provision persistence failures, and add deterministic setup/cleanup/database failure-injection tests.
+- [x] Quarantine pre-boundary `UNKNOWN`/default-endpoint generations during migration and require an active generation with exactly four canonical, non-retired, externally verified targets before dispatch.
+- [x] Reconcile destroy/reset against externally observed state, accept only exact `terminated` or service-level not-found as irreversible EC2 cleanup, classify not-found errors through the SDK error chain, and keep public-inventory absence separate from EC2 termination evidence.
+- [x] Make the CLI smoke use one database/generation, alternate CLI/HTTP fault/reset channels across all four targets, recreate and destroy both generations, verify EC2 terminal cleanup plus Tagging absence, and validate every mutation status/receipt with executable Draft 2020-12 schemas.
+- Verification completed with `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test -q` (71 unit, 2 API-contract, 14 mutation integration, 3 wrapper tests), `python3 scripts/validate_release_fixture.py --negative`, `bash -n scripts/verify_cli_interop.sh`, and `git diff --check`. AWS `TerminateInstances` may keep terminated instances visible in `DescribeInstances` for approximately one hour, so EC2 termination and Foxtail public-inventory absence are recorded as separate proofs; see the [official API documentation](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_TerminateInstances.html).
+
+## Issue #5 Final Live Repair Results
+
+- [x] Make the deterministic failed-realize test inject a pre-dispatch EC2 failure through the mock boundary instead of depending on an unavailable localhost port.
+- [x] Poll only the EC2 state while stopping a running resize target, retain strict final state/type reconciliation, and send the documented `InstanceType` modify field without the duplicate `Attribute` field that makes LocalStack clear the type.
+- Verification completed with `cargo fmt --all`, the focused pre-dispatch, four-scenario mock, and mutation lifecycle tests, and the complete LocalStack 4.14.0 smoke using `AWS_ENDPOINT_URL=http://127.0.0.1:4566`, `FOXTAIL_MUTATION_AMI_ID=ami-760aaa0f`, test credentials, and `us-east-1`. The run passed realization, all four fault/reset cycles, recreate, destroy, exact `terminated`/not-found EC2 cleanup checks, zero Foxtail Resource Groups Tagging mappings for retired ARNs, and every downstream CLI interoperability check.
+- [x] Full proof: complete live smoke passed with EC2 termination evidence and separate Foxtail public-inventory absence proof.
+
+## Issue #5 Standards Repair Results
+
+- [x] Require prior-generation EC2 termination evidence keyed by each exact target identity, with a truthful four-identity public-inventory absence count in the receipt schema; add negative coverage for missing proof, omitted targets, contradictory duplicate IDs, and contradictory counts.
+- [x] Make the LocalStack EC2 terminal check fail closed on transport, authentication, malformed JSON, wrong identity/state, and non-`InvalidInstanceID.NotFound` service errors; add backend coverage for running/stopped/error observations.
+- Deterministic verification completed with `cargo test -q` (72 unit, 2 API-contract, 19 mutation integration, 3 wrapper tests), `cargo clippy --all-targets --all-features -- -D warnings`, `cargo fmt --all -- --check`, `python3 scripts/validate_release_fixture.py --negative`, `bash -n scripts/verify_cli_interop.sh`, and `git diff --check`. Parent-verified fresh LocalStack 4.14.0 smoke using `AWS_ENDPOINT_URL=http://127.0.0.1:4566`, `FOXTAIL_MUTATION_AMI_ID=ami-760aaa0f`, test credentials, and `us-east-1` passed the tightened EC2 terminal/not-found parser, recreate/destroy lifecycle, zero retired Resource Groups Tagging mappings, and all downstream CLI checks.
+
+## Issue #5 Implementation Results
+
+- Added a migration-backed disposable mutation ledger with four generation-owned EC2 targets (stop, resize, stop-recovery, and resize-restoration), manifest/status/identity exposure, complete-estate fingerprinting, and canonical persisted operation receipts.
+- Added isolated-environment and existing admin-token gates for mutation status, fault, reset, recreate, and destroy; authority binds version, fixture generation, mutation generation/id, and exact manifest digest, with one-use reset tokens and fail-closed stale/duplicate/unknown-field handling.
+- Added CLI and HTTP lifecycle surfaces, recreation identity replacement, destruction cleanup with public-inventory absence proof, updated schemas/goldens/docs, focused lifecycle and parser tests, and smoke-script coverage. The smoke script keeps large AWS responses in temporary files to avoid shell argument-size limits.
+- Verification completed successfully with `cargo fmt --all -- --check`, `cargo test -q` (71 unit, 2 API-contract, 3 wrapper tests), `cargo clippy --all-targets --all-features -- -D warnings`, `python3 scripts/validate_release_fixture.py --definition tests/fixtures/release-qualification-v1.definition.json --manifest tests/fixtures/release-qualification-v1.manifest.json --negative`, `bash -n scripts/verify_cli_interop.sh`, `git diff --check`, and `bash scripts/verify_cli_interop.sh` (localhost access required and granted).
+
 # Cost Explorer USAGE_TYPE Grouping Work
 
 # Release Qualification Fixture v1

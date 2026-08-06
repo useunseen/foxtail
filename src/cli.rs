@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, ValueEnum, Serialize, Deserialize, PartialEq)]
@@ -106,4 +106,56 @@ pub enum FixtureCommands {
     Manifest,
     /// Print realized control identities and their manifest digest.
     Identities,
+    /// Print qualification-only mutation generation state.
+    MutationStatus,
+    /// Apply one one-use, manifest-bound EC2 fault.
+    Fault {
+        #[command(flatten)]
+        authority: FixtureMutationAuthorityArgs,
+        #[arg(long)]
+        control_id: String,
+        #[arg(long)]
+        target_id: String,
+        #[arg(long, default_value = "target")]
+        scope: String,
+        #[arg(long)]
+        fault_kind: String,
+        #[arg(long)]
+        application_time: Option<String>,
+    },
+    /// Reset one fault using its one-use reset token.
+    Reset {
+        #[command(flatten)]
+        authority: FixtureMutationAuthorityArgs,
+        #[arg(long)]
+        receipt_id: String,
+        #[arg(long)]
+        reset_token: String,
+    },
+    /// Atomically retire the current mutation generation and create a fresh one.
+    Recreate {
+        #[command(flatten)]
+        authority: FixtureMutationAuthorityArgs,
+        #[arg(long)]
+        clock_anchor: Option<String>,
+    },
+    /// Destroy the current mutation generation and prove public identity absence.
+    Destroy {
+        #[command(flatten)]
+        authority: FixtureMutationAuthorityArgs,
+    },
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct FixtureMutationAuthorityArgs {
+    #[arg(long, default_value = "release-qualification-v1")]
+    pub version: String,
+    #[arg(long)]
+    pub generation: i64,
+    #[arg(long)]
+    pub manifest_digest: String,
+    #[arg(long)]
+    pub mutation_generation: i64,
+    #[arg(long)]
+    pub mutation_generation_id: String,
 }

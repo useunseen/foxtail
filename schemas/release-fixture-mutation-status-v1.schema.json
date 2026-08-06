@@ -1,0 +1,205 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://useunseen.dev/foxtail/schemas/release-fixture-mutation-status-v1.schema.json",
+  "title": "Foxtail release qualification mutation status v1",
+  "type": "object",
+  "required": [
+    "schema",
+    "status",
+    "fixture_generation",
+    "mutation_generation",
+    "mutation_generation_id",
+    "manifest_digest",
+    "targets",
+    "active_faults"
+  ],
+  "properties": {
+    "schema": {"const": "foxtail.release-fixture-mutation-status/v1"},
+    "status": {"enum": ["ACTIVE", "ABSENT", "QUARANTINED"]},
+    "fixture_generation": {"type": ["integer", "null"], "minimum": 1},
+    "mutation_generation": {"type": ["integer", "null"], "minimum": 1},
+    "mutation_generation_id": {
+      "type": ["string", "null"],
+      "pattern": "^mg-[0-9]{4,}$"
+    },
+    "manifest_digest": {
+      "type": ["string", "null"],
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "targets": {
+      "type": "array",
+      "maxItems": 4,
+      "items": {"$ref": "#/$defs/target"}
+    },
+    "active_faults": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/active_fault"}
+    },
+    "resource_ids": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
+    "intents": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/intent"}
+    },
+    "quarantined_generations": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/quarantined_generation"}
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"const": "ACTIVE"}}},
+      "then": {
+        "properties": {
+          "fixture_generation": {"type": "integer", "minimum": 1},
+          "mutation_generation": {"type": "integer", "minimum": 1},
+          "mutation_generation_id": {"type": "string", "pattern": "^mg-[0-9]{4,}$"},
+          "manifest_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+        },
+        "minProperties": 8
+      }
+    },
+    {
+      "if": {"properties": {"status": {"const": "ABSENT"}}},
+      "then": {
+        "properties": {
+          "targets": {"maxItems": 0},
+          "active_faults": {"maxItems": 0}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"status": {"const": "QUARANTINED"}}},
+      "then": {
+        "required": ["resource_ids", "intents", "quarantined_generations"],
+        "properties": {
+          "targets": {"maxItems": 0},
+          "active_faults": {"maxItems": 0}
+        },
+        "anyOf": [
+          {"properties": {"quarantined_generations": {"minItems": 1}}},
+          {"properties": {"intents": {"minItems": 1}}}
+        ]
+      }
+    }
+  ],
+  "$defs": {
+    "target": {
+      "type": "object",
+      "required": [
+        "control_id",
+        "target_kind",
+        "setup_fault_kind",
+        "resource_id",
+        "aws_identity",
+        "instance_state",
+        "instance_type",
+        "initial_state",
+        "initial_type",
+        "terminal_state",
+        "terminal_type",
+        "restored_state",
+        "restored_type",
+        "external_status",
+        "external_identity_verified"
+      ],
+      "properties": {
+        "control_id": {"type": "string"},
+        "target_kind": {"enum": ["stop", "resize", "stop-recovery", "resize-restoration"]},
+        "setup_fault_kind": {"enum": ["stop", "resize"]},
+        "resource_id": {"type": "string", "minLength": 1},
+        "aws_identity": {"type": "string", "minLength": 1},
+        "instance_state": {"enum": ["running", "stopped"]},
+        "instance_type": {"type": "string", "minLength": 1},
+        "initial_state": {"enum": ["running", "stopped"]},
+        "initial_type": {"type": "string", "minLength": 1},
+        "terminal_state": {"enum": ["running", "stopped"]},
+        "terminal_type": {"type": "string", "minLength": 1},
+        "restored_state": {"enum": ["running", "stopped"]},
+        "restored_type": {"type": "string", "minLength": 1},
+        "external_status": {
+          "enum": ["PROVISIONED", "ACTIVE", "FAULTED", "RESTORED", "DESTROYED", "ABSENT", "FAILED", "AMBIGUOUS"]
+        },
+        "external_identity_verified": {"const": true}
+      },
+      "additionalProperties": false
+    },
+    "active_fault": {
+      "type": "object",
+      "required": [
+        "receipt_id",
+        "mutation_generation",
+        "generation_id",
+        "manifest_digest",
+        "control_id",
+        "target_id",
+        "scope",
+        "fault_kind",
+        "applied_at",
+        "prior_state",
+        "terminal_state",
+        "status",
+        "reset_token"
+      ],
+      "properties": {
+        "receipt_id": {"type": "string", "minLength": 8},
+        "mutation_generation": {"type": "integer", "minimum": 1},
+        "generation_id": {"type": "string", "pattern": "^mg-[0-9]{4,}$"},
+        "manifest_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "control_id": {"type": "string"},
+        "target_id": {"type": "string", "minLength": 1},
+        "scope": {"const": "target"},
+        "fault_kind": {"enum": ["stop", "resize"]},
+        "applied_at": {"type": "string", "format": "date-time"},
+        "prior_state": {"type": "string", "pattern": "^(running|stopped):[^:]+$"},
+        "terminal_state": {"type": "string", "pattern": "^(running|stopped):[^:]+$"},
+        "status": {"const": "ACTIVE"},
+        "reset_token": {"type": "string", "minLength": 8}
+      },
+      "additionalProperties": false
+    },
+    "intent": {
+      "type": "object",
+      "required": ["intent_id", "operation", "status", "created_at", "updated_at"],
+      "properties": {
+        "intent_id": {"type": "string", "minLength": 8},
+        "operation": {"enum": ["realize", "recreate", "fault", "reset", "destroy"]},
+        "mutation_generation": {"type": ["integer", "null"], "minimum": 1},
+        "generation_id": {"type": ["string", "null"], "pattern": "^mg-[0-9]{4,}$"},
+        "fixture_generation": {"type": ["integer", "null"], "minimum": 1},
+        "status": {"enum": ["INTENT", "DISPATCHED", "AMBIGUOUS"]},
+        "error": {"type": ["string", "null"]},
+        "created_at": {"type": "string", "format": "date-time"},
+        "updated_at": {"type": "string", "format": "date-time"}
+      },
+      "additionalProperties": false
+    },
+    "quarantined_generation": {
+      "type": "object",
+      "required": [
+        "mutation_generation", "generation_id", "fixture_generation", "manifest_digest",
+        "external_status", "resource_ids", "intents"
+      ],
+      "properties": {
+        "mutation_generation": {"type": "integer", "minimum": 1},
+        "generation_id": {"type": "string", "pattern": "^mg-[0-9]{4,}$"},
+        "fixture_generation": {"type": "integer", "minimum": 1},
+        "manifest_digest": {"type": "string"},
+        "external_status": {
+          "enum": ["UNKNOWN", "PROVISIONING", "PROVISIONED", "ACTIVE", "FAULTED", "RESTORED", "DESTROYED", "ABSENT", "FAILED", "AMBIGUOUS"]
+        },
+        "resource_ids": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        },
+        "intents": {"type": "array", "items": {"$ref": "#/$defs/intent"}}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

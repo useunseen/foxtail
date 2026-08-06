@@ -166,6 +166,28 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=root / "schemas/release-fixture-manifest-v1.schema.json",
     )
+    parser.add_argument(
+        "--mutation-status",
+        type=Path,
+        help="validate one emitted release-fixture mutation status document",
+    )
+    parser.add_argument(
+        "--mutation-status-schema",
+        type=Path,
+        default=root / "schemas/release-fixture-mutation-status-v1.schema.json",
+    )
+    parser.add_argument(
+        "--receipt",
+        action="append",
+        type=Path,
+        default=[],
+        help="validate one emitted operation receipt (repeatable)",
+    )
+    parser.add_argument(
+        "--receipt-schema",
+        type=Path,
+        default=root / "schemas/release-fixture-receipt-v1.schema.json",
+    )
     parser.add_argument("--negative", action="store_true", help="run forbidden-field rejection checks")
     return parser.parse_args()
 
@@ -181,12 +203,21 @@ def main() -> int:
         )
         return 2
 
-    definition = validate(args.definition_schema, args.definition or args.definition_golden)
-    manifest = validate(args.manifest_schema, args.manifest or args.manifest_golden)
-    if args.negative:
+    definition = manifest = None
+    if not args.mutation_status and not args.receipt:
+        definition = validate(args.definition_schema, args.definition or args.definition_golden)
+        manifest = validate(args.manifest_schema, args.manifest or args.manifest_golden)
+    elif args.definition or args.manifest:
+        definition = validate(args.definition_schema, args.definition or args.definition_golden)
+        manifest = validate(args.manifest_schema, args.manifest or args.manifest_golden)
+    if args.mutation_status:
+        validate(args.mutation_status_schema, args.mutation_status)
+    for receipt_path in args.receipt:
+        validate(args.receipt_schema, receipt_path)
+    if args.negative and definition is not None and manifest is not None:
         run_negative_checks(args.definition_schema, definition, args.manifest_schema, manifest)
     print(
-        "validated Draft 2020-12 release-fixture definition and manifest "
+        "validated Draft 2020-12 release-fixture documents "
         f"with jsonschema {installed_version}"
     )
     return 0

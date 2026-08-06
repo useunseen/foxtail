@@ -6,6 +6,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${BIN:-$ROOT_DIR/target/debug/foxtail}"
 SOURCE_DB="${MOCK_DATA_DB:-$ROOT_DIR/mock_data.db}"
 PORT="${AWS_MOCK_VERIFY_PORT:-18080}"
+LOCALSTACK_ENDPOINT="${AWS_ENDPOINT_URL:-http://127.0.0.1:4566}"
 TMP_DIR="$(mktemp -d)"
 TMP_DB="$TMP_DIR/mock_data.db"
 SERVER_LOG="$TMP_DIR/server.log"
@@ -43,6 +44,17 @@ if [[ ! -f "$SOURCE_DB" ]]; then
   exit 1
 fi
 
+if [[ -z "${FOXTAIL_MUTATION_AMI_ID:-}" ]]; then
+  echo "FOXTAIL_MUTATION_AMI_ID must name a valid disposable LocalStack AMI" >&2
+  exit 1
+fi
+export AWS_ENDPOINT_URL="$LOCALSTACK_ENDPOINT"
+if ! aws --output json --endpoint-url "$LOCALSTACK_ENDPOINT" ec2 describe-images \
+  --image-ids "$FOXTAIL_MUTATION_AMI_ID" >/dev/null 2>&1; then
+  echo "LocalStack EC2 endpoint is unavailable or FOXTAIL_MUTATION_AMI_ID is invalid: $LOCALSTACK_ENDPOINT" >&2
+  exit 1
+fi
+
 cd "$ROOT_DIR"
 log_step "Building debug binary"
 cargo build >/dev/null
@@ -67,6 +79,7 @@ if [[ "$FIXTURE_EC2_COUNT" -lt 5 ]]; then
   exit 1
 fi
 
+export FOXTAIL_QUALIFICATION_ENV=isolated
 log_step "Starting temporary mock server on http://127.0.0.1:$PORT"
 DATABASE_URL="sqlite:$TMP_DB" "$BIN" serve --port "$PORT" >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
@@ -113,6 +126,22 @@ aws_json() {
   aws --output json --endpoint-url "$ENDPOINT" "$@"
 }
 
+localstack_json() {
+  aws --output json --endpoint-url "$LOCALSTACK_ENDPOINT" "$@"
+}
+
+validate_mutation_document() {
+  local kind="$1"
+  local document="$2"
+  local path="$TMP_DIR/mutation-${kind}-$RANDOM.json"
+  printf '%s\n' "$document" >"$path"
+  if [[ "$kind" == "status" ]]; then
+    python3 "$ROOT_DIR/scripts/validate_release_fixture.py" --mutation-status "$path"
+  else
+    python3 "$ROOT_DIR/scripts/validate_release_fixture.py" --receipt "$path"
+  fi
+}
+
 python3 "$ROOT_DIR/scripts/validate_release_fixture.py" --negative
 
 FIXTURE_DEFINITION="$(curl -fsS "$ENDPOINT/_mock/fixture/definition?version=release-qualification-v1")"
@@ -143,17 +172,13 @@ PY
 log_step "Verified release fixture: definition and pre-realization status"
 
 FIXTURE_ANCHOR="2026-08-05T00:00:00Z"
-CLI_DB="$TMP_DIR/cli-fixture.db"
-sqlite3 "$TMP_DB" ".backup '$CLI_DB'" >/dev/null
 FIXTURE_REALIZATION="$(curl -fsS -X POST "$ENDPOINT/_mock/fixture/realize" \
   -H 'content-type: application/json' \
   -d "{\"version\":\"release-qualification-v1\",\"clock_anchor\":\"$FIXTURE_ANCHOR\"}")"
-CLI_REALIZATION="$("$BIN" --database-url "sqlite:$CLI_DB" fixture realize \
-  --clock-anchor "$FIXTURE_ANCHOR")"
-if [[ "$CLI_REALIZATION" != "$FIXTURE_REALIZATION" ]]; then
-  echo "fixture realization CLI/HTTP bytes differ" >&2
-  exit 1
-fi
+# Keep one database and one isolated generation for all subsequent reads.
+# Calling fixture realize again is intentionally rejected once this
+# authority-bound generation exists; CLI/HTTP parity is checked through the
+# supported persisted status/manifest/identity surfaces below.
 FIXTURE_REALIZATION="$FIXTURE_REALIZATION" python3 - <<'PY'
 import json
 import os
@@ -190,6 +215,8 @@ if degraded["evidence"].get("cloudwatch_complete_days") != 13:
 if len(degraded["evidence"].get("cloudwatch_missing_offsets", [])) != 1:
     raise SystemExit("degraded fixture control did not expose exactly one missing CPU offset")
 PY
+FIXTURE_REALIZATION_FILE="$TMP_DIR/fixture-realization.json"
+printf '%s\n' "$FIXTURE_REALIZATION" >"$FIXTURE_REALIZATION_FILE"
 log_step "Verified release fixture: realization manifest, digest, identities, and observed evidence"
 FIXTURE_STATUS_REALIZED="$(curl -fsS "$ENDPOINT/_mock/fixture/status")"
 FIXTURE_MANIFEST="$(curl -fsS "$ENDPOINT/_mock/fixture/manifest")"
@@ -211,6 +238,244 @@ python3 "$ROOT_DIR/scripts/validate_release_fixture.py" \
   --manifest "$TMP_DIR/fixture-manifest.json" \
   --negative
 log_step "Verified release fixture: persisted CLI/HTTP parity and executable Draft 2020-12 schema policy"
+
+MUTATION_STATUS="$(curl -fsS "$ENDPOINT/_mock/fixture/mutation/status")"
+validate_mutation_document status "$MUTATION_STATUS"
+CLI_MUTATION_STATUS="$("$BIN" --database-url "sqlite:$TMP_DB" fixture mutation-status)"
+if [[ "$CLI_MUTATION_STATUS" != "$MUTATION_STATUS" ]]; then
+  echo "mutation status CLI/HTTP bytes differ" >&2
+  exit 1
+fi
+AUTHORITY="$(FIXTURE_REALIZATION="$FIXTURE_REALIZATION" python3 -c '
+import json, os
+m = json.loads(os.environ["FIXTURE_REALIZATION"])["manifest"]
+print(json.dumps({
+  "version": "release-qualification-v1",
+  "generation": m["generation"],
+  "manifest_digest": m["digest"],
+  "mutation_generation": m["mutation_generation"],
+  "mutation_generation_id": m["mutation_generation_id"],
+}))
+')"
+AUTH_VERSION="$(echo "$AUTHORITY" | jq -r .version)"
+AUTH_GENERATION="$(echo "$AUTHORITY" | jq -r .generation)"
+AUTH_MANIFEST_DIGEST="$(echo "$AUTHORITY" | jq -r .manifest_digest)"
+AUTH_MUTATION_GENERATION="$(echo "$AUTHORITY" | jq -r .mutation_generation)"
+AUTH_MUTATION_GENERATION_ID="$(echo "$AUTHORITY" | jq -r .mutation_generation_id)"
+MUTATION_TARGET_ROWS="$(FIXTURE_REALIZATION="$FIXTURE_REALIZATION" python3 - <<'PY'
+import json
+import os
+
+manifest = json.loads(os.environ["FIXTURE_REALIZATION"])["manifest"]
+for target in manifest["mutation_resources"]:
+    print("\t".join((
+        target["resource_id"],
+        target["target_kind"],
+        target["setup_fault_kind"],
+        target["control_id"],
+        target["initial_state"],
+        target["initial_type"],
+        target["terminal_state"],
+        target["terminal_type"],
+    )))
+PY
+)"
+while IFS=$'\t' read -r mutation_id target_kind setup_fault_kind control_id expected_state expected_type terminal_state terminal_type; do
+  [[ -z "$mutation_id" ]] && continue
+  PUBLIC_INSTANCE="$(localstack_json ec2 describe-instances --instance-ids "$mutation_id")"
+  PUBLIC_INSTANCE="$PUBLIC_INSTANCE" MUTATION_ID="$mutation_id" EXPECTED_STATE="$expected_state" EXPECTED_TYPE="$expected_type" python3 - <<'PY'
+import json
+import os
+
+data = json.loads(os.environ["PUBLIC_INSTANCE"])
+reservations = data.get("Reservations", [])
+instances = [instance for reservation in reservations for instance in reservation.get("Instances", [])]
+if len(instances) != 1 or instances[0].get("InstanceId") != os.environ["MUTATION_ID"]:
+    raise SystemExit(f"public EC2 did not return exact mutation identity {os.environ['MUTATION_ID']}")
+instance = instances[0]
+state = instance.get("State", {}).get("Name")
+instance_type = instance.get("InstanceType")
+if state != os.environ["EXPECTED_STATE"] or instance_type != os.environ["EXPECTED_TYPE"]:
+    raise SystemExit(f"unexpected initial public state/type for {os.environ['MUTATION_ID']}: {state}:{instance_type}")
+PY
+done <<<"$MUTATION_TARGET_ROWS"
+OLD_MUTATION_ARNS="$(FIXTURE_REALIZATION="$FIXTURE_REALIZATION" python3 - <<'PY'
+import json
+import os
+
+for target in json.loads(os.environ["FIXTURE_REALIZATION"])["manifest"]["mutation_resources"]:
+    print(target["aws_identity"])
+PY
+)"
+SCENARIO_INDEX=0
+while IFS=$'\t' read -r mutation_id target_kind setup_fault_kind control_id expected_state expected_type terminal_state terminal_type; do
+  [[ -z "$mutation_id" ]] && continue
+  SCENARIO_INDEX=$((SCENARIO_INDEX + 1))
+  FAULT_REQUEST="$(AUTHORITY="$AUTHORITY" CONTROL_ID="$control_id" TARGET_ID="$mutation_id" FAULT_KIND="$setup_fault_kind" python3 -c '
+import json, os
+value = json.loads(os.environ["AUTHORITY"])
+value.update(control_id=os.environ["CONTROL_ID"], target_id=os.environ["TARGET_ID"], scope="target", fault_kind=os.environ["FAULT_KIND"], application_time="2026-08-05T00:00:00Z")
+print(json.dumps(value))
+')"
+  if [[ "$SCENARIO_INDEX" == "1" || "$SCENARIO_INDEX" == "3" ]]; then
+    FAULT_RECEIPT="$("$BIN" --database-url "sqlite:$TMP_DB" fixture fault \
+      --version "$AUTH_VERSION" --generation "$AUTH_GENERATION" \
+      --manifest-digest "$AUTH_MANIFEST_DIGEST" \
+      --mutation-generation "$AUTH_MUTATION_GENERATION" \
+      --mutation-generation-id "$AUTH_MUTATION_GENERATION_ID" \
+      --control-id "$control_id" --target-id "$mutation_id" --scope target \
+      --fault-kind "$setup_fault_kind" --application-time "2026-08-05T00:00:00Z")"
+    RESET_CHANNEL="http"
+  else
+    FAULT_RECEIPT="$(curl -fsS -X POST "$ENDPOINT/_mock/fixture/fault" \
+      -H 'content-type: application/json' -d "$FAULT_REQUEST")"
+    RESET_CHANNEL="cli"
+  fi
+  if [[ "$(echo "$FAULT_RECEIPT" | jq -r .status)" != "APPLIED" ]]; then
+    echo "fixture fault did not report APPLIED for $target_kind" >&2
+    exit 1
+  fi
+  validate_mutation_document receipt "$FAULT_RECEIPT"
+  FAULT_PUBLIC="$(localstack_json ec2 describe-instances --instance-ids "$mutation_id")"
+  FAULT_PUBLIC="$FAULT_PUBLIC" MUTATION_ID="$mutation_id" EXPECTED_STATE="$terminal_state" EXPECTED_TYPE="$terminal_type" python3 - <<'PY'
+import json
+import os
+instances = [instance for reservation in json.loads(os.environ["FAULT_PUBLIC"]).get("Reservations", []) for instance in reservation.get("Instances", [])]
+if len(instances) != 1 or instances[0].get("InstanceId") != os.environ["MUTATION_ID"]:
+    raise SystemExit("public EC2 fault identity mismatch")
+if instances[0].get("State", {}).get("Name") != os.environ["EXPECTED_STATE"] or instances[0].get("InstanceType") != os.environ["EXPECTED_TYPE"]:
+    raise SystemExit("public EC2 did not show the expected fault state/type")
+PY
+  RESET_REQUEST="$(FAULT_RECEIPT="$FAULT_RECEIPT" AUTHORITY="$AUTHORITY" python3 -c '
+import json, os
+a = json.loads(os.environ["AUTHORITY"])
+r = json.loads(os.environ["FAULT_RECEIPT"])
+a.update(receipt_id=r["receipt_id"], reset_token=r["reset_token"])
+print(json.dumps(a))
+')"
+  if [[ "$RESET_CHANNEL" == "http" ]]; then
+    RESET_RECEIPT="$(curl -fsS -X POST "$ENDPOINT/_mock/fixture/reset" \
+      -H 'content-type: application/json' -d "$RESET_REQUEST")"
+  else
+    RESET_RECEIPT="$("$BIN" --database-url "sqlite:$TMP_DB" fixture reset \
+      --version "$AUTH_VERSION" --generation "$AUTH_GENERATION" \
+      --manifest-digest "$AUTH_MANIFEST_DIGEST" \
+      --mutation-generation "$AUTH_MUTATION_GENERATION" \
+      --mutation-generation-id "$AUTH_MUTATION_GENERATION_ID" \
+      --receipt-id "$(echo "$FAULT_RECEIPT" | jq -r .receipt_id)" \
+      --reset-token "$(echo "$FAULT_RECEIPT" | jq -r .reset_token)")"
+  fi
+  if [[ "$(echo "$RESET_RECEIPT" | jq -r .status)" != "RESET" ]]; then
+    echo "fixture reset receipt did not report RESET for $target_kind" >&2
+    exit 1
+  fi
+  validate_mutation_document receipt "$RESET_RECEIPT"
+  RESET_PUBLIC="$(localstack_json ec2 describe-instances --instance-ids "$mutation_id")"
+  RESET_PUBLIC="$RESET_PUBLIC" MUTATION_ID="$mutation_id" EXPECTED_STATE="$expected_state" EXPECTED_TYPE="$expected_type" python3 - <<'PY'
+import json
+import os
+instances = [instance for reservation in json.loads(os.environ["RESET_PUBLIC"]).get("Reservations", []) for instance in reservation.get("Instances", [])]
+if len(instances) != 1 or instances[0].get("InstanceId") != os.environ["MUTATION_ID"]:
+    raise SystemExit("public EC2 reset identity mismatch")
+if instances[0].get("State", {}).get("Name") != os.environ["EXPECTED_STATE"] or instances[0].get("InstanceType") != os.environ["EXPECTED_TYPE"]:
+    raise SystemExit("public EC2 did not show the expected restored state/type")
+PY
+done <<<"$MUTATION_TARGET_ROWS"
+if "$BIN" --database-url "sqlite:$TMP_DB" fixture fault \
+  --version "$AUTH_VERSION" --generation "$((AUTH_GENERATION + 1))" \
+  --manifest-digest "$AUTH_MANIFEST_DIGEST" \
+  --mutation-generation "$AUTH_MUTATION_GENERATION" \
+  --mutation-generation-id "$AUTH_MUTATION_GENERATION_ID" \
+  --control-id "ec2-mutation-stop-001" \
+  --target-id "i-do-not-have-authority" --scope target --fault-kind stop >/dev/null 2>&1; then
+  echo "stale CLI authority unexpectedly succeeded" >&2
+  exit 1
+fi
+RECREATE_RECEIPT="$("$BIN" --database-url "sqlite:$TMP_DB" fixture recreate \
+  --version "$AUTH_VERSION" --generation "$AUTH_GENERATION" \
+  --manifest-digest "$AUTH_MANIFEST_DIGEST" \
+  --mutation-generation "$AUTH_MUTATION_GENERATION" \
+  --mutation-generation-id "$AUTH_MUTATION_GENERATION_ID")"
+if [[ "$(echo "$RECREATE_RECEIPT" | jq -r .status)" != "RECREATED" ]]; then
+  echo "fixture recreate receipt did not report RECREATED" >&2
+  exit 1
+fi
+validate_mutation_document receipt "$RECREATE_RECEIPT"
+NEW_AUTHORITY="$(curl -fsS "$ENDPOINT/_mock/fixture/manifest" | jq -c '{version:"release-qualification-v1", generation, manifest_digest:.digest, mutation_generation, mutation_generation_id}')"
+NEW_MUTATION_ARNS="$(curl -fsS "$ENDPOINT/_mock/fixture/manifest" | python3 -c '
+import json, sys
+for target in json.load(sys.stdin)["mutation_resources"]:
+    print(target["aws_identity"])
+')"
+DESTROY_RECEIPT="$("$BIN" --database-url "sqlite:$TMP_DB" fixture destroy \
+  --version "$(echo "$NEW_AUTHORITY" | jq -r .version)" \
+  --generation "$(echo "$NEW_AUTHORITY" | jq -r .generation)" \
+  --manifest-digest "$(echo "$NEW_AUTHORITY" | jq -r .manifest_digest)" \
+  --mutation-generation "$(echo "$NEW_AUTHORITY" | jq -r .mutation_generation)" \
+  --mutation-generation-id "$(echo "$NEW_AUTHORITY" | jq -r .mutation_generation_id)")"
+if [[ "$(echo "$DESTROY_RECEIPT" | jq -r '.public_inventory_absence.all_absent')" != "true" ]]; then
+  echo "fixture destroy did not prove public identity absence" >&2
+  exit 1
+fi
+validate_mutation_document receipt "$DESTROY_RECEIPT"
+while IFS= read -r old_arn; do
+  [[ -z "$old_arn" ]] && continue
+  if [[ "$(aws_json resourcegroupstaggingapi get-resources --resource-arn-list "$old_arn" | jq '.ResourceTagMappingList | length')" != "0" ]]; then
+    echo "destroyed mutation identity remains visible in Foxtail public inventory: $old_arn" >&2
+    exit 1
+  fi
+  old_id="${old_arn##*/}"
+  old_public_file="$TMP_DIR/old-ec2-$old_id.json"
+  old_error_file="$TMP_DIR/old-ec2-$old_id.err"
+  set +e
+  localstack_json ec2 describe-instances --instance-ids "$old_id" >"$old_public_file" 2>"$old_error_file"
+  old_describe_status=$?
+  set -e
+  if [[ "$old_describe_status" -eq 0 ]]; then
+    if ! OLD_ID="$old_id" python3 - "$old_public_file" <<'PY'
+import json
+import os
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    payload = json.load(handle)
+instances = [
+    instance
+    for reservation in payload.get("Reservations", [])
+    for instance in reservation.get("Instances", [])
+]
+if len(instances) != 1 or instances[0].get("InstanceId") != os.environ["OLD_ID"]:
+    raise SystemExit("successful EC2 DescribeInstances response did not contain exactly the requested identity")
+if instances[0].get("State", {}).get("Name") != "terminated":
+    raise SystemExit("successful EC2 DescribeInstances response did not prove terminated state")
+PY
+    then
+      echo "destroyed mutation identity was not terminal in LocalStack EC2: $old_id" >&2
+      exit 1
+    fi
+  else
+    if [[ -s "$old_public_file" ]] || ! python3 - "$old_error_file" <<'PY'
+import re
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    error = handle.read()
+if not re.search(
+    r"An error occurred \(InvalidInstanceID\.NotFound\) when calling the DescribeInstances operation:",
+    error,
+):
+    raise SystemExit("EC2 DescribeInstances failed without the explicit InvalidInstanceID.NotFound service error")
+PY
+    then
+      echo "LocalStack EC2 absence check failed for $old_id" >&2
+      cat "$old_error_file" >&2
+      exit 1
+    fi
+  fi
+done <<<"$OLD_MUTATION_ARNS
+$NEW_MUTATION_ARNS"
+log_step "Verified qualification mutation lifecycle: status, fault, reset, recreate, destroy, EC2 terminal cleanup, and public inventory absence"
+
 FIXTURE_IDS="$(FIXTURE_REALIZATION="$FIXTURE_REALIZATION" python3 - <<'PY'
 import json
 import os
@@ -308,14 +573,19 @@ FIXTURE_COSTS="$(aws_json ce get-cost-and-usage \
   --granularity DAILY \
   --metrics UnblendedCost \
   --group-by Type=DIMENSION,Key=RESOURCE_ID)"
-FIXTURE_COSTS="$FIXTURE_COSTS" FIXTURE_REALIZATION="$FIXTURE_REALIZATION" python3 - <<'PY'
+FIXTURE_COSTS_FILE="$TMP_DIR/fixture-costs.json"
+printf '%s\n' "$FIXTURE_COSTS" >"$FIXTURE_COSTS_FILE"
+python3 - "$FIXTURE_COSTS_FILE" "$FIXTURE_REALIZATION_FILE" <<'PY'
 import json
-import os
+import sys
 
-manifest = json.loads(os.environ["FIXTURE_REALIZATION"])["manifest"]
+with open(sys.argv[2], encoding="utf-8") as handle:
+    manifest = json.load(handle)["manifest"]
 ids = {resource["resource_id"] for resource in manifest["resources"]}
 observed = {resource_id: 0.0 for resource_id in ids}
-for bucket in json.loads(os.environ["FIXTURE_COSTS"]).get("ResultsByTime", []):
+with open(sys.argv[1], encoding="utf-8") as handle:
+    costs = json.load(handle)
+for bucket in costs.get("ResultsByTime", []):
     for group in bucket.get("Groups", []):
         keys = group.get("Keys", [])
         if len(keys) != 1 or keys[0] not in observed:
@@ -328,11 +598,14 @@ PY
 log_step "Verified release fixture: identity-matched Cost Explorer resource groups"
 
 FIXTURE_RECOMMENDATIONS="$(aws_json compute-optimizer get-ec2-instance-recommendations)"
-FIXTURE_RECOMMENDATIONS="$FIXTURE_RECOMMENDATIONS" FIXTURE_REALIZATION="$FIXTURE_REALIZATION" python3 - <<'PY'
+FIXTURE_RECOMMENDATIONS_FILE="$TMP_DIR/fixture-recommendations.json"
+printf '%s\n' "$FIXTURE_RECOMMENDATIONS" >"$FIXTURE_RECOMMENDATIONS_FILE"
+python3 - "$FIXTURE_RECOMMENDATIONS_FILE" "$FIXTURE_REALIZATION_FILE" <<'PY'
 import json
-import os
+import sys
 
-manifest = json.loads(os.environ["FIXTURE_REALIZATION"])["manifest"]
+with open(sys.argv[2], encoding="utf-8") as handle:
+    manifest = json.load(handle)["manifest"]
 expected = {
     resource["resource_id"]: (
         "OVER_PROVISIONED"
@@ -347,10 +620,10 @@ expected = {
     )
     for resource in manifest["resources"]
 }
+with open(sys.argv[1], encoding="utf-8") as handle:
+    recommendations_payload = json.load(handle)
 recommendations = {}
-for recommendation in json.loads(os.environ["FIXTURE_RECOMMENDATIONS"]).get(
-    "instanceRecommendations", []
-):
+for recommendation in recommendations_payload.get("instanceRecommendations", []):
     arn = recommendation.get("instanceArn", "")
     resource_id = arn.rsplit("/", 1)[-1]
     if resource_id in expected:

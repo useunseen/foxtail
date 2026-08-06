@@ -131,6 +131,11 @@ These are for local debugging and control, not AWS parity:
 - `GET /_mock/fixture/status`
 - `GET /_mock/fixture/manifest`
 - `GET /_mock/fixture/identities`
+- `GET /_mock/fixture/mutation/status`
+- `POST /_mock/fixture/fault`
+- `POST /_mock/fixture/reset`
+- `POST /_mock/fixture/recreate`
+- `POST /_mock/fixture/destroy`
 - `GET /_mock/dashboard/data`
 - `GET /_mock/dashboard/resources`
 - `GET /_mock/dashboard/trends/cloudwatch`
@@ -164,12 +169,58 @@ curl -X POST http://127.0.0.1:8080/_mock/fixture/realize \
 ~~~~
 
 The manifest binds the definition digest, generator and LocalStack provenance,
-clock anchor, AWS account/region scope, realized identities, public evidence
-declarations, and the two deferred mutation controls. The ordinary AWS-compatible
-inventory, CloudWatch, Cost Explorer, and Compute Optimizer routes remain the
-authoritative evidence surfaces. The default public account scope is
-`123456789012`; an explicit fixture `account_id` must match it so manifest ARNs
-and public identities cannot diverge.
+clock anchor, AWS account/region scope, realized read-only identities, and (in
+isolated mode only) four fresh generation-owned EC2 identities: `stop`,
+`resize`, `stop-recovery`, and `resize-restoration`. The ordinary
+AWS-compatible inventory, CloudWatch, Cost Explorer, and Compute Optimizer
+routes remain the authoritative evidence surfaces. The default public account
+scope is `123456789012`; an explicit fixture `account_id` must match it so
+manifest ARNs and public identities cannot diverge.
+
+Without the exact `FOXTAIL_QUALIFICATION_ENV=isolated` value, `fixture realize`
+keeps those mutation controls declared-only and does not call EC2 or write a
+mutation generation. In isolated mode, Foxtail uses the `AWS_ENDPOINT_URL` (or
+the request's `endpoint_url`) to call EC2 `RunInstances`, `StopInstances`,
+`ModifyInstanceAttribute`, `StartInstances`, `DescribeInstances`, and
+`TerminateInstances`. Set `FOXTAIL_MUTATION_AMI_ID` (and, when required by the
+endpoint, `FOXTAIL_MUTATION_SUBNET_ID` and `FOXTAIL_MUTATION_SECURITY_GROUP_ID`)
+to values valid for that LocalStack account. A generation is not considered
+complete until its returned public IDs, states, and instance types reconcile.
+
+Mutation controls are qualification-only. Set `FOXTAIL_QUALIFICATION_ENV=isolated`
+in the disposable process, and send `x-mock-admin-token` when
+`AWS_MOCK_ADMIN_TOKEN` is configured. Every mutation request must repeat the
+current generation, mutation-generation id, and exact manifest digest. Fault
+receipts return one-use reset tokens; stale, duplicate, malformed, or
+ambiguous requests fail without changing state. The `destroy` receipt proves
+all generation-owned identities are absent from public Resource Groups
+inventory and all active faults have been reset. Recreate and destroy receipts
+encode `external_ec2_termination` as an identity-keyed object: each exact EC2
+target ID appears once with a `terminated` or service-level `not-found` value.
+
+Example authority-bound lifecycle (values come from `fixture manifest`):
+
+```bash
+export FOXTAIL_QUALIFICATION_ENV=isolated
+target/debug/foxtail fixture mutation-status
+target/debug/foxtail fixture fault \
+  --generation 1 \
+  --manifest-digest sha256:... \
+  --mutation-generation 1 \
+  --mutation-generation-id mg-0001 \
+  --control-id ec2-mutation-stop-001 \
+  --target-id i-foxtail-mutation-g0001-stop \
+  --scope target --fault-kind stop
+```
+
+The target ID in a live generation is the ID returned by EC2 and copied from
+the current manifest; the example ID is only the deterministic `mock://` test
+backend form. After `fault` or `reset`, verify the state/type with public EC2
+`DescribeInstances`; after `destroy`, verify every retired ID is either
+service-level not-found or exactly `terminated` in EC2, and is absent from
+Resource Groups Tagging. AWS may retain terminated instances in
+`DescribeInstances` for approximately one hour; see the official
+[TerminateInstances documentation](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_TerminateInstances.html).
 
 ## Supported AWS-Compatible Commands
 

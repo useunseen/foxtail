@@ -1,0 +1,161 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://useunseen.dev/foxtail/schemas/release-fixture-receipt-v1.schema.json",
+  "title": "Foxtail release qualification mutation receipts v1",
+  "type": "object",
+  "required": ["schema", "operation", "status", "receipt_id"],
+  "properties": {
+    "schema": {"type": "string"},
+    "operation": {"type": "string"},
+    "status": {"type": "string"},
+    "receipt_id": {"type": "string", "minLength": 8},
+    "generation": {"type": "integer", "minimum": 1},
+    "manifest_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "mutation_generation": {"type": "integer", "minimum": 1},
+    "mutation_generation_id": {"type": "string", "pattern": "^mg-[0-9]{4,}$"},
+    "control_id": {"type": "string"},
+    "target_id": {"type": "string", "minLength": 1},
+    "scope": {"const": "target"},
+    "fault_kind": {"enum": ["stop", "resize"]},
+    "applied_at": {"type": "string", "format": "date-time"},
+    "reset_token": {"type": "string", "minLength": 8},
+    "reset_token_use": {"const": "one-use"},
+    "fault_receipt_id": {"type": "string", "minLength": 8},
+    "reset_token_consumed": {"const": true},
+    "reset_at": {"type": "string", "format": "date-time"},
+    "prior_state": {"type": "string", "pattern": "^(running|stopped):[^:]+$"},
+    "terminal_state": {"type": "string", "pattern": "^(running|stopped):[^:]+$"},
+    "created_at": {"type": "string", "format": "date-time"},
+    "identities_replaced": {"const": true},
+    "prior": {"$ref": "#/$defs/retired_generation"},
+    "terminal": {"$ref": "#/$defs/generation"},
+    "faults_reset": {"type": "array", "items": {"$ref": "#/$defs/reset_receipt"}},
+    "targets_destroyed": {"type": "array", "items": {"$ref": "#/$defs/destroyed_target"}},
+    "external_ec2_termination": {"$ref": "#/$defs/external_termination_evidence"},
+    "public_inventory_absence": {"$ref": "#/$defs/public_absence"},
+    "destroyed_at": {"type": "string", "format": "date-time"}
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "schema": {"const": "foxtail.release-fixture-fault-receipt/v1"},
+        "operation": {"const": "fault"},
+        "status": {"const": "APPLIED"}
+      },
+      "required": [
+        "generation", "manifest_digest", "mutation_generation", "mutation_generation_id",
+        "control_id", "target_id", "scope", "fault_kind", "applied_at",
+        "prior_state", "terminal_state", "reset_token", "reset_token_use"
+      ]
+    },
+    {
+      "properties": {
+        "schema": {"const": "foxtail.release-fixture-reset-receipt/v1"},
+        "operation": {"const": "reset"},
+        "status": {"const": "RESET"}
+      },
+      "required": [
+        "fault_receipt_id", "generation", "manifest_digest", "mutation_generation",
+        "mutation_generation_id", "control_id", "target_id", "scope", "fault_kind",
+        "prior_state", "terminal_state", "reset_at", "reset_token_consumed"
+      ]
+    },
+    {
+      "properties": {
+        "schema": {"const": "foxtail.release-fixture-recreate-receipt/v1"},
+        "operation": {"const": "recreate"},
+        "status": {"const": "RECREATED"},
+        "identities_replaced": {"const": true}
+      },
+      "required": ["prior", "terminal", "created_at", "identities_replaced"]
+    },
+    {
+      "properties": {
+        "schema": {"const": "foxtail.release-fixture-destroy-receipt/v1"},
+        "operation": {"const": "destroy"},
+        "status": {"const": "DESTROYED"}
+      },
+      "required": ["faults_reset", "targets_destroyed", "external_ec2_termination", "public_inventory_absence", "destroyed_at"]
+    }
+  ],
+  "$defs": {
+    "generation": {
+      "type": "object",
+      "required": ["manifest_digest", "mutation_generation", "mutation_generation_id", "targets"],
+      "properties": {
+        "manifest_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "mutation_generation": {"type": "integer", "minimum": 1},
+        "mutation_generation_id": {"type": "string", "pattern": "^mg-[0-9]{4,}$"},
+        "targets": {"type": "array", "minItems": 4, "maxItems": 4}
+      },
+      "additionalProperties": true
+    },
+    "retired_generation": {
+      "type": "object",
+      "required": ["manifest_digest", "mutation_generation", "mutation_generation_id", "targets", "external_ec2_termination"],
+      "properties": {
+        "manifest_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "mutation_generation": {"type": "integer", "minimum": 1},
+        "mutation_generation_id": {"type": "string", "pattern": "^mg-[0-9]{4,}$"},
+        "targets": {"type": "array", "minItems": 4, "maxItems": 4},
+        "external_ec2_termination": {"$ref": "#/$defs/external_termination_evidence"}
+      },
+      "additionalProperties": true
+    },
+    "reset_receipt": {
+      "type": "object",
+      "required": [
+        "schema", "operation", "status", "receipt_id", "fault_receipt_id",
+        "target_id", "control_id", "scope", "fault_kind", "prior_state",
+        "terminal_state", "reset_at", "reset_token_consumed"
+      ],
+      "properties": {
+        "schema": {"const": "foxtail.release-fixture-reset-receipt/v1"},
+        "operation": {"const": "reset"},
+        "status": {"const": "RESET"},
+        "receipt_id": {"type": "string", "minLength": 8},
+        "fault_receipt_id": {"type": "string", "minLength": 8},
+        "target_id": {"type": "string"},
+        "control_id": {"type": "string"},
+        "scope": {"const": "target"},
+        "fault_kind": {"enum": ["stop", "resize"]},
+        "prior_state": {"type": "string", "pattern": "^(running|stopped):[^:]+$"},
+        "terminal_state": {"type": "string", "pattern": "^(running|stopped):[^:]+$"},
+        "reset_at": {"type": "string", "format": "date-time"},
+        "reset_token_consumed": {"const": true}
+      },
+      "additionalProperties": true
+    },
+    "destroyed_target": {
+      "type": "object",
+      "required": ["resource_id", "control_id", "target_kind", "prior_state", "terminal_state"],
+      "properties": {
+        "resource_id": {"type": "string"},
+        "control_id": {"type": "string"},
+        "target_kind": {"enum": ["stop", "resize", "stop-recovery", "resize-restoration"]},
+        "prior_state": {"type": "string", "pattern": "^(running|stopped):[^:]+$"},
+        "terminal_state": {"type": "string", "pattern": "^(running|stopped):[^:]+$"}
+      },
+      "additionalProperties": false
+    },
+    "external_termination_evidence": {
+      "type": "object",
+      "minProperties": 4,
+      "maxProperties": 4,
+      "propertyNames": {"type": "string", "minLength": 1},
+      "additionalProperties": {"enum": ["terminated", "not-found"]}
+    },
+    "public_absence": {
+      "type": "object",
+      "required": ["checked", "all_absent", "absent_count", "resource_ids"],
+      "properties": {
+        "checked": {"const": true},
+        "all_absent": {"const": true},
+        "absent_count": {"const": 4},
+        "resource_ids": {"type": "array", "minItems": 4, "maxItems": 4, "uniqueItems": true}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
