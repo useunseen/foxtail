@@ -61,6 +61,39 @@ fn routes_cost_explorer_commands_to_aws_with_endpoint() {
 }
 
 #[test]
+fn routes_ec2_describe_instances_to_aws_with_endpoint() {
+    let temp_dir = unique_temp_dir("route-ec2");
+    let aws_log = temp_dir.join("aws.log");
+    let awslocal_log = temp_dir.join("awslocal.log");
+    let aws_bin = temp_dir.join("aws");
+    let awslocal_bin = temp_dir.join("awslocal");
+
+    write_stub(&aws_bin, &aws_log, 0);
+    write_stub(&awslocal_bin, &awslocal_log, 0);
+
+    let status = Command::new(env!("CARGO_BIN_EXE_foxtail"))
+        .arg("--aws-bin")
+        .arg(&aws_bin)
+        .arg("--awslocal-bin")
+        .arg(&awslocal_bin)
+        .arg("ec2")
+        .arg("describe-instances")
+        .status()
+        .unwrap();
+
+    assert!(status.success());
+    assert!(aws_log.exists());
+    assert!(!awslocal_log.exists());
+    let log = fs::read_to_string(aws_log).unwrap();
+    assert!(log.contains("--endpoint-url"));
+    assert!(log.contains("http://127.0.0.1:8080"));
+    assert!(log.contains("ec2"));
+    assert!(log.contains("describe-instances"));
+
+    fs::remove_dir_all(temp_dir).unwrap();
+}
+
+#[test]
 fn routes_passthrough_commands_to_awslocal() {
     let temp_dir = unique_temp_dir("route-awslocal");
     let aws_log = temp_dir.join("aws.log");

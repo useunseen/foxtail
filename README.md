@@ -224,6 +224,18 @@ Resource Groups Tagging. AWS may retain terminated instances in
 
 ## Supported AWS-Compatible Commands
 
+### EC2 fixture observation
+
+- `ec2 describe-instances`
+
+The wrapper routes this read-only Query/XML operation to Foxtail. After the
+release-qualification fixture is realized, the response contains exactly the
+five manifest read-only controls, including their stable state, instance type,
+availability zone, and manifest-bound tags. The four disposable mutation
+targets are never exposed on this observation surface. Keep this Foxtail
+observation endpoint separate from the dedicated mutation LocalStack endpoint
+(for example, Foxtail on `127.0.0.1:8080` and mutation LocalStack on `:4666`).
+
 ### Cost Explorer
 
 - `ce get-cost-and-usage`

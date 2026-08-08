@@ -560,3 +560,181 @@ Invariant: qualification mutations can affect only fresh, manifest-bound, one-us
 - [x] Move generic AWS JSON/XML error body serialization into `src/handlers/aws.rs`.
 - [x] Clarify the handler ownership standard so reusable/extracted response builders live in `src/handlers/` while established endpoint orchestration can remain in `serve.rs`.
 - [x] Count distinct operation names, not protocol inventory entries, in dashboard service scorecards.
+
+# Issue #8: Foxtail fixture observation and account-bound readiness
+
+Pinned base: `844e4cb764e8b165a8d25296642182d5de6fb1bf`
+
+Invariant: the five deterministic read-only fixture controls are exposed only
+through Foxtail's AWS-compatible EC2 observation surface; four disposable
+mutation targets are created only in a fresh separate LocalStack account bound
+to the manifest; STS identity and scope contradictions fail closed before any
+external mutation or durable partial state.
+
+## Acceptance Map
+
+- [x] AC1-3: add EC2 Query/XML `DescribeInstances` parsing/response shaping
+  with exactly the five manifest read-only rows and independent dispatch from
+  CloudWatch Query; preserve JSON and existing CloudWatch behavior.
+- [x] AC4: route wrapper `ec2 describe-instances` through `aws` with the
+  Foxtail endpoint while preserving passthrough routing for unrelated commands
+  and updating help text/tests.
+- [x] AC5-6: bind mutation credentials to the manifest account, verify STS
+  `GetCallerIdentity.Account` against that account before the first write, and
+  make mock/transport/malformed/mismatch failures leave no partial mutation
+  state.
+- [x] AC7-8: prove account `123456789012` owns exactly four manifest mutation
+  IDs, default `test` owns none, and fresh mutation LocalStack state is empty
+  while the five read-only rows remain only on Foxtail's separate surface.
+- [x] AC9-10: preserve Unseen checkout read-only; run reuse/readiness/recreate
+  proof if feasible, otherwise record the pinned-source blocker; independently
+  prove generation and all four target IDs rotate with readiness afterward.
+- [x] AC11: add focused negative coverage for dispatch, account identity, and
+  pre-mutation failures; preserve fail-closed behavior for wrong, missing,
+  extra, stale, or contradictory observations.
+
+## Execution Plan
+
+- [x] Create `peter/issue-8-fixture-readiness` from the pinned base and map the
+  acceptance criteria to `serve.rs`, `wrapper.rs`, `mutation.rs`, and fixture
+  orchestration.
+- [x] Implement the EC2 Query/XML observation route and exact manifest-driven
+  response, with parser/handler/CloudWatch dispatch tests.
+- [x] Implement wrapper routing/help updates and subprocess routing coverage.
+- [x] Implement account-derived credentials plus pre-write STS identity proof,
+  including deterministic mock success/mismatch/transport tests.
+- [x] Add focused fixture/lifecycle negative coverage and update only the
+  necessary contract/schema/docs artifacts.
+- [x] Run focused formatting/tests and isolated live interoperability checks
+  without touching shared `localstack-aws`; record environment gaps.
+- [x] Inspect the complete diff and clean worktree, then commit the coherent
+  implementation without pushing.
+
+## Issue #8 Review / Results
+
+- AC1-3 owner `src/serve.rs`: added independent EC2 Query/XML dispatch and
+  manifest-driven `DescribeInstances` XML. `cargo test -q --test
+  aws_api_contract ec2_query_describe_instances_returns_exact_manifest_rows`
+  passed; `cargo test -q --test aws_api_contract
+  cloudwatch_metric_statistics_json_and_xml_emit_requested_stats` passed;
+  direct AWS CLI proof against a fresh Foxtail server on
+  `http://127.0.0.1:18081` returned exactly five instances with stable IDs,
+  `running`/code 16 state, `m6i.large`, `us-east-1a`, and five canonical
+  fixture tags per row.
+- AC4 owner `src/wrapper.rs`: `ec2 describe-instances` now routes through
+  `aws --endpoint-url http://127.0.0.1:8080`; `cargo test -q --test
+  foxtail_wrapper routes_ec2_describe_instances_to_aws_with_endpoint` and
+  `bash scripts/verify_wrapper_routing.sh` passed. `s3 ls` remains awslocal
+  passthrough.
+- AC5-6 owner `src/mutation.rs` and fixture orchestration: credentials use the
+  requested manifest account, and STS caller identity is checked before the
+  first intent/write. Mock identity success, mismatch, transport, and
+  malformed tests passed; `cargo test -q --test fixture_mutations
+  wrong_sts_account_fails_before_mutation_intent_or_external_state` passed
+  with zero intent, generation, or mutation resource rows on mismatch.
+- AC7-8 owner mutation lifecycle: focused mock proof
+  `cargo test -q --test fixture_mutations` passed all 20 tests, including four
+  unique mutation targets and read-only/public absence assertions. A fresh
+  dedicated LocalStack account-separation run could not be executed because
+  Docker access is denied for this worker (`permission denied ...
+  /Users/murphy/.orbstack/run/docker.sock`); shared `localstack-aws` was not
+  touched.
+- AC9-10 owner lifecycle plus the read-only Unseen consumer: deterministic
+  mock lifecycle proves generation/readiness/recreation identity rotation in
+  the existing suite. The pinned Unseen checkout remained clean at
+  `721b6df1a179645a2bd483c9a5614a916042d36d`; its vendored contract still pins
+  Foxtail source revision `844e4cb764e8b165a8d25296642182d5de6fb1bf`, so the
+  consumer live reuse/readiness/recreate proof must be rerun after its pinned
+  provenance and manifest golden/digest are updated to this branch's metadata
+  contract, then it can point at this issue branch. Read-only targeted Unseen
+  tests were not runnable because that checkout has no `pytest` module
+  installed.
+- AC11 owner EC2 dispatch and account preflight: unsupported/malformed EC2
+  Query requests fail closed, strict manifest validation rejects unknown,
+  duplicate, missing, contradictory controls/tags, and wrong-account mock
+  realization leaves no durable mutation state. `cargo test -q --lib
+  mutation::tests`, `cargo test -q --lib
+  generated_manifest_matches_checked_in_canonical_golden`, and `git diff --check`
+  passed; `python3 scripts/validate_release_fixture.py --definition
+  tests/fixtures/release-qualification-v1.definition.json --manifest
+  tests/fixtures/release-qualification-v1.manifest.json --negative` passed.
+- Additional verification: `cargo fmt --all`, `cargo check`, and
+  `cargo clippy --all-targets --all-features -- -D warnings` passed;
+  `bash -n scripts/verify_cli_interop.sh scripts/verify_wrapper_routing.sh`
+  passed. Broad full-suite and full CLI interoperability gates remain for the
+  parent after frozen review as requested.
+
+## Issue #8 Frozen Review Repair
+
+- [x] Bind every mutation LocalStack query in `verify_cli_interop.sh` to
+  explicit manifest-account or default-test-account credentials, prove both
+  accounts are empty before realization, and verify the manifest account owns
+  exactly four mutation IDs while the test account owns none afterward.
+- [x] Require all four observed EC2 fields in the release manifest schema and
+  cap read-only resources at exactly five; extend executable negative checks
+  for each missing field and an extra sixth resource.
+- [x] Move reusable EC2 Query parsing, manifest observation validation, state
+  mapping, XML escaping, and response building into the deep
+  `src/handlers/ec2.rs` protocol boundary while keeping route orchestration in
+  `src/serve.rs`.
+- [x] Add colocated EC2 handler tests for malformed/indexed Query members,
+  action validation, contradictory observations/tags/scopes, invalid state,
+  and XML escaping/state mapping; retain focused HTTP and CloudWatch tests.
+
+### Frozen Repair Results
+
+- Focused verification passed: `cargo fmt --all`, `cargo check`,
+  `cargo test -q --lib handlers::ec2::tests` (7 tests), EC2 and CloudWatch
+  API-contract filters (1 test each), wrapper routing filter (1 test), the
+  pinned executable schema validator with `--negative`, `bash -n` for both
+  verification scripts, and `git diff --check`.
+- The shell repair defaults qualification proof to the dedicated LocalStack
+  endpoint (`127.0.0.1:4666`) and fails closed when either account is not empty
+  before realization or when post-realization IDs/scope differ. A live Docker/
+  LocalStack run was not available to this worker; the parent must run the
+  isolated live proof. Shared `localstack-aws` was not touched.
+- The schema-only change does not alter fixture definition/manifest goldens or
+  the manifest digest.
+
+## Issue #8 Final Parent Verification
+
+- Frozen Standards and Spec review of `3aac64f2a99e796ff922d82876351f536c1f6221`
+  completed with zero findings after the repair commit.
+- Broad verification passed with `cargo fmt --all -- --check`, `cargo test`
+  (82 library, 3 API-contract, 20 mutation integration, 4 wrapper, and doc
+  tests), and `cargo clippy --all-targets --all-features -- -D warnings`.
+- After explicit user approval, the parent removed only the prior dedicated
+  `foxtail-qualification-localstack` container and its anonymous data volume,
+  then started a fresh ephemeral LocalStack 4.14.0 on `127.0.0.1:4666` with
+  EC2 and STS. Shared `localstack-aws` on port 4566 remained untouched.
+- Before realization, STS returned account `123456789012` for the manifest
+  credential and `000000000000` for `test`; both EC2 inventories were empty.
+- `AWS_ENDPOINT_URL=http://127.0.0.1:4666
+  FOXTAIL_MUTATION_AMI_ID=ami-760aaa0f MOCK_DATA_DB=<disposable-migrated-db>
+  bash scripts/verify_cli_interop.sh` passed end to end. It proved exactly five
+  stable read-only EC2 rows on Foxtail, exactly four mutation IDs under the
+  manifest account and none under `test`, status/fault/reset/recreate/destroy,
+  mutation-generation and four-ID rotation, terminal cleanup/public absence,
+  and every remaining AWS CLI compatibility check.
+- The read-only Unseen #354 checkout stayed clean at
+  `721b6df1a179645a2bd483c9a5614a916042d36d`. Its live `reuse` command reached
+  Foxtail on port 8080 and LocalStack on 4666, then rejected fail-closed with
+  primary reason `foxtail_source_revision_mismatch`, as its captured contract
+  still pins the old Foxtail source.
+- Additional Unseen diagnostics are consumer follow-ups, not silent Foxtail
+  changes: the #354 collector compares the full Resource Groups inventory
+  (five read-only rows plus four active #5 mutation mappings) with only the
+  read-only IDs, and its 86,400-second CloudWatch collection reported
+  `public_timestamp_outside_fixture_bucket` while comparing rebucketed public
+  timestamps with raw fixture offsets. The resulting inventory, evidence, and
+  fingerprint mismatches require an explicit Unseen contract/collector
+  decision before `reuse` and subsequent `recreate` can be accepted.
+- The exact Unseen pin refresh is Foxtail source
+  `3aac64f2a99e796ff922d82876351f536c1f6221`, manifest schema file SHA-256
+  `c7a50c2512a5471226355b4a97cfd048b7648fd9a5fd6ddf2ab6a2d5b33e1e66`,
+  manifest golden file SHA-256
+  `23e2a5f6f74c60825cfdf92185e5ffdde7f609b0fb2d96b2739fde9762db9817`,
+  and manifest self-digest
+  `sha256:521437a47f2dbb492525b6edd95770f0a0402b366b01e581ddcd3a20b9f9aeb1`;
+  the captured schema/golden and `fixture_contract.py` source-revision guard
+  must be updated together in an authorized Unseen change.

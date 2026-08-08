@@ -15,6 +15,7 @@ use aws_sdk_ec2::types::{
     AttributeValue, Filter, Instance, InstanceStateName, InstanceType, ResourceType, Tag,
     TagSpecification,
 };
+use aws_sdk_sts::Client as StsClient;
 use aws_smithy_http_client::Builder as HttpClientBuilder;
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -254,6 +255,8 @@ pub struct Ec2MutationBackend {
 impl Ec2MutationBackend {
     pub async fn connect(endpoint_url: &str, region: &str, account_id: &str) -> Result<Self> {
         if let Some(mock_key) = endpoint_url.strip_prefix("mock://") {
+            let caller_account = mock_caller_account(mock_key, account_id)?;
+            verify_caller_account(account_id, &caller_account)?;
             let states = MOCK_STATES.get_or_init(|| Mutex::new(BTreeMap::new()));
             let state = states
                 .lock()
@@ -297,11 +300,32 @@ impl Ec2MutationBackend {
         let mut loader = aws_config::defaults(BehaviorVersion::latest())
             .region(Region::new(region.to_string()))
             .endpoint_url(endpoint_url)
-            .credentials_provider(Credentials::new("test", "test", None, None, "static"));
+            // LocalStack derives the emulated account from the access key.
+            // Binding the credential to the manifest account prevents a
+            // qualification generation from silently landing in `test`'s
+            // default account.
+            .credentials_provider(Credentials::new(
+                account_id.to_string(),
+                format!("{account_id}-secret"),
+                None,
+                None,
+                "foxtail-account-bound",
+            ));
         if endpoint_url.starts_with("http://") {
             loader = loader.http_client(HttpClientBuilder::new().build_http());
         }
         let config = loader.load().await;
+        let identity = StsClient::new(&config)
+            .get_caller_identity()
+            .send()
+            .await
+            .context("verify STS GetCallerIdentity before EC2 mutation")?;
+        let caller_account = identity
+            .account()
+            .map(str::trim)
+            .filter(|account| !account.is_empty())
+            .ok_or_else(|| anyhow!("STS GetCallerIdentity returned no account"))?;
+        verify_caller_account(account_id, caller_account)?;
         Ok(Self {
             backend: Arc::new(BackendKind::Aws(Client::new(&config))),
             region: region.to_string(),
@@ -974,6 +998,41 @@ fn is_not_found_error(error: &anyhow::Error) -> bool {
         || message.contains("does not exist")
 }
 
+fn verify_caller_account(expected: &str, actual: &str) -> Result<()> {
+    let expected = expected.trim();
+    let actual = actual.trim();
+    if expected.is_empty() {
+        bail!("manifest account is empty");
+    }
+    if actual.is_empty() {
+        bail!("STS GetCallerIdentity returned no account");
+    }
+    if actual != expected {
+        bail!(
+            "STS caller account '{}' does not match manifest account '{}'",
+            actual,
+            expected
+        );
+    }
+    Ok(())
+}
+
+fn mock_caller_account(mock_key: &str, requested_account: &str) -> Result<String> {
+    match mock_key {
+        "sts-transport-error" => bail!("injected STS GetCallerIdentity transport failure"),
+        "sts-malformed" => Ok(String::new()),
+        _ => {
+            if let Some(account) = mock_key
+                .strip_prefix("sts-account-")
+                .or_else(|| mock_key.strip_prefix("account-"))
+            {
+                return Ok(account.to_string());
+            }
+            Ok(requested_account.to_string())
+        }
+    }
+}
+
 fn is_terminal_instance_state(state: &str) -> bool {
     state == "terminated"
 }
@@ -989,7 +1048,7 @@ fn definitely_pre_dispatch_error(message: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_terminal_instance_state;
+    use super::{is_terminal_instance_state, mock_caller_account, verify_caller_account};
 
     #[test]
     fn only_terminated_is_external_destruction_proof() {
@@ -997,5 +1056,20 @@ mod tests {
         for state in ["running", "stopped", "shutting-down", "unknown"] {
             assert!(!is_terminal_instance_state(state), "state={state}");
         }
+    }
+
+    #[test]
+    fn mock_sts_identity_is_bound_to_requested_account() {
+        let caller = mock_caller_account("fixture", "123456789012").unwrap();
+        assert_eq!(caller, "123456789012");
+        assert!(verify_caller_account("123456789012", &caller).is_ok());
+        assert!(verify_caller_account("123456789012", "000000000000").is_err());
+    }
+
+    #[test]
+    fn mock_sts_failures_are_not_coerced_into_success() {
+        assert!(mock_caller_account("sts-transport-error", "123456789012").is_err());
+        let malformed = mock_caller_account("sts-malformed", "123456789012").unwrap();
+        assert!(verify_caller_account("123456789012", &malformed).is_err());
     }
 }

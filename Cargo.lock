@@ -1263,6 +1263,7 @@ dependencies = [
  "aws-sdk-elasticloadbalancingv2",
  "aws-sdk-rds",
  "aws-sdk-s3",
+ "aws-sdk-sts",
  "aws-smithy-http-client",
  "axum",
  "chrono",

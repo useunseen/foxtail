@@ -3,7 +3,7 @@ use axum::{
     http::{Request, StatusCode},
 };
 use chrono::{DateTime, Utc};
-use foxtail::{db, serve};
+use foxtail::{db, fixture, serve};
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -50,6 +50,73 @@ async fn seed_metric_series(pool: &SqlitePool) {
         .await
         .unwrap();
     }
+}
+
+async fn seed_fixture_resources(pool: &SqlitePool) {
+    for index in 0..5 {
+        sqlx::query(
+            "INSERT INTO resources (id, resource_type, region, scenario, tags)
+             VALUES (?, 'ec2', 'us-east-1', 'Baseline', '{}')",
+        )
+        .bind(format!("i-ec2-query-{index}"))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn ec2_query_describe_instances_returns_exact_manifest_rows() {
+    let pool = test_pool("ec2-query").await;
+    seed_fixture_resources(&pool).await;
+    let snapshot = fixture::realize(
+        &pool,
+        fixture::RealizeRequest {
+            clock_anchor: Some("2026-08-05T00:00:00Z".to_string()),
+            ..fixture::RealizeRequest::default()
+        },
+    )
+    .await
+    .unwrap();
+    let manifest: Value = serde_json::from_slice(&snapshot.manifest_bytes).unwrap();
+    let expected_ids = manifest["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|resource| resource["resource_id"].as_str().unwrap().to_string())
+        .collect::<std::collections::BTreeSet<_>>();
+    let app = serve::build_app(pool);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("Action=DescribeInstances&Version=2016-11-15"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_text(response).await;
+    let mut reader = quick_xml::Reader::from_str(&body);
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Eof) => break,
+            Ok(_) => {}
+            Err(error) => panic!("EC2 XML response is malformed: {error}"),
+        }
+    }
+    assert!(body.contains("<DescribeInstancesResponse"));
+    assert!(body.contains("<instanceState><code>16</code><name>running</name>"));
+    assert!(body.contains("<instanceType>m6i.large</instanceType>"));
+    assert!(body.contains("<availabilityZone>us-east-1a</availabilityZone>"));
+    for resource_id in &expected_ids {
+        assert!(body.contains(&format!("<instanceId>{resource_id}</instanceId>")));
+        assert!(body.contains(&format!("<value>{resource_id}</value>")));
+    }
+    assert_eq!(body.matches("<instanceId>").count(), 5);
+    assert_eq!(body.matches("<item><instanceId>").count(), 5);
 }
 
 #[tokio::test]

@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use axum::{
     Json, Router,
     body::Bytes,
@@ -18,7 +18,7 @@ use tracing::{debug, info, warn};
 use crate::cli::Scenario;
 use crate::fixture;
 use crate::generator;
-use crate::handlers::{aws, cloudwatch as cw, cost_explorer as ce};
+use crate::handlers::{aws, cloudwatch as cw, cost_explorer as ce, ec2};
 use crate::metrics::{self, MetricQueryParams};
 
 const ADMIN_TOKEN_HEADER: &str = "x-mock-admin-token";
@@ -1119,6 +1119,16 @@ fn extract_resource_id_from_query(query: &CloudWatchQuery) -> Option<String> {
         return Some(val.clone());
     }
     None
+}
+
+async fn load_fixture_ec2_observations(pool: &SqlitePool) -> Result<ec2::ManifestObservations> {
+    let state = fixture::read_state(pool).await?;
+    let manifest_bytes = state
+        .manifest_bytes
+        .ok_or_else(|| anyhow!("fixture has not been realized"))?;
+    let manifest: Value = serde_json::from_slice(&manifest_bytes)
+        .map_err(|error| anyhow!("persisted fixture manifest is not JSON: {error}"))?;
+    ec2::observations_from_manifest(&manifest)
 }
 
 fn parse_cloudwatch_query_from_form(body: &[u8]) -> std::result::Result<CloudWatchQuery, String> {
@@ -2505,7 +2515,11 @@ async fn dispatch_aws_request(
     } else if target.starts_with("GraniteServiceVersion20100801.") {
         handle_cloudwatch_json(target, pool, body, protocol, injected_now).await
     } else if target.is_empty() && content_type.contains("application/x-www-form-urlencoded") {
-        handle_cloudwatch_query(pool, body, protocol, injected_now).await
+        if ec2::action_from_form(&body).as_deref() == Some("DescribeInstances") {
+            handle_ec2_query(pool, body, protocol).await
+        } else {
+            handle_cloudwatch_query(pool, body, protocol, injected_now).await
+        }
     } else {
         warn!(
             "Unknown target or protocol: target='{}', content_type='{}'",
@@ -2518,6 +2532,77 @@ async fn dispatch_aws_request(
             StatusCode::NOT_FOUND,
         )
     }
+}
+
+async fn handle_ec2_query(
+    pool: SqlitePool,
+    body: Bytes,
+    protocol: Protocol,
+) -> axum::response::Response {
+    let query = match ec2::parse_query_from_form(&body) {
+        Ok(query) if ec2::validate_describe_instances(&query).is_ok() => query,
+        Ok(query) => {
+            return error_response(
+                protocol,
+                "InvalidAction",
+                &format!("The action '{}' is not supported", query.action),
+                StatusCode::BAD_REQUEST,
+            );
+        }
+        Err(message) => {
+            return error_response(
+                protocol,
+                "InvalidParameterValue",
+                &message,
+                StatusCode::BAD_REQUEST,
+            );
+        }
+    };
+    let ec2::ManifestObservations {
+        account_id,
+        anchor,
+        observations,
+    } = match load_fixture_ec2_observations(&pool).await {
+        Ok(value) => value,
+        Err(error) => {
+            let message = error.to_string();
+            let code = if message.contains("has not been realized") {
+                "InvalidInstanceID.NotFound"
+            } else {
+                "InternalError"
+            };
+            return error_response(protocol, code, &message, StatusCode::BAD_REQUEST);
+        }
+    };
+
+    let selected = if query.instance_ids.is_empty() {
+        observations
+    } else {
+        let by_id = observations
+            .into_iter()
+            .map(|observation| (observation.resource_id.clone(), observation))
+            .collect::<BTreeMap<_, _>>();
+        let mut selected = Vec::with_capacity(query.instance_ids.len());
+        for resource_id in query.instance_ids {
+            let Some(observation) = by_id.get(&resource_id) else {
+                return error_response(
+                    protocol,
+                    "InvalidInstanceID.NotFound",
+                    &format!("The instance ID '{resource_id}' does not exist"),
+                    StatusCode::BAD_REQUEST,
+                );
+            };
+            selected.push(observation.clone());
+        }
+        selected
+    };
+    let xml = ec2::describe_instances_xml(&account_id, &anchor, &selected);
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/xml; charset=utf-8")],
+        xml,
+    )
+        .into_response()
 }
 
 async fn handle_resource_groups_tagging(

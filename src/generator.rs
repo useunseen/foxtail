@@ -3,6 +3,7 @@ use aws_config::BehaviorVersion;
 use aws_sdk_cloudwatch::config::Credentials;
 use aws_sdk_cloudwatch::config::Region;
 use aws_sdk_ec2::Client as Ec2Client;
+use aws_sdk_ec2::types::{InstanceStateName, InstanceType};
 use aws_sdk_elasticache::Client as ElastiCacheClient;
 use aws_sdk_elasticloadbalancingv2::Client as ElbClient;
 use aws_sdk_rds::Client as RdsClient;
@@ -324,19 +325,44 @@ pub async fn run(
                         .collect::<std::collections::HashMap<_, _>>()
                 )
                 .to_string();
+                let instance_state = instance
+                    .state()
+                    .and_then(|state| state.name())
+                    .map(InstanceStateName::as_str)
+                    .unwrap_or("running")
+                    .to_string();
+                let instance_type = instance
+                    .instance_type()
+                    .map(InstanceType::as_str)
+                    .unwrap_or("m6i.large")
+                    .to_string();
+                let availability_zone = instance
+                    .placement()
+                    .and_then(|placement| placement.availability_zone())
+                    .map(str::to_string);
 
                 sqlx::query(
-                    "INSERT INTO resources (id, resource_type, region, scenario, tags)
-                     VALUES (?, 'ec2', ?, ?, ?)
-                     ON CONFLICT(id) DO UPDATE SET resource_type='ec2', region=?, scenario=?, tags=?",
+                    "INSERT INTO resources
+                        (id, resource_type, region, scenario, tags,
+                         instance_state, instance_type, availability_zone)
+                     VALUES (?, 'ec2', ?, ?, ?, ?, ?, ?)
+                     ON CONFLICT(id) DO UPDATE SET
+                        resource_type='ec2', region=?, scenario=?, tags=?,
+                        instance_state=?, instance_type=?, availability_zone=?",
                 )
                 .bind(&id)
                 .bind(&region)
                 .bind(scenario.to_string())
                 .bind(&tags_json)
+                .bind(&instance_state)
+                .bind(&instance_type)
+                .bind(&availability_zone)
                 .bind(&region)
                 .bind(scenario.to_string())
                 .bind(&tags_json)
+                .bind(&instance_state)
+                .bind(&instance_type)
+                .bind(&availability_zone)
                 .execute(&mut *tx)
                 .await?;
 
