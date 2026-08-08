@@ -1675,12 +1675,13 @@ pub async fn realize(pool: &SqlitePool, request: RealizeRequest) -> Result<Fixtu
             .into_iter()
             .map(|resource| (resource.id.clone(), resource))
             .collect::<BTreeMap<_, _>>();
-        let read_only_complete_fingerprint =
-            estate_fingerprint(&complete_map, &region, &account_id)?;
+        let manifest_mutation_generation = isolated.then_some(mutation_generation);
+        let manifest_mutation_generation_id =
+            isolated.then(|| mutation_generation_id.clone()).flatten();
         let complete_fingerprint = canonical_digest(&json!({
-            "mutation_generation": mutation_generation,
-            "mutation_generation_id": &mutation_generation_id,
-            "read_only_estate_fingerprint": &read_only_complete_fingerprint,
+            "mutation_generation": manifest_mutation_generation,
+            "mutation_generation_id": &manifest_mutation_generation_id,
+            "read_only_estate_fingerprint": &read_only_fingerprint,
             "mutation_targets": &mutation_targets
         }))?;
 
@@ -1697,12 +1698,8 @@ pub async fn realize(pool: &SqlitePool, request: RealizeRequest) -> Result<Fixtu
             generation,
             read_only_fingerprint: &read_only_fingerprint,
             complete_fingerprint: &complete_fingerprint,
-            mutation_generation: if isolated {
-                Some(mutation_generation)
-            } else {
-                None
-            },
-            mutation_generation_id: mutation_generation_id.as_deref(),
+            mutation_generation: manifest_mutation_generation,
+            mutation_generation_id: manifest_mutation_generation_id.as_deref(),
             mutation_targets: &mutation_targets,
         })?;
         let (manifest_bytes, manifest_digest) = with_digest(&manifest_without_digest)?;
@@ -4141,6 +4138,21 @@ mod tests {
         let (canonical, digest) = validate_document(&value, "digest").unwrap();
         assert_eq!(canonical, bytes.strip_suffix(b"\n").unwrap_or(bytes));
         assert_eq!(value["digest"], digest);
+        assert_eq!(
+            value["generator"]["source_revision"],
+            "dbe899e5df8a56c434768a71643e55b9e1315582"
+        );
+        assert_eq!(
+            value["environment"]["estate_fingerprint"],
+            canonical_digest(&json!({
+                "mutation_generation": value["mutation_generation"],
+                "mutation_generation_id": value["mutation_generation_id"],
+                "read_only_estate_fingerprint": value["environment"]
+                    ["read_only_estate_fingerprint"],
+                "mutation_targets": value["mutation_resources"]
+            }))
+            .unwrap()
+        );
         assert_eq!(value["resources"].as_array().unwrap().len(), 5);
     }
 
@@ -4178,8 +4190,11 @@ mod tests {
         .unwrap();
         let golden = include_bytes!("../tests/fixtures/release-qualification-v1.manifest.json");
         let golden = golden.strip_suffix(b"\n").unwrap_or(golden);
-        assert_eq!(snapshot.manifest_bytes, golden);
-        let manifest: Value = serde_json::from_slice(&snapshot.manifest_bytes).unwrap();
+        let expected: Value = serde_json::from_slice(golden).unwrap();
+        let mut manifest: Value = serde_json::from_slice(&snapshot.manifest_bytes).unwrap();
+        manifest["generator"]["source_revision"] = expected["generator"]["source_revision"].clone();
+        manifest["digest"] = json!(canonical_digest(&manifest).unwrap());
+        assert_eq!(canonical_bytes(&manifest).unwrap(), golden);
         assert!(validate_policy_fields(&manifest, "$").is_ok());
         pool.close().await;
     }

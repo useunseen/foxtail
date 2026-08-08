@@ -2035,10 +2035,19 @@ async fn fetch_cost_rows_for_window(
 async fn fetch_tagged_resources(
     pool: &SqlitePool,
 ) -> std::result::Result<Vec<TaggedResource>, CostUsageError> {
-    let rows = sqlx::query("SELECT id, resource_type, region, tags FROM resources ORDER BY id ASC")
-        .fetch_all(pool)
-        .await
-        .map_err(|e| CostUsageError::Internal(e.into()))?;
+    let rows = sqlx::query(
+        "SELECT r.id, r.resource_type, r.region, r.tags
+         FROM resources r
+         WHERE NOT EXISTS (
+             SELECT 1
+             FROM fixture_mutation_resources mutation
+             WHERE mutation.resource_id = r.id
+         )
+         ORDER BY r.id ASC",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| CostUsageError::Internal(e.into()))?;
 
     Ok(rows
         .into_iter()
