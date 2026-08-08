@@ -695,3 +695,46 @@ external mutation or durable partial state.
   isolated live proof. Shared `localstack-aws` was not touched.
 - The schema-only change does not alter fixture definition/manifest goldens or
   the manifest digest.
+
+## Issue #8 Final Parent Verification
+
+- Frozen Standards and Spec review of `3aac64f2a99e796ff922d82876351f536c1f6221`
+  completed with zero findings after the repair commit.
+- Broad verification passed with `cargo fmt --all -- --check`, `cargo test`
+  (82 library, 3 API-contract, 20 mutation integration, 4 wrapper, and doc
+  tests), and `cargo clippy --all-targets --all-features -- -D warnings`.
+- After explicit user approval, the parent removed only the prior dedicated
+  `foxtail-qualification-localstack` container and its anonymous data volume,
+  then started a fresh ephemeral LocalStack 4.14.0 on `127.0.0.1:4666` with
+  EC2 and STS. Shared `localstack-aws` on port 4566 remained untouched.
+- Before realization, STS returned account `123456789012` for the manifest
+  credential and `000000000000` for `test`; both EC2 inventories were empty.
+- `AWS_ENDPOINT_URL=http://127.0.0.1:4666
+  FOXTAIL_MUTATION_AMI_ID=ami-760aaa0f MOCK_DATA_DB=<disposable-migrated-db>
+  bash scripts/verify_cli_interop.sh` passed end to end. It proved exactly five
+  stable read-only EC2 rows on Foxtail, exactly four mutation IDs under the
+  manifest account and none under `test`, status/fault/reset/recreate/destroy,
+  mutation-generation and four-ID rotation, terminal cleanup/public absence,
+  and every remaining AWS CLI compatibility check.
+- The read-only Unseen #354 checkout stayed clean at
+  `721b6df1a179645a2bd483c9a5614a916042d36d`. Its live `reuse` command reached
+  Foxtail on port 8080 and LocalStack on 4666, then rejected fail-closed with
+  primary reason `foxtail_source_revision_mismatch`, as its captured contract
+  still pins the old Foxtail source.
+- Additional Unseen diagnostics are consumer follow-ups, not silent Foxtail
+  changes: the #354 collector compares the full Resource Groups inventory
+  (five read-only rows plus four active #5 mutation mappings) with only the
+  read-only IDs, and its 86,400-second CloudWatch collection reported
+  `public_timestamp_outside_fixture_bucket` while comparing rebucketed public
+  timestamps with raw fixture offsets. The resulting inventory, evidence, and
+  fingerprint mismatches require an explicit Unseen contract/collector
+  decision before `reuse` and subsequent `recreate` can be accepted.
+- The exact Unseen pin refresh is Foxtail source
+  `3aac64f2a99e796ff922d82876351f536c1f6221`, manifest schema file SHA-256
+  `c7a50c2512a5471226355b4a97cfd048b7648fd9a5fd6ddf2ab6a2d5b33e1e66`,
+  manifest golden file SHA-256
+  `23e2a5f6f74c60825cfdf92185e5ffdde7f609b0fb2d96b2739fde9762db9817`,
+  and manifest self-digest
+  `sha256:521437a47f2dbb492525b6edd95770f0a0402b366b01e581ddcd3a20b9f9aeb1`;
+  the captured schema/golden and `fixture_contract.py` source-revision guard
+  must be updated together in an authorized Unseen change.
