@@ -1675,12 +1675,13 @@ pub async fn realize(pool: &SqlitePool, request: RealizeRequest) -> Result<Fixtu
             .into_iter()
             .map(|resource| (resource.id.clone(), resource))
             .collect::<BTreeMap<_, _>>();
-        let read_only_complete_fingerprint =
-            estate_fingerprint(&complete_map, &region, &account_id)?;
+        let manifest_mutation_generation = isolated.then_some(mutation_generation);
+        let manifest_mutation_generation_id =
+            isolated.then(|| mutation_generation_id.clone()).flatten();
         let complete_fingerprint = canonical_digest(&json!({
-            "mutation_generation": mutation_generation,
-            "mutation_generation_id": &mutation_generation_id,
-            "read_only_estate_fingerprint": &read_only_complete_fingerprint,
+            "mutation_generation": manifest_mutation_generation,
+            "mutation_generation_id": &manifest_mutation_generation_id,
+            "read_only_estate_fingerprint": &read_only_fingerprint,
             "mutation_targets": &mutation_targets
         }))?;
 
@@ -1697,12 +1698,8 @@ pub async fn realize(pool: &SqlitePool, request: RealizeRequest) -> Result<Fixtu
             generation,
             read_only_fingerprint: &read_only_fingerprint,
             complete_fingerprint: &complete_fingerprint,
-            mutation_generation: if isolated {
-                Some(mutation_generation)
-            } else {
-                None
-            },
-            mutation_generation_id: mutation_generation_id.as_deref(),
+            mutation_generation: manifest_mutation_generation,
+            mutation_generation_id: manifest_mutation_generation_id.as_deref(),
             mutation_targets: &mutation_targets,
         })?;
         let (manifest_bytes, manifest_digest) = with_digest(&manifest_without_digest)?;
@@ -4144,6 +4141,17 @@ mod tests {
         assert_eq!(
             value["generator"]["source_revision"],
             "91c5daac1b331c28a63d43d4ccf9c326aa699738"
+        );
+        assert_eq!(
+            value["environment"]["estate_fingerprint"],
+            canonical_digest(&json!({
+                "mutation_generation": value["mutation_generation"],
+                "mutation_generation_id": value["mutation_generation_id"],
+                "read_only_estate_fingerprint": value["environment"]
+                    ["read_only_estate_fingerprint"],
+                "mutation_targets": value["mutation_resources"]
+            }))
+            .unwrap()
         );
         assert_eq!(value["resources"].as_array().unwrap().len(), 5);
     }
