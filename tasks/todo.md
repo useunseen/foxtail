@@ -743,5 +743,27 @@ external mutation or durable partial state.
 
 - [x] Exclude active qualification mutation targets from the Foxtail Resource Groups read-only inventory.
 - [x] Prove the five-row inventory remains exact while a mutation generation is active.
-- [ ] Run focused tests, full Rust verification, and the live Foxtail/LocalStack/Unseen reuse check.
-- [ ] Record review findings and final verification below.
+- [x] Run focused tests, full Rust verification, and the live Foxtail/LocalStack/Unseen reuse check.
+- [x] Record review findings and final verification below.
+
+## Final verification
+
+- Foxtail's frozen code head `860242fe5ee2bb8cb3db5347878ad6fe6ddee1b5`
+  passed `cargo test` (82 library, 4 API-contract, 20 mutation integration,
+  4 wrapper, and doc tests) and
+  `cargo clippy --all-targets --all-features -- -D warnings`.
+- `FOXTAIL_SOURCE_REVISION=dbe899e5df8a56c434768a71643e55b9e1315582
+  FOXTAIL_MUTATION_AMI_ID=ami-03cf127a
+  AWS_ENDPOINT_URL=http://127.0.0.1:4666
+  AWS_MOCK_VERIFY_PORT=18080 bash scripts/verify_cli_interop.sh` passed against
+  a fresh disposable LocalStack 4.14.0 estate, including exact inventory and
+  the complete fault/reset/recreate/destroy lifecycle.
+- Unseen's frozen head `26055541dce1dd283f3c555e6e232cc6fd12cdc7`
+  passed its focused 91-test acceptance matrix and full 2,837-test unit suite.
+  Its real `reuse` CLI then inspected a fresh Foxtail realization while the
+  destroyed-generation LocalStack tombstones remained and returned
+  `accepted=true`, `ready=true`, `status=REUSABLE`, and
+  `reason=readiness_verified`.
+- Frozen-object Spec/correctness review was clean across all twelve acceptance
+  criteria. Standards review found no code issue and identified only the
+  previously incomplete progress/results record closed by this section.
