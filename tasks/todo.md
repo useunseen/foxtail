@@ -738,3 +738,10 @@ external mutation or durable partial state.
   `sha256:521437a47f2dbb492525b6edd95770f0a0402b366b01e581ddcd3a20b9f9aeb1`;
   the captured schema/golden and `fixture_contract.py` source-revision guard
   must be updated together in an authorized Unseen change.
+
+# Issue #8 Live Reuse Follow-Up
+
+- [x] Exclude active qualification mutation targets from the Foxtail Resource Groups read-only inventory.
+- [x] Prove the five-row inventory remains exact while a mutation generation is active.
+- [ ] Run focused tests, full Rust verification, and the live Foxtail/LocalStack/Unseen reuse check.
+- [ ] Record review findings and final verification below.

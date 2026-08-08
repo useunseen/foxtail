@@ -400,6 +400,26 @@ if test_instances:
     raise SystemExit("default test account unexpectedly exposed mutation instances")
 PY
 log_step "Verified manifest account owns exactly four mutation IDs and default test account owns none"
+
+ACTIVE_TAGGED_INVENTORY="$(aws_json resourcegroupstaggingapi get-resources \
+  --resource-type-filters ec2:instance)"
+ACTIVE_TAGGED_INVENTORY="$ACTIVE_TAGGED_INVENTORY" FIXTURE_REALIZATION="$FIXTURE_REALIZATION" python3 - <<'PY'
+import json
+import os
+
+manifest = json.loads(os.environ["FIXTURE_REALIZATION"])["manifest"]
+expected = {resource["resource_id"] for resource in manifest["resources"]}
+observed = {
+    mapping["ResourceARN"].rsplit("/", 1)[-1]
+    for mapping in json.loads(os.environ["ACTIVE_TAGGED_INVENTORY"])["ResourceTagMappingList"]
+}
+if observed != expected:
+    raise SystemExit(
+        f"active Resource Groups inventory did not contain exactly the five read-only IDs: {observed} != {expected}"
+    )
+PY
+log_step "Verified active Resource Groups inventory excludes qualification mutation targets"
+
 while IFS=$'\t' read -r mutation_id target_kind setup_fault_kind control_id expected_state expected_type terminal_state terminal_type; do
   [[ -z "$mutation_id" ]] && continue
   PUBLIC_INSTANCE="$(mutation_manifest_json ec2 describe-instances --instance-ids "$mutation_id")"

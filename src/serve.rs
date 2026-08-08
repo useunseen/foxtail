@@ -2035,10 +2035,19 @@ async fn fetch_cost_rows_for_window(
 async fn fetch_tagged_resources(
     pool: &SqlitePool,
 ) -> std::result::Result<Vec<TaggedResource>, CostUsageError> {
-    let rows = sqlx::query("SELECT id, resource_type, region, tags FROM resources ORDER BY id ASC")
-        .fetch_all(pool)
-        .await
-        .map_err(|e| CostUsageError::Internal(e.into()))?;
+    let rows = sqlx::query(
+        "SELECT r.id, r.resource_type, r.region, r.tags
+         FROM resources r
+         WHERE NOT EXISTS (
+             SELECT 1
+             FROM fixture_mutation_resources mutation
+             WHERE mutation.resource_id = r.id
+         )
+         ORDER BY r.id ASC",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| CostUsageError::Internal(e.into()))?;
 
     Ok(rows
         .into_iter()
@@ -7695,6 +7704,73 @@ mod tests {
         assert_eq!(mappings.len(), 1);
         assert_eq!(mappings[0]["ResourceARN"], requested_arn);
         assert_eq!(mappings[0]["Tags"][0]["Value"], "api-b");
+    }
+
+    #[tokio::test]
+    async fn tagging_get_resources_excludes_active_fixture_mutation_targets() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO resources (id, resource_type, region, scenario, tags)
+             VALUES
+             ('i-read-only', 'ec2', 'us-east-1', 'Baseline', '{\"Name\":\"read-only\"}'),
+             ('i-mutation', 'ec2', 'us-east-1', 'QualificationMutation', '{\"Name\":\"mutation\"}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO fixture_mutation_generations
+             (mutation_generation, generation_id, fixture_generation, manifest_digest,
+              complete_estate_fingerprint, state, resource_ids, created_at, endpoint_url,
+              region, account_id, external_status)
+             VALUES (1, 'mg-0001', 1, 'sha256:manifest', 'sha256:estate', 'ACTIVE',
+                     '[\"i-mutation\"]', '2026-08-08T00:00:00Z', 'http://127.0.0.1:4666',
+                     'us-east-1', '123456789012', 'ACTIVE')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO fixture_mutation_resources
+             (resource_id, mutation_generation, generation_id, control_id, target_kind,
+              setup_fault_kind, instance_state, instance_type, initial_state, initial_type,
+              terminal_state, terminal_type, restored_state, restored_type, external_status,
+              external_identity_verified, created_at)
+             VALUES ('i-mutation', 1, 'mg-0001', 'ec2-mutation-stop-001', 'stop', 'stop',
+                     'running', 'm6i.large', 'running', 'm6i.large', 'stopped', 'm6i.large',
+                     'running', 'm6i.large', 'ACTIVE', 1, '2026-08-08T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let response = build_app(pool)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-amz-json-1.1")
+                    .header(
+                        "x-amz-target",
+                        "ResourceGroupsTaggingAPI_20170126.GetResources",
+                    )
+                    .body(Body::from(
+                        json!({"ResourceTypeFilters": ["ec2:instance"]}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(
+            body["ResourceTagMappingList"],
+            json!([{
+                "ResourceARN": resource_arn("ec2", "us-east-1", "i-read-only"),
+                "Tags": [{"Key": "Name", "Value": "read-only"}]
+            }])
+        );
     }
 
     #[tokio::test]
