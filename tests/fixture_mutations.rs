@@ -191,6 +191,43 @@ async fn ordinary_realize_keeps_mutation_controls_declared_only() {
 }
 
 #[tokio::test]
+async fn wrong_sts_account_fails_before_mutation_intent_or_external_state() {
+    fixture::with_isolated_qualification(async {
+        let pool = seeded_pool().await;
+        let error = fixture::realize(
+            &pool,
+            RealizeRequest {
+                endpoint_url: Some("mock://sts-account-000000000000".to_string()),
+                ..RealizeRequest::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("does not match manifest account"));
+        assert_eq!(intent_count(&pool).await, 0);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM fixture_mutation_generations",)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM resources WHERE id LIKE 'i-foxtail-mutation-%'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+        pool.close().await;
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn mock_backend_reconciles_all_four_scenarios_and_public_absence() {
     fixture::with_isolated_qualification(async {
         let pool = seeded_pool().await;

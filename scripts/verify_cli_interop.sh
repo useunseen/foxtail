@@ -239,6 +239,39 @@ python3 "$ROOT_DIR/scripts/validate_release_fixture.py" \
   --negative
 log_step "Verified release fixture: persisted CLI/HTTP parity and executable Draft 2020-12 schema policy"
 
+FOXTAIL_EC2_OBSERVATION="$(aws_json ec2 describe-instances)"
+FOXTAIL_EC2_OBSERVATION="$FOXTAIL_EC2_OBSERVATION" FIXTURE_MANIFEST="$FIXTURE_MANIFEST" python3 - <<'PY'
+import json
+import os
+
+manifest = json.loads(os.environ["FIXTURE_MANIFEST"])
+expected = {
+    resource["resource_id"]: resource
+    for resource in manifest["resources"]
+}
+payload = json.loads(os.environ["FOXTAIL_EC2_OBSERVATION"])
+instances = [
+    instance
+    for reservation in payload.get("Reservations", [])
+    for instance in reservation.get("Instances", [])
+]
+if len(instances) != 5 or {instance.get("InstanceId") for instance in instances} != set(expected):
+    raise SystemExit("Foxtail EC2 observation did not return exactly the five manifest resources")
+for instance in instances:
+    resource = expected[instance["InstanceId"]]
+    observed = resource["observed"]
+    if instance.get("State", {}).get("Name") != observed["instance_state"]:
+        raise SystemExit("Foxtail EC2 observation returned an unexpected instance state")
+    if instance.get("InstanceType") != observed["instance_type"]:
+        raise SystemExit("Foxtail EC2 observation returned an unexpected instance type")
+    if instance.get("Placement", {}).get("AvailabilityZone") != observed["availability_zone"]:
+        raise SystemExit("Foxtail EC2 observation returned an unexpected availability zone")
+    tags = {tag.get("Key"): tag.get("Value") for tag in instance.get("Tags", [])}
+    if tags != observed["tags"]:
+        raise SystemExit("Foxtail EC2 observation returned tags different from the manifest")
+PY
+log_step "Verified Foxtail AWS-compatible EC2 observation: exactly five manifest rows and stable metadata"
+
 MUTATION_STATUS="$(curl -fsS "$ENDPOINT/_mock/fixture/mutation/status")"
 validate_mutation_document status "$MUTATION_STATUS"
 CLI_MUTATION_STATUS="$("$BIN" --database-url "sqlite:$TMP_DB" fixture mutation-status)"

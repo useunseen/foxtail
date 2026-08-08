@@ -44,6 +44,7 @@ const FOXTAIL_ROUTED_COMMANDS: &[(&str, &str)] = &[
     ("compute-optimizer", "get-ec2-instance-recommendations"),
     ("compute-optimizer", "get-ebs-volume-recommendations"),
     ("cur", "describe-report-definitions"),
+    ("ec2", "describe-instances"),
     ("cloudwatch", "list-metrics"),
     ("cloudwatch", "get-metric-statistics"),
     ("cloudwatch", "get-metric-data"),
@@ -349,6 +350,7 @@ Foxtail-routed commands:
   compute-optimizer get-ec2-instance-recommendations
   compute-optimizer get-ebs-volume-recommendations
   cur describe-report-definitions
+  ec2 describe-instances
   cloudwatch list-metrics
   cloudwatch get-metric-statistics
   cloudwatch get-metric-data
@@ -356,7 +358,6 @@ Foxtail-routed commands:
 LocalStack passthrough examples:
   foxtail s3 ls
   foxtail sqs list-queues
-  foxtail ec2 describe-instances
 
 Examples:
   Generate an idle-heavy dataset:
@@ -371,8 +372,11 @@ Examples:
   Foxtail-routed CloudWatch:
     foxtail cloudwatch list-metrics --namespace AWS/EC2 --metric-name CPUUtilization
 
-  LocalStack passthrough:
+  Foxtail-routed EC2 observation:
     foxtail ec2 describe-instances
+
+  LocalStack passthrough:
+    foxtail s3 ls
 
   Explain the routing decision:
     foxtail --debug-routing s3 ls
@@ -473,6 +477,29 @@ mod tests {
                 DEFAULT_FOXTAIL_ENDPOINT,
                 "cloudwatch",
                 "list-metrics"
+            ])
+        );
+    }
+
+    #[test]
+    fn routes_ec2_observation_to_foxtail() {
+        let parsed = ParsedCli {
+            config: Config::default(),
+            forwarded_args: os(&["ec2", "describe-instances"]),
+            mode: RunMode::Execute,
+        };
+
+        let invocation = build_invocation(&parsed);
+
+        assert_eq!(invocation.backend, Backend::Aws);
+        assert_eq!(invocation.program, DEFAULT_AWS_BIN);
+        assert_eq!(
+            invocation.args,
+            os(&[
+                "--endpoint-url",
+                DEFAULT_FOXTAIL_ENDPOINT,
+                "ec2",
+                "describe-instances"
             ])
         );
     }

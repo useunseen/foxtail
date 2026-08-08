@@ -639,6 +639,16 @@ fn non_empty(value: Option<&str>, name: &str) -> Result<String> {
     Ok(value.to_string())
 }
 
+fn parse_resource_tags(raw: Option<&str>) -> BTreeMap<String, String> {
+    raw.and_then(|raw| serde_json::from_str::<Map<String, Value>>(raw).ok())
+        .map(|tags| {
+            tags.into_iter()
+                .filter_map(|(key, value)| value.as_str().map(|value| (key, value.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 async fn validate_mutation_authority(
     pool: &SqlitePool,
     authority: &MutationAuthority,
@@ -1425,7 +1435,7 @@ pub async fn realize(pool: &SqlitePool, request: RealizeRequest) -> Result<Fixtu
     }
 
     let rows = sqlx::query(
-        "SELECT id, region, scenario
+        "SELECT id, region, scenario, instance_state, instance_type, availability_zone, tags
          FROM resources
          WHERE resource_type = 'ec2'
            AND id NOT IN (
@@ -1452,6 +1462,10 @@ pub async fn realize(pool: &SqlitePool, request: RealizeRequest) -> Result<Fixtu
                 id: row.try_get("id")?,
                 region: row.try_get("region")?,
                 scenario: row.try_get("scenario")?,
+                instance_state: row.try_get("instance_state")?,
+                instance_type: row.try_get("instance_type")?,
+                availability_zone: row.try_get("availability_zone")?,
+                tags: parse_resource_tags(row.try_get::<Option<String>, _>("tags")?.as_deref()),
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1520,6 +1534,18 @@ pub async fn realize(pool: &SqlitePool, request: RealizeRequest) -> Result<Fixtu
     .fetch_one(pool)
     .await?;
     let mutation_generation_id = isolated.then(|| mutation_generation_id(mutation_generation));
+    // Account identity is verified by STS before the intent is persisted. A
+    // mismatch, transport failure, or malformed identity therefore leaves no
+    // partial mutation ledger behind and cannot reach EC2 RunInstances.
+    let mutation_backend = if isolated {
+        Some(
+            mutation::Ec2MutationBackend::connect(&endpoint_url, &region, &account_id)
+                .await
+                .with_context(|| format!("connect to public EC2 endpoint {endpoint_url}"))?,
+        )
+    } else {
+        None
+    };
     let intent_id = if isolated {
         let id = if let Some(reuse_intent_id) = request.reuse_intent_id.clone() {
             reuse_intent_id
@@ -1547,72 +1573,54 @@ pub async fn realize(pool: &SqlitePool, request: RealizeRequest) -> Result<Fixtu
         None
     };
 
-    let provisioned = if isolated {
-        let backend = mutation::Ec2MutationBackend::connect(&endpoint_url, &region, &account_id)
+    let provisioned = if let Some(backend) = mutation_backend {
+        match backend
+            .provision_generation(generation, mutation_generation_id.as_deref().unwrap())
             .await
-            .with_context(|| format!("connect to public EC2 endpoint {endpoint_url}"));
-        match backend {
-            Ok(backend) => match backend
-                .provision_generation(generation, mutation_generation_id.as_deref().unwrap())
-                .await
-            {
-                Ok(targets) => Some((backend, targets)),
-                Err(error) => {
-                    if let Some(intent_id) = intent_id.as_deref() {
-                        if let Some(failure) = error.downcast_ref::<mutation::ProvisionFailure>() {
-                            let quarantine = quarantine_provisioned_generation(
-                                pool,
-                                MutationGenerationContext {
-                                    fixture_generation: generation,
-                                    mutation_generation,
-                                    generation_id: mutation_generation_id.as_deref().unwrap(),
-                                    region: &region,
-                                    account_id: &account_id,
-                                    endpoint_url: &endpoint_url,
-                                    anchor: &anchor.to_rfc3339_opts(SecondsFormat::Secs, true),
-                                },
-                                &failure.returned_ids,
-                                &error.to_string(),
-                            )
-                            .await;
-                            let intent_error = match quarantine {
-                                Ok(()) => error.to_string(),
-                                Err(quarantine_error) => {
-                                    format!("{error}; quarantine_error={quarantine_error}")
-                                }
-                            };
-                            let _ = update_mutation_intent(
-                                pool,
-                                intent_id,
-                                "AMBIGUOUS",
-                                Some(&intent_error),
-                                &now_rfc3339(),
-                            )
-                            .await;
-                        } else {
-                            let _ = update_mutation_intent(
-                                pool,
-                                intent_id,
-                                "FAILED",
-                                Some(&error.to_string()),
-                                &now_rfc3339(),
-                            )
-                            .await;
-                        }
-                    }
-                    return Err(error);
-                }
-            },
+        {
+            Ok(targets) => Some((backend, targets)),
             Err(error) => {
                 if let Some(intent_id) = intent_id.as_deref() {
-                    let _ = update_mutation_intent(
-                        pool,
-                        intent_id,
-                        "FAILED",
-                        Some(&error.to_string()),
-                        &now_rfc3339(),
-                    )
-                    .await;
+                    if let Some(failure) = error.downcast_ref::<mutation::ProvisionFailure>() {
+                        let quarantine = quarantine_provisioned_generation(
+                            pool,
+                            MutationGenerationContext {
+                                fixture_generation: generation,
+                                mutation_generation,
+                                generation_id: mutation_generation_id.as_deref().unwrap(),
+                                region: &region,
+                                account_id: &account_id,
+                                endpoint_url: &endpoint_url,
+                                anchor: &anchor.to_rfc3339_opts(SecondsFormat::Secs, true),
+                            },
+                            &failure.returned_ids,
+                            &error.to_string(),
+                        )
+                        .await;
+                        let intent_error = match quarantine {
+                            Ok(()) => error.to_string(),
+                            Err(quarantine_error) => {
+                                format!("{error}; quarantine_error={quarantine_error}")
+                            }
+                        };
+                        let _ = update_mutation_intent(
+                            pool,
+                            intent_id,
+                            "AMBIGUOUS",
+                            Some(&intent_error),
+                            &now_rfc3339(),
+                        )
+                        .await;
+                    } else {
+                        let _ = update_mutation_intent(
+                            pool,
+                            intent_id,
+                            "FAILED",
+                            Some(&error.to_string()),
+                            &now_rfc3339(),
+                        )
+                        .await;
+                    }
                 }
                 return Err(error);
             }
@@ -2468,6 +2476,25 @@ pub async fn recreate(pool: &SqlitePool, request: RecreateRequest) -> Result<Vec
     .fetch_one(pool)
     .await?;
     let predicted_generation_id = mutation_generation_id(predicted_mutation_generation);
+    let old_endpoint = old_environment
+        .get("aws_endpoint_url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("active fixture manifest endpoint is missing"))?;
+    let old_account = old_environment
+        .get("account_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("active fixture manifest account is missing"))?;
+    let old_region = old_environment
+        .get("region")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("active fixture manifest region is missing"))?;
+    // Do the account-bound STS preflight before either recreate intent is
+    // persisted. A changed endpoint/account therefore cannot leave a partial
+    // recreation ledger behind.
+    let _preflight_backend =
+        mutation::Ec2MutationBackend::connect(old_endpoint, old_region, old_account)
+            .await
+            .with_context(|| format!("verify recreate account through {old_endpoint}"))?;
     let created_at = now_rfc3339();
     let intent_id = begin_mutation_intent(
         pool,
@@ -3155,6 +3182,10 @@ struct ResourceIdentity {
     id: String,
     region: String,
     scenario: String,
+    instance_state: String,
+    instance_type: String,
+    availability_zone: Option<String>,
+    tags: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -3176,6 +3207,10 @@ struct EstateResource {
     id: String,
     region: String,
     scenario: String,
+    instance_state: String,
+    instance_type: String,
+    availability_zone: Option<String>,
+    tags: BTreeMap<String, String>,
     avg_cpu: Option<f64>,
     metric_count: i64,
     cost_record_count: i64,
@@ -3354,6 +3389,10 @@ async fn load_estate_resources(
             id: identity.id.clone(),
             region: identity.region.clone(),
             scenario: identity.scenario.clone(),
+            instance_state: identity.instance_state.clone(),
+            instance_type: identity.instance_type.clone(),
+            availability_zone: identity.availability_zone.clone(),
+            tags: identity.tags.clone(),
             avg_cpu,
             metric_count: metrics.len() as i64,
             cost_record_count: costs.len() as i64,
@@ -3451,12 +3490,20 @@ fn estate_fingerprint(
     let rows = resources
         .iter()
         .map(|(control_id, resource)| {
+            let (role, scenario) = role_and_intent(control_id);
             json!({
                 "control_id": control_id,
                 "resource_id": resource.id,
                 "resource_type": "ec2",
                 "region": resource.region,
                 "scenario": resource.scenario,
+                "instance_state": resource.instance_state,
+                "instance_type": resource.instance_type,
+                "availability_zone": resource
+                    .availability_zone
+                    .clone()
+                    .unwrap_or_else(|| format!("{}a", region)),
+                "tags": observation_tags(resource, control_id, role, scenario),
                 "metrics": resource.metrics.iter().map(|metric| json!({
                     "namespace": metric.namespace,
                     "metric_name": metric.metric_name,
@@ -3499,6 +3546,7 @@ fn build_manifest(context: ManifestContext<'_>) -> Result<Value> {
         .iter()
         .map(|(control_id, resource)| {
             let (role, scenario_intent) = role_and_intent(control_id);
+            let tags = observation_tags(resource, control_id, role, scenario_intent);
             json!({
                 "control_id": control_id,
                 "role": role,
@@ -3508,6 +3556,13 @@ fn build_manifest(context: ManifestContext<'_>) -> Result<Value> {
                 "scenario": scenario_intent,
                 "evidence": evidence_declaration(control_id, resource),
                 "observed": {
+                    "instance_state": resource.instance_state,
+                    "instance_type": resource.instance_type,
+                    "availability_zone": resource
+                        .availability_zone
+                        .clone()
+                        .unwrap_or_else(|| format!("{}a", region)),
+                    "tags": tags,
                     "metric_count": resource.metric_count,
                     "cost_record_count": resource.cost_record_count,
                     "average_cpu": resource.avg_cpu,
@@ -3609,7 +3664,7 @@ fn build_manifest(context: ManifestContext<'_>) -> Result<Value> {
     }))
 }
 
-fn role_and_intent(control_id: &str) -> (&'static str, &'static str) {
+pub(crate) fn role_and_intent(control_id: &str) -> (&'static str, &'static str) {
     match control_id {
         "ec2-idle-positive-001" => ("positive", "ec2.idle.complete-history"),
         "ec2-idle-negative-001" => ("negative", "ec2.busy.complete-history"),
@@ -3646,6 +3701,24 @@ fn evidence_declaration(control_id: &str, resource: &EstateResource) -> Value {
         evidence["recommendation_observed_within_days"] = json!(HISTORY_DAYS);
     }
     evidence
+}
+
+fn observation_tags(
+    resource: &EstateResource,
+    control_id: &str,
+    role: &str,
+    scenario: &str,
+) -> BTreeMap<String, String> {
+    let mut tags = resource.tags.clone();
+    // Fixture-owned tags are scope assertions, not hints. Replace any source
+    // tag with the canonical value so a stale LocalStack tag cannot contradict
+    // the manifest control identity that Foxtail publishes.
+    tags.insert("Name".to_string(), resource.id.clone());
+    tags.insert("FoxtailFixture".to_string(), FIXTURE_VERSION.to_string());
+    tags.insert("FoxtailControl".to_string(), control_id.to_string());
+    tags.insert("FoxtailRole".to_string(), role.to_string());
+    tags.insert("FoxtailScenario".to_string(), scenario.to_string());
+    tags
 }
 
 fn identity_values(manifest: &Value) -> Result<Vec<Value>> {
