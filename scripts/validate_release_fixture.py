@@ -112,6 +112,21 @@ def validate_value(schema_path: Path, document: Any) -> None:
         raise ValueError("forbidden policy field rejected")
 
 
+def expect_schema_rejection(
+    schema_path: Path,
+    document: Any,
+    label: str,
+    mutate: Any,
+) -> None:
+    mutated = copy.deepcopy(document)
+    mutate(mutated)
+    try:
+        validate_value(schema_path, mutated)
+    except ValueError:
+        return
+    raise SystemExit(f"negative schema check unexpectedly accepted {label}")
+
+
 def run_negative_checks(
     definition_schema: Path,
     definition: Any,
@@ -138,6 +153,20 @@ def run_negative_checks(
         "manifest.control_catalogue[0]",
         ("control_catalogue", 0),
         "Stretch",
+    )
+    for field in ("instance_state", "instance_type", "availability_zone", "tags"):
+        expect_schema_rejection(
+            manifest_schema,
+            manifest,
+            f"manifest.resources[0].observed missing {field}",
+            lambda value, field=field: value["resources"][0]["observed"].pop(field, None),
+        )
+
+    expect_schema_rejection(
+        manifest_schema,
+        manifest,
+        "manifest.resources extra sixth read-only resource",
+        lambda value: value["resources"].append(copy.deepcopy(value["resources"][0])),
     )
 
 

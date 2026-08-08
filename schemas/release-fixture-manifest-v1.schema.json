@@ -80,6 +80,7 @@
     "resources": {
       "type": "array",
       "minItems": 5,
+      "maxItems": 5,
       "items": {
         "type": "object",
         "required": [
@@ -107,6 +108,7 @@
           },
           "observed": {
             "type": "object",
+            "required": ["instance_state", "instance_type", "availability_zone", "tags"],
             "properties": {
               "instance_state": {"enum": ["pending", "running", "stopped", "shutting-down", "terminated", "stopping"]},
               "instance_type": {"type": "string"},

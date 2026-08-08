@@ -663,3 +663,35 @@ external mutation or durable partial state.
   `bash -n scripts/verify_cli_interop.sh scripts/verify_wrapper_routing.sh`
   passed. Broad full-suite and full CLI interoperability gates remain for the
   parent after frozen review as requested.
+
+## Issue #8 Frozen Review Repair
+
+- [x] Bind every mutation LocalStack query in `verify_cli_interop.sh` to
+  explicit manifest-account or default-test-account credentials, prove both
+  accounts are empty before realization, and verify the manifest account owns
+  exactly four mutation IDs while the test account owns none afterward.
+- [x] Require all four observed EC2 fields in the release manifest schema and
+  cap read-only resources at exactly five; extend executable negative checks
+  for each missing field and an extra sixth resource.
+- [x] Move reusable EC2 Query parsing, manifest observation validation, state
+  mapping, XML escaping, and response building into the deep
+  `src/handlers/ec2.rs` protocol boundary while keeping route orchestration in
+  `src/serve.rs`.
+- [x] Add colocated EC2 handler tests for malformed/indexed Query members,
+  action validation, contradictory observations/tags/scopes, invalid state,
+  and XML escaping/state mapping; retain focused HTTP and CloudWatch tests.
+
+### Frozen Repair Results
+
+- Focused verification passed: `cargo fmt --all`, `cargo check`,
+  `cargo test -q --lib handlers::ec2::tests` (7 tests), EC2 and CloudWatch
+  API-contract filters (1 test each), wrapper routing filter (1 test), the
+  pinned executable schema validator with `--negative`, `bash -n` for both
+  verification scripts, and `git diff --check`.
+- The shell repair defaults qualification proof to the dedicated LocalStack
+  endpoint (`127.0.0.1:4666`) and fails closed when either account is not empty
+  before realization or when post-realization IDs/scope differ. A live Docker/
+  LocalStack run was not available to this worker; the parent must run the
+  isolated live proof. Shared `localstack-aws` was not touched.
+- The schema-only change does not alter fixture definition/manifest goldens or
+  the manifest digest.

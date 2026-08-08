@@ -6,7 +6,14 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${BIN:-$ROOT_DIR/target/debug/foxtail}"
 SOURCE_DB="${MOCK_DATA_DB:-$ROOT_DIR/mock_data.db}"
 PORT="${AWS_MOCK_VERIFY_PORT:-18080}"
-LOCALSTACK_ENDPOINT="${AWS_ENDPOINT_URL:-http://127.0.0.1:4566}"
+LOCALSTACK_ENDPOINT="${AWS_ENDPOINT_URL:-http://127.0.0.1:4666}"
+MANIFEST_ACCOUNT_ID="${FOXTAIL_MANIFEST_ACCOUNT_ID:-123456789012}"
+MANIFEST_ACCESS_KEY_ID="${FOXTAIL_MANIFEST_ACCESS_KEY_ID:-$MANIFEST_ACCOUNT_ID}"
+MANIFEST_SECRET_ACCESS_KEY="${FOXTAIL_MANIFEST_SECRET_ACCESS_KEY:-${MANIFEST_ACCOUNT_ID}-secret}"
+TEST_ACCESS_KEY_ID="${FOXTAIL_TEST_ACCESS_KEY_ID:-test}"
+TEST_SECRET_ACCESS_KEY="${FOXTAIL_TEST_SECRET_ACCESS_KEY:-test}"
+FOXTAIL_ACCESS_KEY_ID="${FOXTAIL_OBSERVATION_ACCESS_KEY_ID:-test}"
+FOXTAIL_SECRET_ACCESS_KEY="${FOXTAIL_OBSERVATION_SECRET_ACCESS_KEY:-test}"
 TMP_DIR="$(mktemp -d)"
 TMP_DB="$TMP_DIR/mock_data.db"
 SERVER_LOG="$TMP_DIR/server.log"
@@ -49,8 +56,12 @@ if [[ -z "${FOXTAIL_MUTATION_AMI_ID:-}" ]]; then
   exit 1
 fi
 export AWS_ENDPOINT_URL="$LOCALSTACK_ENDPOINT"
-if ! aws --output json --endpoint-url "$LOCALSTACK_ENDPOINT" ec2 describe-images \
-  --image-ids "$FOXTAIL_MUTATION_AMI_ID" >/dev/null 2>&1; then
+if ! AWS_ACCESS_KEY_ID="$MANIFEST_ACCESS_KEY_ID" \
+  AWS_SECRET_ACCESS_KEY="$MANIFEST_SECRET_ACCESS_KEY" \
+  AWS_SESSION_TOKEN="" AWS_SECURITY_TOKEN="" \
+  AWS_DEFAULT_REGION=us-east-1 AWS_PAGER="" \
+  aws --output json --endpoint-url "$LOCALSTACK_ENDPOINT" ec2 describe-images \
+    --image-ids "$FOXTAIL_MUTATION_AMI_ID" >/dev/null 2>&1; then
   echo "LocalStack EC2 endpoint is unavailable or FOXTAIL_MUTATION_AMI_ID is invalid: $LOCALSTACK_ENDPOINT" >&2
   exit 1
 fi
@@ -96,11 +107,6 @@ if ! curl -fsS "http://127.0.0.1:$PORT/_mock/status" >/dev/null 2>/dev/null; the
   exit 1
 fi
 
-export AWS_ACCESS_KEY_ID=test
-export AWS_SECRET_ACCESS_KEY=test
-export AWS_DEFAULT_REGION=us-east-1
-export AWS_PAGER=""
-
 ENDPOINT="http://127.0.0.1:$PORT"
 readarray -t VERIFY_DATES < <(python3 - <<'PY'
 from datetime import datetime, timedelta, timezone
@@ -122,12 +128,34 @@ FIXTURE_CW_END_TIME="${VERIFY_DATES[3]}"
 FIXTURE_CE_START_DAY="${VERIFY_DATES[4]%%T*}"
 FIXTURE_CE_END_DAY="${VERIFY_DATES[1]}"
 
-aws_json() {
-  aws --output json --endpoint-url "$ENDPOINT" "$@"
+aws_for_account() {
+  local access_key_id="$1"
+  local secret_access_key="$2"
+  shift 2
+  AWS_ACCESS_KEY_ID="$access_key_id" \
+    AWS_SECRET_ACCESS_KEY="$secret_access_key" \
+    AWS_SESSION_TOKEN="" \
+    AWS_SECURITY_TOKEN="" \
+    AWS_DEFAULT_REGION=us-east-1 \
+    AWS_PAGER="" \
+    aws --output json "$@"
 }
 
-localstack_json() {
-  aws --output json --endpoint-url "$LOCALSTACK_ENDPOINT" "$@"
+aws_json() {
+  # Foxtail's read-only observation surface is intentionally separate from
+  # the mutation LocalStack endpoint.
+  aws_for_account "$FOXTAIL_ACCESS_KEY_ID" "$FOXTAIL_SECRET_ACCESS_KEY" \
+    --endpoint-url "$ENDPOINT" "$@"
+}
+
+mutation_manifest_json() {
+  aws_for_account "$MANIFEST_ACCESS_KEY_ID" "$MANIFEST_SECRET_ACCESS_KEY" \
+    --endpoint-url "$LOCALSTACK_ENDPOINT" "$@"
+}
+
+mutation_test_json() {
+  aws_for_account "$TEST_ACCESS_KEY_ID" "$TEST_SECRET_ACCESS_KEY" \
+    --endpoint-url "$LOCALSTACK_ENDPOINT" "$@"
 }
 
 validate_mutation_document() {
@@ -143,6 +171,24 @@ validate_mutation_document() {
 }
 
 python3 "$ROOT_DIR/scripts/validate_release_fixture.py" --negative
+
+MANIFEST_EMPTY_BEFORE="$(mutation_manifest_json ec2 describe-instances)"
+TEST_EMPTY_BEFORE="$(mutation_test_json ec2 describe-instances)"
+MANIFEST_EMPTY_BEFORE="$MANIFEST_EMPTY_BEFORE" TEST_EMPTY_BEFORE="$TEST_EMPTY_BEFORE" python3 - <<'PY'
+import json
+import os
+
+for label in ("MANIFEST_EMPTY_BEFORE", "TEST_EMPTY_BEFORE"):
+    payload = json.loads(os.environ[label])
+    instances = [
+        instance
+        for reservation in payload.get("Reservations", [])
+        for instance in reservation.get("Instances", [])
+    ]
+    if instances:
+        raise SystemExit(f"fresh mutation account {label} was not empty before realization")
+PY
+log_step "Verified fresh mutation LocalStack is empty for manifest and default-test accounts"
 
 FIXTURE_DEFINITION="$(curl -fsS "$ENDPOINT/_mock/fixture/definition?version=release-qualification-v1")"
 FIXTURE_STATUS="$(curl -fsS "$ENDPOINT/_mock/fixture/status")"
@@ -217,6 +263,14 @@ if len(degraded["evidence"].get("cloudwatch_missing_offsets", [])) != 1:
 PY
 FIXTURE_REALIZATION_FILE="$TMP_DIR/fixture-realization.json"
 printf '%s\n' "$FIXTURE_REALIZATION" >"$FIXTURE_REALIZATION_FILE"
+REALIZED_MANIFEST_ACCOUNT_ID="$(FIXTURE_REALIZATION="$FIXTURE_REALIZATION" python3 -c '
+import json, os
+print(json.loads(os.environ["FIXTURE_REALIZATION"])["manifest"]["environment"]["account_id"])
+')"
+if [[ "$REALIZED_MANIFEST_ACCOUNT_ID" != "$MANIFEST_ACCOUNT_ID" ]]; then
+  echo "fixture manifest account $REALIZED_MANIFEST_ACCOUNT_ID differs from configured mutation account $MANIFEST_ACCOUNT_ID" >&2
+  exit 1
+fi
 log_step "Verified release fixture: realization manifest, digest, identities, and observed evidence"
 FIXTURE_STATUS_REALIZED="$(curl -fsS "$ENDPOINT/_mock/fixture/status")"
 FIXTURE_MANIFEST="$(curl -fsS "$ENDPOINT/_mock/fixture/manifest")"
@@ -313,9 +367,42 @@ for target in manifest["mutation_resources"]:
     )))
 PY
 )"
+MANIFEST_MUTATION_AFTER="$(mutation_manifest_json ec2 describe-instances)"
+TEST_MUTATION_AFTER="$(mutation_test_json ec2 describe-instances)"
+MANIFEST_MUTATION_AFTER="$MANIFEST_MUTATION_AFTER" TEST_MUTATION_AFTER="$TEST_MUTATION_AFTER" FIXTURE_REALIZATION="$FIXTURE_REALIZATION" python3 - <<'PY'
+import json
+import os
+
+manifest = json.loads(os.environ["FIXTURE_REALIZATION"])["manifest"]
+expected = {target["resource_id"] for target in manifest["mutation_resources"]}
+if len(expected) != 4:
+    raise SystemExit(f"fixture manifest did not declare exactly four mutation IDs: {expected}")
+
+manifest_payload = json.loads(os.environ["MANIFEST_MUTATION_AFTER"])
+manifest_instances = [
+    instance
+    for reservation in manifest_payload.get("Reservations", [])
+    for instance in reservation.get("Instances", [])
+]
+manifest_ids = {instance.get("InstanceId") for instance in manifest_instances}
+if manifest_ids != expected:
+    raise SystemExit(
+        f"manifest account did not expose exactly the four mutation IDs: {manifest_ids} != {expected}"
+    )
+
+test_payload = json.loads(os.environ["TEST_MUTATION_AFTER"])
+test_instances = [
+    instance
+    for reservation in test_payload.get("Reservations", [])
+    for instance in reservation.get("Instances", [])
+]
+if test_instances:
+    raise SystemExit("default test account unexpectedly exposed mutation instances")
+PY
+log_step "Verified manifest account owns exactly four mutation IDs and default test account owns none"
 while IFS=$'\t' read -r mutation_id target_kind setup_fault_kind control_id expected_state expected_type terminal_state terminal_type; do
   [[ -z "$mutation_id" ]] && continue
-  PUBLIC_INSTANCE="$(localstack_json ec2 describe-instances --instance-ids "$mutation_id")"
+  PUBLIC_INSTANCE="$(mutation_manifest_json ec2 describe-instances --instance-ids "$mutation_id")"
   PUBLIC_INSTANCE="$PUBLIC_INSTANCE" MUTATION_ID="$mutation_id" EXPECTED_STATE="$expected_state" EXPECTED_TYPE="$expected_type" python3 - <<'PY'
 import json
 import os
@@ -369,7 +456,7 @@ print(json.dumps(value))
     exit 1
   fi
   validate_mutation_document receipt "$FAULT_RECEIPT"
-  FAULT_PUBLIC="$(localstack_json ec2 describe-instances --instance-ids "$mutation_id")"
+  FAULT_PUBLIC="$(mutation_manifest_json ec2 describe-instances --instance-ids "$mutation_id")"
   FAULT_PUBLIC="$FAULT_PUBLIC" MUTATION_ID="$mutation_id" EXPECTED_STATE="$terminal_state" EXPECTED_TYPE="$terminal_type" python3 - <<'PY'
 import json
 import os
@@ -403,7 +490,7 @@ print(json.dumps(a))
     exit 1
   fi
   validate_mutation_document receipt "$RESET_RECEIPT"
-  RESET_PUBLIC="$(localstack_json ec2 describe-instances --instance-ids "$mutation_id")"
+  RESET_PUBLIC="$(mutation_manifest_json ec2 describe-instances --instance-ids "$mutation_id")"
   RESET_PUBLIC="$RESET_PUBLIC" MUTATION_ID="$mutation_id" EXPECTED_STATE="$expected_state" EXPECTED_TYPE="$expected_type" python3 - <<'PY'
 import json
 import os
@@ -461,7 +548,7 @@ while IFS= read -r old_arn; do
   old_public_file="$TMP_DIR/old-ec2-$old_id.json"
   old_error_file="$TMP_DIR/old-ec2-$old_id.err"
   set +e
-  localstack_json ec2 describe-instances --instance-ids "$old_id" >"$old_public_file" 2>"$old_error_file"
+  mutation_manifest_json ec2 describe-instances --instance-ids "$old_id" >"$old_public_file" 2>"$old_error_file"
   old_describe_status=$?
   set -e
   if [[ "$old_describe_status" -eq 0 ]]; then

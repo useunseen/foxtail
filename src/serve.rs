@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 use axum::{
     Json, Router,
     body::Bytes,
@@ -18,7 +18,7 @@ use tracing::{debug, info, warn};
 use crate::cli::Scenario;
 use crate::fixture;
 use crate::generator;
-use crate::handlers::{aws, cloudwatch as cw, cost_explorer as ce};
+use crate::handlers::{aws, cloudwatch as cw, cost_explorer as ce, ec2};
 use crate::metrics::{self, MetricQueryParams};
 
 const ADMIN_TOKEN_HEADER: &str = "x-mock-admin-token";
@@ -92,21 +92,6 @@ struct CloudWatchQuery {
     dim_value_2: Option<String>,
     statistics: Vec<String>,
     extended_statistics: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-struct Ec2Query {
-    action: String,
-    instance_ids: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-struct FixtureEc2Observation {
-    resource_id: String,
-    instance_state: String,
-    instance_type: String,
-    availability_zone: String,
-    tags: BTreeMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -1136,266 +1121,14 @@ fn extract_resource_id_from_query(query: &CloudWatchQuery) -> Option<String> {
     None
 }
 
-fn parse_ec2_query_from_form(body: &[u8]) -> std::result::Result<Ec2Query, String> {
-    let pairs: Vec<(String, String)> = serde_urlencoded::from_bytes(body)
-        .map_err(|error| format!("Failed to parse EC2 Query body: {error}"))?;
-    let mut action = None;
-    let mut instance_ids = BTreeMap::new();
-    for (key, value) in pairs {
-        match key.as_str() {
-            "Action" => action = Some(value),
-            key if key.starts_with("InstanceId.") => {
-                let index = key
-                    .strip_prefix("InstanceId.")
-                    .filter(|index| !index.is_empty())
-                    .and_then(|index| index.parse::<usize>().ok())
-                    .ok_or_else(|| format!("Invalid InstanceId member '{}'.", key))?;
-                if index == 0 {
-                    return Err(format!("Invalid InstanceId member '{}'.", key));
-                }
-                instance_ids.insert(index, value);
-            }
-            // AWS Query requests carry Version and may include filters. The
-            // read-only fixture surface only needs the identity selector;
-            // unsupported members are intentionally ignored here so ordinary
-            // CLI requests remain compatible.
-            _ => {}
-        }
-    }
-    Ok(Ec2Query {
-        action: action.ok_or_else(|| "Missing required field 'Action'.".to_string())?,
-        instance_ids: instance_ids.into_values().collect(),
-    })
-}
-
-fn query_action_from_form(body: &[u8]) -> Option<String> {
-    serde_urlencoded::from_bytes::<Vec<(String, String)>>(body)
-        .ok()
-        .and_then(|pairs| {
-            pairs
-                .into_iter()
-                .find_map(|(key, value)| (key == "Action").then_some(value))
-        })
-}
-
-fn parse_fixture_tags(value: Option<&Value>) -> Result<BTreeMap<String, String>> {
-    let object = value
-        .and_then(Value::as_object)
-        .ok_or_else(|| anyhow!("fixture EC2 observation tags are missing or malformed"))?;
-    object
-        .iter()
-        .map(|(key, value)| {
-            let value = value
-                .as_str()
-                .ok_or_else(|| anyhow!("fixture EC2 tag '{key}' is not a string"))?;
-            Ok((key.clone(), value.to_string()))
-        })
-        .collect()
-}
-
-async fn load_fixture_ec2_observations(
-    pool: &SqlitePool,
-) -> Result<(String, String, Vec<FixtureEc2Observation>)> {
+async fn load_fixture_ec2_observations(pool: &SqlitePool) -> Result<ec2::ManifestObservations> {
     let state = fixture::read_state(pool).await?;
     let manifest_bytes = state
         .manifest_bytes
         .ok_or_else(|| anyhow!("fixture has not been realized"))?;
     let manifest: Value = serde_json::from_slice(&manifest_bytes)
         .map_err(|error| anyhow!("persisted fixture manifest is not JSON: {error}"))?;
-    let environment = manifest
-        .get("environment")
-        .and_then(Value::as_object)
-        .ok_or_else(|| anyhow!("fixture manifest environment is missing"))?;
-    let account_id = environment
-        .get("account_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("fixture manifest account_id is missing"))?
-        .to_string();
-    let region = environment
-        .get("region")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("fixture manifest region is missing"))?
-        .to_string();
-    let anchor = manifest
-        .pointer("/clock/anchor")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("fixture manifest clock anchor is missing"))?
-        .to_string();
-    let resources = manifest
-        .get("resources")
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("fixture manifest resources are missing"))?;
-    if resources.len() != fixture::REALIZED_CONTROL_IDS.len() {
-        bail!(
-            "fixture manifest must expose exactly {} read-only EC2 resources; found {}",
-            fixture::REALIZED_CONTROL_IDS.len(),
-            resources.len()
-        );
-    }
-    let mutation_ids = manifest
-        .get("mutation_resources")
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("fixture manifest mutation_resources are missing or malformed"))?
-        .iter()
-        .filter_map(|resource| resource.get("resource_id").and_then(Value::as_str))
-        .collect::<BTreeSet<_>>();
-
-    let mut observations = Vec::with_capacity(resources.len());
-    let mut seen_ids = BTreeSet::new();
-    let mut seen_controls = BTreeSet::new();
-    for resource in resources {
-        if resource.get("resource_type").and_then(Value::as_str) != Some("ec2") {
-            bail!("fixture manifest contains a non-EC2 read-only resource");
-        }
-        let control_id = resource
-            .get("control_id")
-            .and_then(Value::as_str)
-            .filter(|control_id| fixture::REALIZED_CONTROL_IDS.contains(control_id))
-            .ok_or_else(|| anyhow!("fixture manifest contains an unknown read-only control"))?;
-        if !seen_controls.insert(control_id.to_string()) {
-            bail!("fixture manifest contains duplicate read-only control '{control_id}'");
-        }
-        let (expected_role, expected_scenario) = fixture::role_and_intent(control_id);
-        if resource.get("role").and_then(Value::as_str) != Some(expected_role)
-            || resource.get("scenario").and_then(Value::as_str) != Some(expected_scenario)
-        {
-            bail!("fixture manifest control '{control_id}' has contradictory role or scenario");
-        }
-        let resource_id = resource
-            .get("resource_id")
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())
-            .ok_or_else(|| anyhow!("fixture manifest resource_id is missing"))?
-            .to_string();
-        if !seen_ids.insert(resource_id.clone()) {
-            bail!("fixture manifest contains duplicate EC2 resource_id '{resource_id}'");
-        }
-        if mutation_ids.contains(resource_id.as_str()) {
-            bail!("fixture manifest exposes a mutation target on the read-only surface");
-        }
-        let expected_arn = format!("arn:aws:ec2:{region}:{account_id}:instance/{resource_id}");
-        if resource.get("aws_identity").and_then(Value::as_str) != Some(expected_arn.as_str()) {
-            bail!("fixture manifest EC2 identity for '{resource_id}' contradicts its scope");
-        }
-        let observed = resource
-            .get("observed")
-            .and_then(Value::as_object)
-            .ok_or_else(|| anyhow!("fixture manifest observed metadata is missing"))?;
-        let instance_state = observed
-            .get("instance_state")
-            .and_then(Value::as_str)
-            .filter(|state| !state.is_empty())
-            .ok_or_else(|| anyhow!("fixture manifest instance_state is missing"))?
-            .to_string();
-        if !matches!(
-            instance_state.as_str(),
-            "pending" | "running" | "stopped" | "shutting-down" | "terminated" | "stopping"
-        ) {
-            bail!("fixture manifest control '{control_id}' has an invalid instance state");
-        }
-        let instance_type = observed
-            .get("instance_type")
-            .and_then(Value::as_str)
-            .filter(|instance_type| !instance_type.is_empty())
-            .ok_or_else(|| anyhow!("fixture manifest instance_type is missing"))?
-            .to_string();
-        let availability_zone = observed
-            .get("availability_zone")
-            .and_then(Value::as_str)
-            .filter(|zone| !zone.is_empty())
-            .ok_or_else(|| anyhow!("fixture manifest availability_zone is missing"))?
-            .to_string();
-        if !availability_zone.starts_with(&region) {
-            bail!("fixture manifest control '{control_id}' has an out-of-scope availability zone");
-        }
-        let tags = parse_fixture_tags(observed.get("tags"))?;
-        let expected_tags = [
-            ("Name", resource_id.as_str()),
-            ("FoxtailFixture", fixture::FIXTURE_VERSION),
-            ("FoxtailControl", control_id),
-            ("FoxtailRole", expected_role),
-            ("FoxtailScenario", expected_scenario),
-        ];
-        if expected_tags
-            .iter()
-            .any(|(key, expected)| tags.get(*key).map(String::as_str) != Some(*expected))
-        {
-            bail!("fixture manifest control '{control_id}' has contradictory fixture tags");
-        }
-        observations.push(FixtureEc2Observation {
-            resource_id,
-            instance_state,
-            instance_type,
-            availability_zone,
-            tags,
-        });
-    }
-    let expected_controls = fixture::REALIZED_CONTROL_IDS
-        .into_iter()
-        .map(str::to_string)
-        .collect::<BTreeSet<_>>();
-    if seen_controls != expected_controls {
-        bail!("fixture manifest read-only controls are missing or extra");
-    }
-    Ok((account_id, anchor, observations))
-}
-
-fn xml_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
-
-fn ec2_state_code(state: &str) -> &'static str {
-    match state {
-        "pending" => "0",
-        "running" => "16",
-        "shutting-down" => "32",
-        "terminated" => "48",
-        "stopping" => "64",
-        "stopped" => "80",
-        _ => "0",
-    }
-}
-
-fn ec2_describe_xml(
-    account_id: &str,
-    anchor: &str,
-    observations: &[FixtureEc2Observation],
-) -> String {
-    let mut xml = String::from(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<DescribeInstancesResponse xmlns=\"http://ec2.amazonaws.com/doc/2016-11-15/\"><requestId>foxtail-fixture</requestId><reservationSet><item><reservationId>r-foxtail-fixture</reservationId><ownerId>",
-    );
-    xml.push_str(&xml_escape(account_id));
-    xml.push_str("</ownerId><groupSet/><instancesSet>");
-    for observation in observations {
-        xml.push_str("<item><instanceId>");
-        xml.push_str(&xml_escape(&observation.resource_id));
-        xml.push_str("</instanceId><imageId>ami-foxtail-fixture</imageId><instanceState><code>");
-        xml.push_str(ec2_state_code(&observation.instance_state));
-        xml.push_str("</code><name>");
-        xml.push_str(&xml_escape(&observation.instance_state));
-        xml.push_str("</name></instanceState><instanceType>");
-        xml.push_str(&xml_escape(&observation.instance_type));
-        xml.push_str("</instanceType><launchTime>");
-        xml.push_str(&xml_escape(anchor));
-        xml.push_str("</launchTime><placement><availabilityZone>");
-        xml.push_str(&xml_escape(&observation.availability_zone));
-        xml.push_str("</availabilityZone><tenancy>default</tenancy></placement><monitoring><state>disabled</state></monitoring><tagSet>");
-        for (key, value) in &observation.tags {
-            xml.push_str("<item><key>");
-            xml.push_str(&xml_escape(key));
-            xml.push_str("</key><value>");
-            xml.push_str(&xml_escape(value));
-            xml.push_str("</value></item>");
-        }
-        xml.push_str("</tagSet></item>");
-    }
-    xml.push_str("</instancesSet></item></reservationSet></DescribeInstancesResponse>");
-    xml
+    ec2::observations_from_manifest(&manifest)
 }
 
 fn parse_cloudwatch_query_from_form(body: &[u8]) -> std::result::Result<CloudWatchQuery, String> {
@@ -2782,7 +2515,7 @@ async fn dispatch_aws_request(
     } else if target.starts_with("GraniteServiceVersion20100801.") {
         handle_cloudwatch_json(target, pool, body, protocol, injected_now).await
     } else if target.is_empty() && content_type.contains("application/x-www-form-urlencoded") {
-        if query_action_from_form(&body).as_deref() == Some("DescribeInstances") {
+        if ec2::action_from_form(&body).as_deref() == Some("DescribeInstances") {
             handle_ec2_query(pool, body, protocol).await
         } else {
             handle_cloudwatch_query(pool, body, protocol, injected_now).await
@@ -2806,8 +2539,8 @@ async fn handle_ec2_query(
     body: Bytes,
     protocol: Protocol,
 ) -> axum::response::Response {
-    let query = match parse_ec2_query_from_form(&body) {
-        Ok(query) if query.action == "DescribeInstances" => query,
+    let query = match ec2::parse_query_from_form(&body) {
+        Ok(query) if ec2::validate_describe_instances(&query).is_ok() => query,
         Ok(query) => {
             return error_response(
                 protocol,
@@ -2825,7 +2558,11 @@ async fn handle_ec2_query(
             );
         }
     };
-    let (account_id, anchor, observations) = match load_fixture_ec2_observations(&pool).await {
+    let ec2::ManifestObservations {
+        account_id,
+        anchor,
+        observations,
+    } = match load_fixture_ec2_observations(&pool).await {
         Ok(value) => value,
         Err(error) => {
             let message = error.to_string();
@@ -2859,7 +2596,7 @@ async fn handle_ec2_query(
         }
         selected
     };
-    let xml = ec2_describe_xml(&account_id, &anchor, &selected);
+    let xml = ec2::describe_instances_xml(&account_id, &anchor, &selected);
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/xml; charset=utf-8")],
