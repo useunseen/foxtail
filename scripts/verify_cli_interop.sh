@@ -17,6 +17,7 @@ FOXTAIL_SECRET_ACCESS_KEY="${FOXTAIL_OBSERVATION_SECRET_ACCESS_KEY:-test}"
 TMP_DIR="$(mktemp -d)"
 TMP_DB="$TMP_DIR/mock_data.db"
 SERVER_LOG="$TMP_DIR/server.log"
+SOURCE_REVISION="${FOXTAIL_SOURCE_REVISION:-}"
 
 log_step() {
   echo "[verify-cli] $*"
@@ -55,6 +56,11 @@ if [[ -z "${FOXTAIL_MUTATION_AMI_ID:-}" ]]; then
   echo "FOXTAIL_MUTATION_AMI_ID must name a valid disposable LocalStack AMI" >&2
   exit 1
 fi
+if [[ ! "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "FOXTAIL_SOURCE_REVISION must be the exact 40-character source commit" >&2
+  exit 1
+fi
+export FOXTAIL_SOURCE_REVISION="$SOURCE_REVISION"
 export AWS_ENDPOINT_URL="$LOCALSTACK_ENDPOINT"
 if ! AWS_ACCESS_KEY_ID="$MANIFEST_ACCESS_KEY_ID" \
   AWS_SECRET_ACCESS_KEY="$MANIFEST_SECRET_ACCESS_KEY" \
@@ -225,7 +231,7 @@ FIXTURE_REALIZATION="$(curl -fsS -X POST "$ENDPOINT/_mock/fixture/realize" \
 # Calling fixture realize again is intentionally rejected once this
 # authority-bound generation exists; CLI/HTTP parity is checked through the
 # supported persisted status/manifest/identity surfaces below.
-FIXTURE_REALIZATION="$FIXTURE_REALIZATION" python3 - <<'PY'
+FIXTURE_REALIZATION="$FIXTURE_REALIZATION" FOXTAIL_SOURCE_REVISION="$SOURCE_REVISION" python3 - <<'PY'
 import json
 import os
 
@@ -235,6 +241,8 @@ if manifest.get("schema") != "foxtail.release-fixture-manifest/v1":
     raise SystemExit("fixture manifest schema mismatch")
 if payload.get("manifest_digest") != manifest.get("digest"):
     raise SystemExit("fixture manifest digest mismatch")
+if manifest.get("generator", {}).get("source_revision") != os.environ["FOXTAIL_SOURCE_REVISION"]:
+    raise SystemExit("fixture manifest source revision mismatch")
 resources = manifest.get("resources", [])
 if len(resources) != 5:
     raise SystemExit("fixture realization did not publish five realized controls")

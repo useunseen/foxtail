@@ -4141,6 +4141,10 @@ mod tests {
         let (canonical, digest) = validate_document(&value, "digest").unwrap();
         assert_eq!(canonical, bytes.strip_suffix(b"\n").unwrap_or(bytes));
         assert_eq!(value["digest"], digest);
+        assert_eq!(
+            value["generator"]["source_revision"],
+            "91c5daac1b331c28a63d43d4ccf9c326aa699738"
+        );
         assert_eq!(value["resources"].as_array().unwrap().len(), 5);
     }
 
@@ -4178,8 +4182,11 @@ mod tests {
         .unwrap();
         let golden = include_bytes!("../tests/fixtures/release-qualification-v1.manifest.json");
         let golden = golden.strip_suffix(b"\n").unwrap_or(golden);
-        assert_eq!(snapshot.manifest_bytes, golden);
-        let manifest: Value = serde_json::from_slice(&snapshot.manifest_bytes).unwrap();
+        let expected: Value = serde_json::from_slice(golden).unwrap();
+        let mut manifest: Value = serde_json::from_slice(&snapshot.manifest_bytes).unwrap();
+        manifest["generator"]["source_revision"] = expected["generator"]["source_revision"].clone();
+        manifest["digest"] = json!(canonical_digest(&manifest).unwrap());
+        assert_eq!(canonical_bytes(&manifest).unwrap(), golden);
         assert!(validate_policy_fields(&manifest, "$").is_ok());
         pool.close().await;
     }
