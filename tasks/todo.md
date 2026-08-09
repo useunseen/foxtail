@@ -363,14 +363,17 @@ handler validates those facts before serving Query/XML observations.
   `AwsCompatibleObservationPort.observe()` proof also passed against a
   temporary Foxtail server and fresh LocalStack account `222222222222`
   (five controls with five attribute and five compatibility responses).
-  The exact-head disposable CLI rerun with fresh namespaces `333333333333`
-  (manifest CLI account) and `444444444444` (test account), plus AMI
-  `ami-eks-k3d-1.36-amd64`, passed both freshness gates but stopped at fixture
-  realization with HTTP 422 because Foxtail's authoritative mutation backend
-  remains bound to account `123456789012`, whose shared state is stale. The
-  fresh accounts remained empty after the run; no direct account-123 cleanup
-  was performed. An isolated LocalStack container fallback was unavailable
-  because no authorized license token was present.
+  The exact-head disposable CLI proof subsequently passed end-to-end against
+  a fresh no-volume `localstack/localstack:4.14.0` community container on
+  `:4667`, using authoritative account `123456789012`, test account
+  `444444444444`, and valid AMI `ami-03cf127a`. It covered the complete
+  existing fault/reset/recreate/destroy lifecycle plus exact attribute/type
+  successes, all public type fields, deterministic negatives, and endpoint
+  separation. Afterward account `123456789012` had no active instances (only
+  expected terminated tombstones) and account `444444444444` was empty; the
+  uniquely named container was stopped, removed, and verified absent. The
+  earlier shared-Pro account-123 422 is retained only as historical context
+  and is superseded by this isolated proof.
 
 ## Scenario Data Quality Verification
 
