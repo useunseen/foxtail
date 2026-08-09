@@ -355,18 +355,22 @@ handler validates those facts before serving Query/XML observations.
   that exact hash.
 - Frozen-head repair status: `DescribeInstances` again preserves the base
   parser's ignored filters/pagination-like/unknown members, while the two new
-  observation actions remain strict; parser models now use full action names;
-  unknown instance-type errors use `InvalidInstanceType`; and CLI type checks
-  derive every requested type and public field from the realized catalogue.
-  Focused and broad local proofs passed. The exact sibling
+  observation actions remain strict and accept only standard `InstanceType.N`
+  members; parser models now use full action names without redundant action or
+  attribute state; unknown instance-type errors use `InvalidInstanceType`; and
+  CLI type checks derive every requested type and public field from the realized
+  catalogue. Focused and broad local proofs passed. The exact sibling
   `AwsCompatibleObservationPort.observe()` proof also passed against a
   temporary Foxtail server and fresh LocalStack account `222222222222`
   (five controls with five attribute and five compatibility responses).
-  A fresh rerun of the full disposable CLI script was blocked by stale
-  resources in the shared LocalStack account `123456789012`; the script's
-  freshness gate stopped before mutation, and the attempted isolated
-  container lacked an authorized LocalStack license token. The shared
-  container and account were not modified.
+  The exact-head disposable CLI rerun with fresh namespaces `333333333333`
+  (manifest CLI account) and `444444444444` (test account), plus AMI
+  `ami-eks-k3d-1.36-amd64`, passed both freshness gates but stopped at fixture
+  realization with HTTP 422 because Foxtail's authoritative mutation backend
+  remains bound to account `123456789012`, whose shared state is stale. The
+  fresh accounts remained empty after the run; no direct account-123 cleanup
+  was performed. An isolated LocalStack container fallback was unavailable
+  because no authorized license token was present.
 
 ## Scenario Data Quality Verification
 

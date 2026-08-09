@@ -2623,7 +2623,7 @@ async fn handle_ec2_query(
                     StatusCode::BAD_REQUEST,
                 );
             };
-            let xml = ec2::describe_instance_attribute_xml(observation, &query);
+            let xml = ec2::describe_instance_attribute_xml(observation, &query.instance_id);
             (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "text/xml; charset=utf-8")],

@@ -8,14 +8,12 @@ use crate::fixture;
 /// observation surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DescribeInstancesQuery {
-    pub action: String,
     pub instance_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DescribeInstanceAttributeQuery {
     pub instance_id: String,
-    pub attribute: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,11 +79,6 @@ pub fn parse_ec2_query_from_form(body: &[u8]) -> std::result::Result<Ec2Query, S
 fn parse_legacy_describe_instances(
     pairs: &[(String, String)],
 ) -> std::result::Result<Ec2Query, String> {
-    let action = pairs
-        .iter()
-        .filter_map(|(key, value)| (key == "Action").then_some(value.clone()))
-        .next_back()
-        .ok_or_else(|| "Missing required field 'Action'.".to_string())?;
     let mut instance_ids = BTreeMap::new();
     for (key, value) in pairs {
         if key.starts_with("InstanceId.") {
@@ -93,7 +86,6 @@ fn parse_legacy_describe_instances(
         }
     }
     Ok(Ec2Query::DescribeInstances(DescribeInstancesQuery {
-        action,
         instance_ids: contiguous_members(instance_ids, "InstanceId")?,
     }))
 }
@@ -117,8 +109,8 @@ fn parse_strict_ec2_query(pairs: &[(String, String)]) -> std::result::Result<Ec2
             key if key.starts_with("InstanceId.") => {
                 insert_member(&mut instance_ids, key, value.clone(), "InstanceId")?
             }
-            key if key.starts_with("InstanceType.") || key.starts_with("InstanceTypes.") => {
-                insert_member_any_prefix(&mut instance_types, key, value.clone(), "InstanceType")?
+            key if key.starts_with("InstanceType.") => {
+                insert_member(&mut instance_types, key, value.clone(), "InstanceType")?
             }
             _ => return Err(format!("Unsupported EC2 Query member '{key}'.")),
         }
@@ -137,7 +129,6 @@ fn parse_strict_ec2_query(pairs: &[(String, String)]) -> std::result::Result<Ec2
             }
             let instance_ids = contiguous_members(instance_ids, "InstanceId")?;
             Ok(Ec2Query::DescribeInstances(DescribeInstancesQuery {
-                action,
                 instance_ids,
             }))
         }
@@ -155,10 +146,7 @@ fn parse_strict_ec2_query(pairs: &[(String, String)]) -> std::result::Result<Ec2
                 return Err(format!("The attribute '{attribute}' is not supported."));
             }
             Ok(Ec2Query::DescribeInstanceAttribute(
-                DescribeInstanceAttributeQuery {
-                    instance_id,
-                    attribute,
-                },
+                DescribeInstanceAttributeQuery { instance_id },
             ))
         }
         "DescribeInstanceTypes" => {
@@ -209,27 +197,6 @@ fn insert_member(
         return Err(format!("Invalid {name} member '{key}'."));
     }
     if members.insert(index, value).is_some() {
-        return Err(format!("Duplicate {name} member '{key}'."));
-    }
-    Ok(())
-}
-
-fn insert_member_any_prefix(
-    members: &mut BTreeMap<usize, String>,
-    key: &str,
-    value: String,
-    name: &str,
-) -> std::result::Result<(), String> {
-    let suffix = key
-        .strip_prefix("InstanceType.")
-        .or_else(|| key.strip_prefix("InstanceTypes."))
-        .filter(|index| !index.is_empty())
-        .and_then(|index| index.parse::<usize>().ok())
-        .ok_or_else(|| format!("Invalid {name} member '{key}'."))?;
-    if suffix == 0 {
-        return Err(format!("Invalid {name} member '{key}'."));
-    }
-    if members.insert(suffix, value).is_some() {
         return Err(format!("Duplicate {name} member '{key}'."));
     }
     Ok(())
@@ -591,10 +558,7 @@ pub fn describe_instances_xml(
     xml
 }
 
-pub fn describe_instance_attribute_xml(
-    observation: &Observation,
-    query: &DescribeInstanceAttributeQuery,
-) -> String {
+pub fn describe_instance_attribute_xml(observation: &Observation, instance_id: &str) -> String {
     let value = if observation.disable_api_termination {
         "true"
     } else {
@@ -602,7 +566,7 @@ pub fn describe_instance_attribute_xml(
     };
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<DescribeInstanceAttributeResponse xmlns=\"http://ec2.amazonaws.com/doc/2016-11-15/\"><requestId>foxtail-fixture</requestId><instanceId>{}</instanceId><disableApiTermination><value>{value}</value></disableApiTermination></DescribeInstanceAttributeResponse>",
-        xml_escape(&query.instance_id)
+        xml_escape(instance_id)
     )
 }
 
@@ -866,7 +830,6 @@ mod tests {
         assert_eq!(
             query,
             Ec2Query::DescribeInstances(DescribeInstancesQuery {
-                action: "DescribeInstances".to_string(),
                 instance_ids: vec!["i-1".to_string(), "i-2".to_string()]
             })
         );
@@ -881,7 +844,6 @@ mod tests {
         assert_eq!(
             query,
             Ec2Query::DescribeInstances(DescribeInstancesQuery {
-                action: "DescribeInstances".to_string(),
                 instance_ids: vec!["i-1".to_string()],
             })
         );
@@ -931,6 +893,7 @@ mod tests {
             b"Action=DescribeInstanceTypes&InstanceType.2=m6i.large",
             b"Action=DescribeInstanceTypes&InstanceType.1=m6i.large&InstanceType.2=m6i.large",
             b"Action=DescribeInstanceTypes&InstanceType.1=m6i.large&NextToken=opaque",
+            b"Action=DescribeInstanceTypes&InstanceTypes.1=m6i.large",
         ] {
             assert!(parse_ec2_query_from_form(body).is_err());
         }
@@ -946,11 +909,7 @@ mod tests {
             availability_zone: "us-east-1a".to_string(),
             tags: BTreeMap::new(),
         };
-        let query = super::DescribeInstanceAttributeQuery {
-            instance_id: "i-1".to_string(),
-            attribute: "disableApiTermination".to_string(),
-        };
-        let attribute_xml = describe_instance_attribute_xml(&observation, &query);
+        let attribute_xml = describe_instance_attribute_xml(&observation, "i-1");
         assert!(attribute_xml.contains("<instanceId>i-1</instanceId>"));
         assert!(attribute_xml.contains("<disableApiTermination><value>true</value>"));
         let type_xml = describe_instance_types_xml(&[super::InstanceTypeObservation {

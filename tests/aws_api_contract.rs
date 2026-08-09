@@ -194,6 +194,7 @@ async fn ec2_oracle_observation_routes_bind_exact_fixture_facts_and_fail_closed(
         "Action=DescribeInstanceTypes&InstanceType.1=t3.unknown",
         "Action=DescribeInstanceTypes&InstanceType.1=t3.medium&InstanceType.2=t3.medium",
         "Action=DescribeInstanceTypes&InstanceType.1=t3.medium&NextToken=unsupported",
+        "Action=DescribeInstanceTypes&InstanceTypes.1=m6i.large",
     ] {
         let response = app
             .clone()
