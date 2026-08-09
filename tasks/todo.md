@@ -1205,5 +1205,7 @@ also passed. The temporary LocalStack container and databases were removed.
   (all fixture/EC2 observation, mutation lifecycle, CloudWatch, Cost Explorer,
   Resource Groups, Pricing, Compute Optimizer, CUR, and wrapper checks); the
   container, service, and temporary database were removed.
-- [x] Final checked-out HEAD is `86fdd590a2c85a7937a0a522bf717a026cb4b712`
-  with a clean worktree.
+- [x] Focused public-contract test commit `192e1f1` asserts every realized
+  `DescribeInstances` row carries all three neutral classification tags.
+- [x] Final checked-out HEAD is
+  `192e1f14892609c40622d6fa06e4697f2c089d96` with a clean worktree.
