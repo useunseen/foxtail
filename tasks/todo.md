@@ -1209,3 +1209,56 @@ also passed. The temporary LocalStack container and databases were removed.
   `DescribeInstances` row carries all three neutral classification tags.
 - [x] The final checked-out worktree is clean after the commits above; the
   exact current HEAD is reported in the handoff below.
+
+## Issue #16 final review repair (third batch)
+
+- [x] The verifier now consumes both canonical
+  `generation_rules.network_profile.network_in_base` and
+  `network_out_base`, applies the shared per-day increment independently to
+  `NetworkIn` and `NetworkOut`, and fails closed for missing, malformed, or
+  collapsed bases. Its self-test proves the distinct canonical surfaces and
+  checks missing/drifting `network_out_base` without importing production
+  policy.
+- [x] Neutral `Owner`, `Criticality`, and `Environment` facts now have one
+  fixture-owned `NEUTRAL_OBSERVATION_TAGS` source reused by realization,
+  EC2-manifest validation, and the public contract test. The realized bytes
+  remain unchanged apart from the separately pinned source revision.
+- [x] Functional repair commit: `8606baa13c3d8d38d5634aec4c6ccf387dcc28b8`.
+  Separate source-revision/golden pin commit:
+  `ed71dc45158c475733103cb7767b7b975cb59dae` naming that full
+  functional revision. Definition digest remains
+  `sha256:aad7cc86551a2e60ec37942cc801293bf61c952fa7bda4f1b5481e58cb9cbcdf`;
+  the source-pinned manifest digest is
+  `sha256:e4d59f1938819a27f2695f4bab51aa5958ebb8edb67f7b2c7338e32a2098197a`.
+- [x] Focused gates passed: `python3 scripts/verify_issue16_unseen.py
+  --self-test` reported distinct `10000.0`/`20000.0` network bases,
+  `python3 -m py_compile scripts/verify_issue16_unseen.py`, exact archived
+  f4c5 boundary proof (`4.0` -> one `idle_instance` finding;
+  `5.0` -> `inventory_observation`/no finding), `cargo fmt --all -- --check`,
+  `cargo test` (94 library, 6 API-contract, 20 mutation, 4 wrapper, and doc
+  tests), `cargo clippy --all-targets --all-features -- -D warnings`, Draft
+  2020-12 validator with negatives, both shell syntax checks, wrapper routing,
+  and `git diff --check`.
+- [x] Unmodified live proof passed against the disposable Foxtail `:18086`
+  and LocalStack `:4666` pair using the exact archived f4c5 source. Outcomes
+  were idle positive `finding`, idle negative `no_finding`, degraded `blocked`
+  only for `incomplete_window:ec2-idle-degraded-001`, resize positive
+  `finding`, and resize negative `no_finding`; complete controls had empty
+  blocker arrays. The receipt reported exactly
+  `read_only_estate_fingerprint_mismatch` and `estate_fingerprint_mismatch`,
+  plus the intentional degraded/oracle blockers, and left the live manifest
+  unmodified. Captured runtime manifest digest was
+  `sha256:f9ce24190e5e9d3df6622f2a6575b87c30436463c24df0cc5785a5c6a569f4cd`.
+- [x] Full disposable `scripts/verify_cli_interop.sh` passed against a fresh
+  dedicated LocalStack 4.14.0 container on `127.0.0.1:4666` with AMI
+  `ami-760aaa0f`, proving fixture realization/CLI-HTTP parity, EC2
+  observations and negatives, DescribeInstanceAttribute/Types, mutation
+  lifecycle and cleanup, Resource Groups, CloudWatch, Cost Explorer,
+  Compute Optimizer, Pricing, CUR, and wrapper routing. The container,
+  service, temporary seed database, and proof directories were removed.
+- [x] Final source pin/golden commit is
+  `ed71dc45158c475733103cb7767b7b975cb59dae`, naming functional
+  `8606baa13c3d8d38d5634aec4c6ccf387dcc28b8`; definition digest remains
+  `sha256:aad7cc86551a2e60ec37942cc801293bf61c952fa7bda4f1b5481e58cb9cbcdf`
+  and source-pinned manifest digest is
+  `sha256:e4d59f1938819a27f2695f4bab51aa5958ebb8edb67f7b2c7338e32a2098197a`.
