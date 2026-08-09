@@ -11,3 +11,23 @@
 ## 2026-05-13
 
 - When a Make target should recover from a missing local binary, depend on the binary file path rather than a phony `build` target if the desired behavior is "build only when absent."
+
+## 2026-08-09
+
+- A verification harness must never rewrite or re-digest a committed consumer
+  manifest to make a cross-repository receipt ready; preserve the exact
+  contract, report the downstream fingerprint/source-refresh blocker, and leave
+  contract refresh ownership with the consumer repository.
+
+- A cross-repository boundary verifier must consume canonical fixture tags and
+  evidence formulas directly. If a downstream adapter needs classification
+  fields, add neutral fixture-owned public facts and make missing values fail
+  closed; never invent them in the verifier or reconstruct timestamps/costs
+  from unrelated constants.
+
+- Keep verifier projections one-to-one with fixture-owned evidence surfaces:
+  distinct `NetworkIn`/`NetworkOut` bases must remain distinct canonical
+  inputs, and shared neutral public facts belong to one fixture-owned source
+  reused by realization, validation, and contract tests. A self-test should
+  reject missing or collapsed surfaces before any cross-repository assessor is
+  invoked.

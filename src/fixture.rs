@@ -53,6 +53,14 @@ pub const DEFAULT_ACCOUNT_ID: &str = "123456789012";
 pub const DEFAULT_REGION: &str = "us-east-1";
 pub const DEFAULT_LOCALSTACK_ENDPOINT: &str = "http://localhost:4566";
 pub const EC2_INSTANCE_TYPE_CATALOGUE: [&str; 3] = ["m6i.large", "t3.medium", "m6i.xlarge"];
+/// Neutral classification facts required on the ordinary EC2 observation
+/// surface. These values deliberately carry no fixture role, expected
+/// outcome, or policy hint.
+pub const NEUTRAL_OBSERVATION_TAGS: [(&str, &str); 3] = [
+    ("Owner", "unknown"),
+    ("Criticality", "unknown"),
+    ("Environment", "unknown"),
+];
 /// Mutating fixture controls are deliberately opt-in. A caller must set this
 /// to `isolated` before a mutation can affect fixture-owned rows.
 pub const ISOLATED_QUALIFICATION_ENV: &str = "FOXTAIL_QUALIFICATION_ENV";
@@ -96,7 +104,7 @@ struct MaterializationProfile {
 const MATERIALIZATION_PROFILES: [MaterializationProfile; 5] = [
     MaterializationProfile {
         control_id: "ec2-idle-positive-001",
-        cpu_value: 5.0,
+        cpu_value: 4.0,
         cost_amount: 1.0,
         missing_cpu_day: None,
     },
@@ -3856,6 +3864,12 @@ fn observation_tags(
     tags.insert("FoxtailControl".to_string(), control_id.to_string());
     tags.insert("FoxtailRole".to_string(), role.to_string());
     tags.insert("FoxtailScenario".to_string(), scenario.to_string());
+    // Neutral classification facts are ordinary public evidence required by
+    // downstream adapters. They intentionally carry no fixture role,
+    // expected outcome, or policy hint.
+    for (key, value) in NEUTRAL_OBSERVATION_TAGS {
+        tags.insert(key.to_string(), value.to_string());
+    }
     tags
 }
 
@@ -4366,7 +4380,7 @@ mod tests {
         assert_eq!(value["digest"], digest);
         assert_eq!(
             value["generator"]["source_revision"],
-            "cbb8bf5e422b0fd1284e9474db6cf9117a034e19"
+            "8606baa13c3d8d38d5634aec4c6ccf387dcc28b8"
         );
         assert_eq!(
             value["environment"]["estate_fingerprint"],
@@ -4422,6 +4436,15 @@ mod tests {
         let golden = golden.strip_suffix(b"\n").unwrap_or(golden);
         let expected: Value = serde_json::from_slice(golden).unwrap();
         let mut manifest: Value = serde_json::from_slice(&snapshot.manifest_bytes).unwrap();
+        let positive = manifest["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|resource| resource["control_id"] == "ec2-idle-positive-001")
+            .unwrap();
+        assert_eq!(positive["observed"]["average_cpu"], json!(4.0));
+        assert_eq!(positive["observed"]["metric_count"], json!(42));
+        assert_eq!(positive["observed"]["cost_record_count"], json!(14));
         manifest["generator"]["source_revision"] = expected["generator"]["source_revision"].clone();
         manifest["digest"] = json!(canonical_digest(&manifest).unwrap());
         assert_eq!(canonical_bytes(&manifest).unwrap(), golden);

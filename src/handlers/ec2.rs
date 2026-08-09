@@ -355,13 +355,14 @@ pub fn observations_from_manifest(manifest: &Value) -> Result<ManifestObservatio
             bail!("fixture manifest control '{control_id}' has an out-of-scope availability zone");
         }
         let tags = parse_tags(observed.get("tags"))?;
-        let expected_tags = [
+        let mut expected_tags = vec![
             ("Name", resource_id.as_str()),
             ("FoxtailFixture", fixture::FIXTURE_VERSION),
             ("FoxtailControl", control_id),
             ("FoxtailRole", expected_role),
             ("FoxtailScenario", expected_scenario),
         ];
+        expected_tags.extend(fixture::NEUTRAL_OBSERVATION_TAGS);
         if expected_tags
             .iter()
             .any(|(key, expected)| tags.get(*key).map(String::as_str) != Some(*expected))
@@ -525,13 +526,48 @@ pub fn describe_instances_xml(
     account_id: &str,
     anchor: &str,
     observations: &[Observation],
-) -> String {
+    instance_type_catalogue: &[InstanceTypeObservation],
+) -> Result<String> {
     let mut xml = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<DescribeInstancesResponse xmlns=\"http://ec2.amazonaws.com/doc/2016-11-15/\"><requestId>foxtail-fixture</requestId><reservationSet><item><reservationId>r-foxtail-fixture</reservationId><ownerId>",
     );
     xml.push_str(&xml_escape(account_id));
     xml.push_str("</ownerId><groupSet/><instancesSet>");
     for observation in observations {
+        let catalogue = instance_type_catalogue
+            .iter()
+            .find(|item| item.instance_type == observation.instance_type)
+            .ok_or_else(|| {
+                anyhow!(
+                    "EC2 instance type '{}' is missing from the fixture catalogue",
+                    observation.instance_type
+                )
+            })?;
+        let root_device_type = singleton_catalogue_fact(
+            &catalogue.supported_root_device_types,
+            "supported_root_device_types",
+            &observation.instance_type,
+        )?;
+        let virtualization_type = singleton_catalogue_fact(
+            &catalogue.supported_virtualization_types,
+            "supported_virtualization_types",
+            &observation.instance_type,
+        )?;
+        let architecture = singleton_catalogue_fact(
+            &catalogue.supported_architectures,
+            "supported_architectures",
+            &observation.instance_type,
+        )?;
+        let ena_support = match catalogue.ena_support.as_str() {
+            "required" | "supported" => "true",
+            "unsupported" => "false",
+            _ => {
+                bail!(
+                    "EC2 instance type '{}' has an invalid fixture ENA fact",
+                    observation.instance_type
+                )
+            }
+        };
         xml.push_str("<item><instanceId>");
         xml.push_str(&xml_escape(&observation.resource_id));
         xml.push_str("</instanceId><imageId>ami-foxtail-fixture</imageId><instanceState><code>");
@@ -540,7 +576,19 @@ pub fn describe_instances_xml(
         xml.push_str(&xml_escape(&observation.instance_state));
         xml.push_str("</name></instanceState><instanceType>");
         xml.push_str(&xml_escape(&observation.instance_type));
-        xml.push_str("</instanceType><launchTime>");
+        // Keep the ordinary EC2 identity/configuration projection complete
+        // enough for consumers to reconcile compatibility from public
+        // DescribeInstances facts. These values come from the fixture-owned
+        // catalogue, not an assessor or finding policy.
+        xml.push_str("</instanceType><rootDeviceType>");
+        xml.push_str(&xml_escape(root_device_type));
+        xml.push_str("</rootDeviceType><architecture>");
+        xml.push_str(&xml_escape(architecture));
+        xml.push_str("</architecture><virtualizationType>");
+        xml.push_str(&xml_escape(virtualization_type));
+        xml.push_str("</virtualizationType><enaSupport>");
+        xml.push_str(ena_support);
+        xml.push_str("</enaSupport><networkInterfaceSet/><blockDeviceMapping/><launchTime>");
         xml.push_str(&xml_escape(anchor));
         xml.push_str("</launchTime><placement><availabilityZone>");
         xml.push_str(&xml_escape(&observation.availability_zone));
@@ -555,7 +603,22 @@ pub fn describe_instances_xml(
         xml.push_str("</tagSet></item>");
     }
     xml.push_str("</instancesSet></item></reservationSet></DescribeInstancesResponse>");
-    xml
+    Ok(xml)
+}
+
+fn singleton_catalogue_fact<'a>(
+    values: &'a [String],
+    field: &str,
+    instance_type: &str,
+) -> Result<&'a str> {
+    if values.len() != 1 || values[0].is_empty() {
+        bail!(
+            "EC2 instance type '{}' has inconsistent fixture {} facts",
+            instance_type,
+            field
+        );
+    }
+    Ok(values[0].as_str())
 }
 
 pub fn describe_instance_attribute_xml(observation: &Observation, instance_id: &str) -> String {
@@ -627,8 +690,8 @@ fn xml_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DescribeInstanceTypesQuery, DescribeInstancesQuery, Ec2Query, ManifestObservations,
-        Observation, action_from_form, describe_instance_attribute_xml,
+        DescribeInstanceTypesQuery, DescribeInstancesQuery, Ec2Query, InstanceTypeObservation,
+        ManifestObservations, Observation, action_from_form, describe_instance_attribute_xml,
         describe_instance_types_xml, describe_instances_xml, observations_from_manifest,
         parse_ec2_query_from_form, state_code,
     };
@@ -668,6 +731,18 @@ mod tests {
             .enumerate()
             .map(|(index, (control_id, role, scenario))| {
                 let resource_id = format!("i-handler-{index}");
+                let mut tags = serde_json::Map::new();
+                tags.insert("Name".to_string(), json!(resource_id));
+                tags.insert(
+                    "FoxtailFixture".to_string(),
+                    json!("release-qualification-v1"),
+                );
+                tags.insert("FoxtailControl".to_string(), json!(control_id));
+                tags.insert("FoxtailRole".to_string(), json!(role));
+                tags.insert("FoxtailScenario".to_string(), json!(scenario));
+                for (key, value) in crate::fixture::NEUTRAL_OBSERVATION_TAGS {
+                    tags.insert(key.to_string(), json!(value));
+                }
                 json!({
                     "control_id": control_id,
                     "role": role,
@@ -680,13 +755,7 @@ mod tests {
                         "instance_type": "m6i.large",
                         "disable_api_termination": false,
                         "availability_zone": "us-east-1a",
-                        "tags": {
-                            "Name": resource_id,
-                            "FoxtailFixture": "release-qualification-v1",
-                            "FoxtailControl": control_id,
-                            "FoxtailRole": role,
-                            "FoxtailScenario": scenario
-                        }
+                        "tags": tags
                     }
                 })
             })
@@ -814,11 +883,60 @@ mod tests {
             availability_zone: "us-east-1a".to_string(),
             tags: BTreeMap::from([("k<>&\"'".to_string(), "v<>&\"'".to_string())]),
         };
-        let xml = describe_instances_xml("123456789012", "2026-08-05T00:00:00Z", &[observation]);
+        let xml = describe_instances_xml(
+            "123456789012",
+            "2026-08-05T00:00:00Z",
+            &[observation],
+            &[InstanceTypeObservation {
+                instance_type: "m6i&large".to_string(),
+                supported_root_device_types: vec!["ebs".to_string()],
+                supported_virtualization_types: vec!["hvm".to_string()],
+                supported_architectures: vec!["x86_64".to_string()],
+                ena_support: "required".to_string(),
+            }],
+        )
+        .unwrap();
         assert!(xml.contains("i-&lt;escaped&gt;"));
         assert!(xml.contains("m6i&amp;large"));
         assert!(xml.contains("k&lt;&gt;&amp;&quot;&apos;"));
         assert!(xml.contains("<code>16</code>"));
+    }
+
+    #[test]
+    fn describe_instances_fails_closed_when_catalogue_facts_drift() {
+        let observation = Observation {
+            resource_id: "i-1".to_string(),
+            instance_state: "running".to_string(),
+            instance_type: "m6i.large".to_string(),
+            disable_api_termination: false,
+            availability_zone: "us-east-1a".to_string(),
+            tags: BTreeMap::new(),
+        };
+        let missing = describe_instances_xml(
+            "123456789012",
+            "2026-08-05T00:00:00Z",
+            std::slice::from_ref(&observation),
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(missing.contains("missing from the fixture catalogue"));
+
+        let inconsistent = describe_instances_xml(
+            "123456789012",
+            "2026-08-05T00:00:00Z",
+            &[observation],
+            &[InstanceTypeObservation {
+                instance_type: "m6i.large".to_string(),
+                supported_root_device_types: vec!["ebs".to_string(), "instance-store".to_string()],
+                supported_virtualization_types: vec!["hvm".to_string()],
+                supported_architectures: vec!["x86_64".to_string()],
+                ena_support: "required".to_string(),
+            }],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(inconsistent.contains("inconsistent fixture supported_root_device_types facts"));
     }
 
     #[test]

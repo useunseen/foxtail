@@ -177,6 +177,12 @@ routes remain the authoritative evidence surfaces. The default public account
 scope is `123456789012`; an explicit fixture `account_id` must match it so
 manifest ARNs and public identities cannot diverge.
 
+The canonical generation rules publish the five fixture-owned evidence
+profiles. The idle-positive control emits 14 complete daily CPU samples at a
+deterministic `4.0` peak, with positive daily network and cost rows; the
+negative and degraded controls retain their complete/bounded-history profiles,
+and the two resize controls retain their complete recommendation evidence.
+
 Each positive, negative, or degraded read-only control declares a non-empty
 `finding_type` selector: the three idle controls use `idle_instance`, and the
 two resize controls use `rightsizing`. This field is production
@@ -253,6 +259,46 @@ unsupported continuation tokens fail closed. The four disposable mutation
 targets are never exposed on this observation surface. Keep this Foxtail
 observation endpoint separate from the dedicated mutation LocalStack endpoint
 (for example, Foxtail on `127.0.0.1:8080` and mutation LocalStack on `:4666`).
+
+### Issue #16 exact assessor proof
+
+The committed verifier archives only Unseen revision
+`f4c5e7802def856fb4d4ec6996cbd616ea16bd95` from the read-only sibling Git
+repository, verifies the imported module paths, and then invokes the registered
+`assess_ec2_evidence:v1` adapter/assessor. Its default boundary mode proves the
+canonical positive fixture/public shape at `4.0` produces one `idle_instance`
+finding and that a copied exact-`5.0` input produces no finding. The boundary
+payload consumes the canonical manifest's neutral `Owner`, `Criticality`, and
+`Environment` tags plus the definition's metric formulas, history offsets,
+clock anchor, and cost profile; it does not invent classification or evidence
+values:
+
+~~~~bash
+/Users/murphy/workspace/iacai0/unseen-agent/.venv/bin/python \
+  scripts/verify_issue16_unseen.py
+~~~~
+
+Run the local verifier self-test to assert that canonical tags and metric
+formulas are consumed and that removing a required classification tag fails
+closed, without importing Unseen:
+
+~~~~bash
+python3 scripts/verify_issue16_unseen.py --self-test
+~~~~
+
+After a disposable Foxtail service is realized, `--live` is a separate proof
+mode. It collects ordinary AWS-compatible responses through Unseen's committed
+`AwsCompatibleObservationPort` and derives the five-control outcomes without
+rewriting the committed manifest. It explicitly reports the expected
+downstream fingerprint-refresh blocker until the authorized Unseen consumer
+refresh; keep its Foxtail and LocalStack endpoints distinct:
+
+~~~~bash
+/Users/murphy/workspace/iacai0/unseen-agent/.venv/bin/python \
+  scripts/verify_issue16_unseen.py --live \
+  --observation-endpoint http://127.0.0.1:18086 \
+  --localstack-endpoint http://127.0.0.1:4666
+~~~~
 
 ### Cost Explorer
 
