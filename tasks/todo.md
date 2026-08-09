@@ -1006,8 +1006,10 @@ outcomes.
   follow-up commit.
 - [x] 7-8. Run an explicit read-only proof using only committed Unseen
   `f4c5e7802def856fb4d4ec6996cbd616ea16bd95` source: positive finding,
-  exact-5.0 boundary no-finding, and the five-control outcome matrix without
-  unsupported capability, stale-window, identity, or fabricated-tag blockers.
+  exact-5.0 boundary no-finding, and the five-control outcome matrix. Complete
+  controls have no unsupported-capability, stale-window, identity,
+  compatibility, or fabricated-tag blockers; the unmodified live contract
+  reports the expected downstream fingerprint-refresh blockers for Unseen.
 - [x] 9-10. Run formatting, Rust/schema/validator/CLI gates and report exact
   commits, digests, source revision, proof outcomes, blockers, and clean status.
 
@@ -1103,5 +1105,43 @@ also passed. The temporary LocalStack container and databases were removed.
   catalogue and fails closed on missing or inconsistent catalogue entries;
   DescribeInstanceTypes remains unchanged and is covered by existing contract
   tests plus a focused drift test.
-- [ ] Rerun all broad gates after the final source-revision/golden pin; record
+- [x] Rerun all broad gates after the final source-revision/golden pin; record
   exact outcomes, blockers, digests, and the final clean worktree below.
+
+## Issue #16 repair verification results
+
+- [x] Boundary verifier command:
+  `/Users/murphy/workspace/iacai0/unseen-agent/.venv/bin/python
+  scripts/verify_issue16_unseen.py`. It archived and imported only committed
+  Unseen `f4c5e7802def856fb4d4ec6996cbd616ea16bd95`, asserted the registered
+  `assess_ec2_evidence:v1` identity, and returned `optimization_finding` with
+  `idle_instance` for the canonical `4.0` public input and
+  `inventory_observation`/no finding for its exact `5.0` boundary copy.
+- [x] Unmodified live verifier command against disposable Foxtail `:18086`
+  and LocalStack `:4666` returned exactly: idle positive `finding`, idle
+  negative `no_finding`, degraded `blocked` for
+  `incomplete_window:ec2-idle-degraded-001`, resize positive `finding`, and
+  resize negative `no_finding`. Complete controls had empty blocker arrays.
+  The receipt also reported exactly
+  `read_only_estate_fingerprint_mismatch` and `estate_fingerprint_mismatch`,
+  plus the intentional degraded blocker and `oracle_outcome_blocked`; it did
+  not rewrite or re-digest the captured Foxtail manifest. Full receipt
+  readiness remains owned by the authorized Unseen consumer refresh.
+- [x] Broad gates passed: `cargo fmt --all -- --check`, `cargo test` (94
+  library, 6 API-contract, 20 mutation, 4 wrapper, and doc tests),
+  `cargo clippy --all-targets --all-features -- -D warnings`,
+  `python3 scripts/validate_release_fixture.py --negative`, `bash -n
+  scripts/verify_cli_interop.sh scripts/verify_wrapper_routing.sh`,
+  `bash scripts/verify_wrapper_routing.sh`, and `git diff --check`.
+- [x] Full disposable `scripts/verify_cli_interop.sh` passed with dedicated
+  LocalStack 4.14.0, including fixture realization, EC2 Query observation and
+  negatives, mutation fault/reset/recreate/destroy cleanup, CloudWatch, Cost
+  Explorer, Resource Groups, Pricing, Compute Optimizer, CUR, and wrapper
+  routing. The LocalStack container, Foxtail process, and temporary databases
+  were removed afterward.
+- [x] Final functional source revision remains
+  `4ee5edbc06bb2f74dcc5243880cf62a09c304bb7`; separate source pin/golden
+  commit `ce7dccb` names that revision. Checked-in definition digest remains
+  `sha256:aad7cc86551a2e60ec37942cc801293bf61c952fa7bda4f1b5481e58cb9cbcdf`;
+  checked-in manifest digest is
+  `sha256:b203911790524c465059a9d619abf64544638563b1390a1825076bb98ef5bccf`.
