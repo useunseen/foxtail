@@ -1062,11 +1062,16 @@ disposable Foxtail service returned this outcome matrix:
 | `ec2-resize-positive-001` | `finding` | none |
 | `ec2-resize-negative-001` | `no_finding` | none |
 
-Receipt readiness was blocked only by the declared degraded incomplete window;
-complete controls had no unsupported-capability, stale-window, identity,
-compatibility, missing-attribute, or fixture-intent blockers. Public collector
-fingerprints were `read_only=sha256:1de2246f4e7f9f1996dee680b8286e9e6c3fb425911b1d37b4468ae7cd30450b`
-and `estate=sha256:6dbfa4cc4c38a1075c7e948404d205816e615baa82e3ac99abfb1dc2bc21ab92`.
+The committed live verifier leaves the realized manifest untouched. The exact
+f4c5 consumer derives the same five-control outcome matrix, with complete
+controls free of unsupported-capability, stale-window, identity,
+compatibility, missing-attribute, or fixture-intent blockers, but the receipt
+also reports the expected downstream
+`read_only_estate_fingerprint_mismatch` and `estate_fingerprint_mismatch`
+refresh blockers because the f4c5 public fingerprint projection is not yet
+refreshed against this Foxtail capture. Only the degraded control's
+`incomplete_window` is an intentional fixture blocker; full receipt readiness
+remains deferred to the authorized Unseen consumer refresh.
 
 Verification passed: `cargo fmt --all -- --check`, `cargo test` (91 library,
 6 API-contract, 20 mutation, 4 wrapper, and doc tests),
@@ -1083,7 +1088,9 @@ also passed. The temporary LocalStack container and databases were removed.
   `assess_ec2_evidence:v1` identity, derives the canonical fixture/public
   positive at `4.0` as one `idle_instance` finding, and proves its copied exact
   `5.0` boundary as `no_finding`. Its separate `--live` mode uses the exact
-  committed `AwsCompatibleObservationPort` for the five-control receipt.
+  committed `AwsCompatibleObservationPort` without changing or re-digesting
+  the manifest, and reports the expected downstream fingerprint-refresh
+  blockers.
 - [x] `7a056e2` moves Compute Optimizer evidence SQL into the typed
   `db::fetch_ec2_compute_optimizer_rows` helper and binds requested
   `InstanceArns` to canonical account/region/service/resource identities;
@@ -1096,6 +1103,5 @@ also passed. The temporary LocalStack container and databases were removed.
   catalogue and fails closed on missing or inconsistent catalogue entries;
   DescribeInstanceTypes remains unchanged and is covered by existing contract
   tests plus a focused drift test.
-- [ ] Rerun the committed live receipt and all broad gates after the final
-  source-revision/golden pin; record exact outcomes, blockers, digests, and the
-  final clean worktree below.
+- [ ] Rerun all broad gates after the final source-revision/golden pin; record
+  exact outcomes, blockers, digests, and the final clean worktree below.

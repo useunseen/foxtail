@@ -11,3 +11,10 @@
 ## 2026-05-13
 
 - When a Make target should recover from a missing local binary, depend on the binary file path rather than a phony `build` target if the desired behavior is "build only when absent."
+
+## 2026-08-09
+
+- A verification harness must never rewrite or re-digest a committed consumer
+  manifest to make a cross-repository receipt ready; preserve the exact
+  contract, report the downstream fingerprint/source-refresh blocker, and leave
+  contract refresh ownership with the consumer repository.

@@ -276,8 +276,10 @@ finding and that a copied exact-`5.0` input produces no finding:
 
 After a disposable Foxtail service is realized, `--live` is a separate proof
 mode. It collects ordinary AWS-compatible responses through Unseen's committed
-`AwsCompatibleObservationPort` and derives the five-control receipt; keep its
-Foxtail and LocalStack endpoints distinct:
+`AwsCompatibleObservationPort` and derives the five-control outcomes without
+rewriting the committed manifest. It explicitly reports the expected
+downstream fingerprint-refresh blocker until the authorized Unseen consumer
+refresh; keep its Foxtail and LocalStack endpoints distinct:
 
 ~~~~bash
 /Users/murphy/workspace/iacai0/unseen-agent/.venv/bin/python \

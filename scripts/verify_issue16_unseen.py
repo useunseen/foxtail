@@ -8,6 +8,8 @@ archive, and sends a public-response-shaped EC2 evidence payload through the
 registered production adapter and assessor.  ``--live`` is a separate mode
 that collects the five controls from an already-realized Foxtail HTTP service
 through Unseen's ordinary AWS-compatible observation port.
+The live mode leaves the committed manifest untouched and reports any
+downstream fingerprint-refresh blocker explicitly.
 
 This verifier never imports a sibling Unseen working tree and never implements
 an evidence threshold.  The CPU values below are fixture evidence and the
