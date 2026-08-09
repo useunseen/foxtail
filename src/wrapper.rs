@@ -45,6 +45,8 @@ const FOXTAIL_ROUTED_COMMANDS: &[(&str, &str)] = &[
     ("compute-optimizer", "get-ebs-volume-recommendations"),
     ("cur", "describe-report-definitions"),
     ("ec2", "describe-instances"),
+    ("ec2", "describe-instance-attribute"),
+    ("ec2", "describe-instance-types"),
     ("cloudwatch", "list-metrics"),
     ("cloudwatch", "get-metric-statistics"),
     ("cloudwatch", "get-metric-data"),
@@ -351,6 +353,8 @@ Foxtail-routed commands:
   compute-optimizer get-ebs-volume-recommendations
   cur describe-report-definitions
   ec2 describe-instances
+  ec2 describe-instance-attribute
+  ec2 describe-instance-types
   cloudwatch list-metrics
   cloudwatch get-metric-statistics
   cloudwatch get-metric-data
@@ -374,6 +378,8 @@ Examples:
 
   Foxtail-routed EC2 observation:
     foxtail ec2 describe-instances
+    foxtail ec2 describe-instance-attribute --instance-id i-example --attribute disableApiTermination
+    foxtail ec2 describe-instance-types --instance-types m6i.large
 
   LocalStack passthrough:
     foxtail s3 ls
@@ -505,6 +511,24 @@ mod tests {
     }
 
     #[test]
+    fn routes_ec2_oracle_observations_to_foxtail() {
+        for operation in ["describe-instance-attribute", "describe-instance-types"] {
+            let parsed = ParsedCli {
+                config: Config::default(),
+                forwarded_args: os(&["ec2", operation]),
+                mode: RunMode::Execute,
+            };
+            let invocation = build_invocation(&parsed);
+            assert_eq!(invocation.backend, Backend::Aws);
+            assert_eq!(invocation.program, DEFAULT_AWS_BIN);
+            assert_eq!(invocation.args[0], "--endpoint-url");
+            assert_eq!(invocation.args[1], DEFAULT_FOXTAIL_ENDPOINT);
+            assert_eq!(invocation.args[2], "ec2");
+            assert_eq!(invocation.args[3], operation);
+        }
+    }
+
+    #[test]
     fn leaves_passthrough_commands_on_awslocal() {
         let parsed = ParsedCli {
             config: Config::default(),
@@ -560,5 +584,7 @@ mod tests {
         assert!(help.contains("Explain the routing decision:"));
         assert!(help.contains("ce get-cost-and-usage"));
         assert!(help.contains("ec2 describe-instances"));
+        assert!(help.contains("ec2 describe-instance-attribute"));
+        assert!(help.contains("ec2 describe-instance-types"));
     }
 }

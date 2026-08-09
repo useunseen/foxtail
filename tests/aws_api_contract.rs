@@ -120,6 +120,130 @@ async fn ec2_query_describe_instances_returns_exact_manifest_rows() {
 }
 
 #[tokio::test]
+async fn ec2_oracle_observation_routes_bind_exact_fixture_facts_and_fail_closed() {
+    let pool = test_pool("ec2-oracle-observations").await;
+    seed_fixture_resources(&pool).await;
+    sqlx::query("UPDATE resources SET disable_api_termination = 1 WHERE id = 'i-ec2-query-0'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let snapshot = fixture::realize(
+        &pool,
+        fixture::RealizeRequest {
+            clock_anchor: Some("2026-08-05T00:00:00Z".to_string()),
+            ..fixture::RealizeRequest::default()
+        },
+    )
+    .await
+    .unwrap();
+    let manifest: Value = serde_json::from_slice(&snapshot.manifest_bytes).unwrap();
+    let app = serve::build_app(pool.clone());
+    let manifest_digest_before = snapshot.manifest_digest.clone();
+
+    let attribute_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(
+                    "Action=DescribeInstanceAttribute&Version=2016-11-15&InstanceId=i-ec2-query-0&Attribute=disableApiTermination",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(attribute_response.status(), StatusCode::OK);
+    let attribute_body = response_text(attribute_response).await;
+    assert!(attribute_body.contains("<instanceId>i-ec2-query-0</instanceId>"));
+    assert!(attribute_body.contains("<disableApiTermination><value>true</value>"));
+
+    let type_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(
+                    "Action=DescribeInstanceTypes&Version=2016-11-15&InstanceType.1=t3.medium&InstanceType.2=m6i.xlarge",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(type_response.status(), StatusCode::OK);
+    let type_body = response_text(type_response).await;
+    for field in [
+        "<instanceType>t3.medium</instanceType>",
+        "<instanceType>m6i.xlarge</instanceType>",
+        "<supportedRootDeviceTypes><item>ebs</item>",
+        "<supportedVirtualizationTypes><item>hvm</item>",
+        "<supportedArchitectures><item>x86_64</item>",
+        "<enaSupport>required</enaSupport>",
+    ] {
+        assert!(type_body.contains(field), "missing {field}");
+    }
+    assert_eq!(type_body.matches("<instanceType>").count(), 2);
+
+    for body in [
+        "Action=DescribeInstanceAttribute&InstanceId=i-unknown&Attribute=disableApiTermination",
+        "Action=DescribeInstanceAttribute&InstanceId=i-ec2-query-0&Attribute=instanceType",
+        "Action=DescribeInstanceAttribute&InstanceId=i-ec2-query-0&InstanceId=i-ec2-query-1&Attribute=disableApiTermination",
+        "Action=DescribeInstanceTypes&InstanceType.1=t3.unknown",
+        "Action=DescribeInstanceTypes&InstanceType.1=t3.medium&InstanceType.2=t3.medium",
+        "Action=DescribeInstanceTypes&InstanceType.1=t3.medium&NextToken=unsupported",
+        "Action=DescribeInstanceTypes&InstanceTypes.1=m6i.large",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !response.status().is_success(),
+            "unexpected success for {body}"
+        );
+        let response_body = response_text(response).await;
+        if body.contains("t3.unknown") {
+            assert!(response_body.contains("InvalidInstanceType"));
+            assert!(!response_body.contains("InvalidInstanceType.NotFound"));
+        }
+    }
+    let state_after = fixture::read_state(&pool).await.unwrap();
+    assert_eq!(
+        state_after.manifest_digest.as_deref(),
+        Some(manifest_digest_before.as_str())
+    );
+
+    let bound_resource = manifest["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|resource| resource["resource_id"] == "i-ec2-query-0")
+        .unwrap();
+    assert_eq!(
+        bound_resource["observed"]["disable_api_termination"],
+        json!(true)
+    );
+    assert_eq!(
+        manifest["ec2_instance_type_catalogue"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+}
+
+#[tokio::test]
 async fn tagging_inventory_excludes_fixture_mutation_resources() {
     let pool = test_pool("tagging-fixture-boundary").await;
     sqlx::query(

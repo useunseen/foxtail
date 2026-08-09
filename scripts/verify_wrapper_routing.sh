@@ -67,6 +67,20 @@ fi
 
 rm -f "$AWS_LOG" "$AWSLOCAL_LOG"
 
+for operation in describe-instance-attribute describe-instance-types; do
+  echo "[verify-wrapper] checking EC2 $operation routing"
+  "$BIN" --aws-bin "$AWS_BIN" --awslocal-bin "$AWSLOCAL_BIN" ec2 "$operation" >/dev/null
+  if [[ ! -f "$AWS_LOG" ]] || [[ -f "$AWSLOCAL_LOG" ]]; then
+    echo "expected EC2 $operation to invoke aws only" >&2
+    exit 1
+  fi
+  if ! grep -q -- "ec2" "$AWS_LOG" || ! grep -q -- "$operation" "$AWS_LOG"; then
+    echo "expected EC2 $operation routing to preserve service and operation tokens" >&2
+    exit 1
+  fi
+  rm -f "$AWS_LOG" "$AWSLOCAL_LOG"
+done
+
 echo "[verify-wrapper] checking passthrough command"
 "$BIN" --aws-bin "$AWS_BIN" --awslocal-bin "$AWSLOCAL_BIN" s3 ls >/dev/null
 

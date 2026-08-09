@@ -52,6 +52,7 @@ pub const SUPPORTED_FINDING_TYPES: [&str; 2] = ["idle_instance", "rightsizing"];
 pub const DEFAULT_ACCOUNT_ID: &str = "123456789012";
 pub const DEFAULT_REGION: &str = "us-east-1";
 pub const DEFAULT_LOCALSTACK_ENDPOINT: &str = "http://localhost:4566";
+pub const EC2_INSTANCE_TYPE_CATALOGUE: [&str; 3] = ["m6i.large", "t3.medium", "m6i.xlarge"];
 /// Mutating fixture controls are deliberately opt-in. A caller must set this
 /// to `isolated` before a mutation can affect fixture-owned rows.
 pub const ISOLATED_QUALIFICATION_ENV: &str = "FOXTAIL_QUALIFICATION_ENV";
@@ -649,6 +650,22 @@ fn generation_rules_value() -> Value {
     })
 }
 
+pub fn ec2_instance_type_catalogue_value() -> Value {
+    EC2_INSTANCE_TYPE_CATALOGUE
+        .into_iter()
+        .map(|instance_type| {
+            json!({
+                "instance_type": instance_type,
+                "supported_root_device_types": ["ebs"],
+                "supported_virtualization_types": ["hvm"],
+                "supported_architectures": ["x86_64"],
+                "ena_support": "required"
+            })
+        })
+        .collect::<Vec<_>>()
+        .into()
+}
+
 pub fn canonical_definition() -> Result<(Vec<u8>, String)> {
     let (mut bytes, digest) = validate_document(&definition_value(), "digest")?;
     let mut value: Value = serde_json::from_slice(&bytes)?;
@@ -752,6 +769,14 @@ fn parse_resource_tags(raw: Option<&str>) -> BTreeMap<String, String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn strict_sqlite_bool(value: i64, name: &str) -> Result<bool> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        other => bail!("{name} persisted value must be 0 or 1; found {other}"),
+    }
 }
 
 async fn validate_mutation_authority(
@@ -1540,7 +1565,8 @@ pub async fn realize(pool: &SqlitePool, request: RealizeRequest) -> Result<Fixtu
     }
 
     let rows = sqlx::query(
-        "SELECT id, region, scenario, instance_state, instance_type, availability_zone, tags
+        "SELECT id, region, scenario, instance_state, instance_type,
+                disable_api_termination, availability_zone, tags
          FROM resources
          WHERE resource_type = 'ec2'
            AND id NOT IN (
@@ -1569,6 +1595,10 @@ pub async fn realize(pool: &SqlitePool, request: RealizeRequest) -> Result<Fixtu
                 scenario: row.try_get("scenario")?,
                 instance_state: row.try_get("instance_state")?,
                 instance_type: row.try_get("instance_type")?,
+                disable_api_termination: strict_sqlite_bool(
+                    row.try_get("disable_api_termination")?,
+                    "disable_api_termination",
+                )?,
                 availability_zone: row.try_get("availability_zone")?,
                 tags: parse_resource_tags(row.try_get::<Option<String>, _>("tags")?.as_deref()),
             })
@@ -3286,6 +3316,7 @@ struct ResourceIdentity {
     scenario: String,
     instance_state: String,
     instance_type: String,
+    disable_api_termination: bool,
     availability_zone: Option<String>,
     tags: BTreeMap<String, String>,
 }
@@ -3311,6 +3342,7 @@ struct EstateResource {
     scenario: String,
     instance_state: String,
     instance_type: String,
+    disable_api_termination: bool,
     availability_zone: Option<String>,
     tags: BTreeMap<String, String>,
     avg_cpu: Option<f64>,
@@ -3493,6 +3525,7 @@ async fn load_estate_resources(
             scenario: identity.scenario.clone(),
             instance_state: identity.instance_state.clone(),
             instance_type: identity.instance_type.clone(),
+            disable_api_termination: identity.disable_api_termination,
             availability_zone: identity.availability_zone.clone(),
             tags: identity.tags.clone(),
             avg_cpu,
@@ -3601,6 +3634,7 @@ fn estate_fingerprint(
                 "scenario": resource.scenario,
                 "instance_state": resource.instance_state,
                 "instance_type": resource.instance_type,
+                "disable_api_termination": resource.disable_api_termination,
                 "availability_zone": resource
                     .availability_zone
                     .clone()
@@ -3660,6 +3694,7 @@ fn build_manifest(context: ManifestContext<'_>) -> Result<Value> {
                 "observed": {
                     "instance_state": resource.instance_state,
                     "instance_type": resource.instance_type,
+                    "disable_api_termination": resource.disable_api_termination,
                     "availability_zone": resource
                         .availability_zone
                         .clone()
@@ -3756,6 +3791,7 @@ fn build_manifest(context: ManifestContext<'_>) -> Result<Value> {
             "reusable_until": reusable_until.to_rfc3339_opts(SecondsFormat::Secs, true)
         },
         "generation": generation,
+        "ec2_instance_type_catalogue": ec2_instance_type_catalogue_value(),
         "mutation_generation": mutation_generation,
         "mutation_generation_id": mutation_generation_id,
         "resources": resource_entries,
@@ -4330,7 +4366,7 @@ mod tests {
         assert_eq!(value["digest"], digest);
         assert_eq!(
             value["generator"]["source_revision"],
-            "71a74458325b6f836d5b195084a7d28218bf9241"
+            "cbb8bf5e422b0fd1284e9474db6cf9117a034e19"
         );
         assert_eq!(
             value["environment"]["estate_fingerprint"],
