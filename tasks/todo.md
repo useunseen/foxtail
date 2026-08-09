@@ -774,22 +774,43 @@ Pinned base: `eaf5f12c97a7997bd3a00cfff16e516c17c0477d`
 
 ## Acceptance Map
 
-- [ ] Add the exact `finding_type` map to Foxtail's canonical definition builder and prove all five read-only controls in the canonical golden/CLI/HTTP output.
-- [ ] Require supported non-empty `finding_type` for positive, negative, and degraded definition controls in the Draft 2020-12 schema and runtime/negative validation; mutation controls must omit it.
-- [ ] Document selector authority as production policy-registration metadata only and reject nested/misplaced selector or expected-outcome encodings while preserving existing forbidden policy fields.
-- [ ] Advance `DEFINITION_REVISION`, schema consts, canonical definition/manifest digests, and checked-in goldens deterministically; update Foxtail-owned source-revision assertions without editing Unseen.
-- [ ] Keep the manifest bound to the exact definition digest without duplicating selector truth; preserve canonical CLI/HTTP parity and schema validation.
-- [ ] Preserve mutation/readiness/AWS CLI/interoperability behavior and run focused Unseen #355 compatibility proof read-only.
-- [ ] Commit the functional implementation, then a separate source-pin/golden update commit if required; report exact hashes and final head.
+- [x] Add the exact `finding_type` map to Foxtail's canonical definition builder and prove all five read-only controls in the canonical golden/CLI/HTTP output.
+- [x] Require supported non-empty `finding_type` for positive, negative, and degraded definition controls in the Draft 2020-12 schema and runtime/negative validation; mutation controls must omit it.
+- [x] Document selector authority as production policy-registration metadata only and reject nested/misplaced selector or expected-outcome encodings while preserving existing forbidden policy fields.
+- [x] Advance `DEFINITION_REVISION`, schema consts, canonical definition/manifest digests, and checked-in goldens deterministically; update Foxtail-owned source-revision assertions without editing Unseen.
+- [x] Keep the manifest bound to the exact definition digest without duplicating selector truth; preserve canonical CLI/HTTP parity and schema validation.
+- [x] Preserve mutation/readiness/AWS CLI/interoperability behavior and run focused Unseen #355 compatibility proof read-only.
+- [x] Commit the functional implementation, then a separate source-pin/golden update commit if required; report exact hashes and final head.
 
 ## Execution Plan
 
 - [x] Inspect current definition, manifest, schema, validator, CLI/HTTP parity, and sibling Unseen policy registration.
 - [x] Implement selectors, schema/runtime validation, docs, focused tests, and regenerate goldens.
 - [x] Run focused Rust/schema/CLI checks and the read-only Unseen compatibility command.
-- [ ] Commit the functional change and any separate source-pin/golden change without amending.
-- [ ] Review the complete diff against every acceptance criterion and record results, residual gaps, and final git status.
+- [x] Commit the functional change and any separate source-pin/golden change without amending.
+- [x] Review the complete diff against every acceptance criterion and record results, residual gaps, and final git status.
 
 ## Review and Results
 
-Pending implementation and frozen-head review.
+The functional implementation is committed as `71a74458325b6f836d5b195084a7d28218bf9241`.
+The follow-up source-pin/golden commit updates the checked-in manifest's
+`generator.source_revision` and the Foxtail-owned golden assertion to that
+functional commit without amending it; its exact hash and final branch head
+are reported in the worker handoff.
+
+- Canonical definition selectors are exact: idle positive/negative/degraded
+  map to `idle_instance`; resize positive/negative map to `rightsizing`; all
+  four mutation controls omit the selector.
+- Runtime and Draft 2020-12 validation reject missing, empty, unsupported,
+  whitespace-padded, mutation, nested, and manifest/control-catalogue selector
+  placements while retaining forbidden expected-finding rejection.
+- Definition revision is `1.0.1`; definition digest is
+  `sha256:a81555c81a528dae62934786e2a51080af674daa998b94da6c4186eae6b778a6`.
+  The manifest binds that digest and contains no `finding_type` key.
+- Focused proof passed: Rust selector/definition tests, full `cargo test -q`,
+  `cargo clippy --all-targets --all-features -- -D warnings`, canonical-format
+  checks, `python3 scripts/validate_release_fixture.py --negative`, and the
+  read-only Unseen policy-registration compatibility command plus four focused
+  Unseen oracle tests. No Unseen files or external tracker state were changed.
+- No residual implementation gap is known; the parent should run its broad
+  verification matrix and any available LocalStack/CLI smoke before publication.
