@@ -297,8 +297,8 @@ Invariant: Foxtail owns only deterministic fixture facts and AWS-compatible read
 - [x] 8. Wrapper: route both operations through Foxtail, never the LocalStack mutation endpoint; extend Rust wrapper tests and `scripts/verify_wrapper_routing.sh` as needed.
 - [x] 9. Focused tests: cover handler/parser/manifest/serializer/dispatcher success, exact identity, duplicates, malformed/unsupported inputs, inconsistent data, and continuation-token behavior.
 - [x] 10. Disposable CLI interop: extend `scripts/verify_cli_interop.sh` for both operations against Foxtail, asserting exact IDs/boolean/type records/all public fields, deterministic negatives, and distinct Foxtail vs LocalStack endpoints while preserving lifecycle/mutation proof.
-- [ ] 11. Sibling proof: using Unseen read-only commit `f4c5e7802def856fb4d4ec6996cbd616ea16bd95`, run its real `AwsCompatibleObservationPort.observe()` against repaired Foxtail disposable state; confirm no `UnsupportedAction`, missing instance-attribute/target-compatibility evidence, or `unsupported_capability`. Add a reproducible Foxtail-side harness when possible; report exact environment blocker otherwise; do not edit Unseen.
-- [ ] 12. Broad regression: run format, full Rust tests, clippy with `-D warnings`, pinned fixture validators (including negatives), shell syntax, wrapper proof, diff check, and full disposable CLI interop with required LocalStack settings.
+- [x] 11. Sibling proof: using Unseen read-only commit `f4c5e7802def856fb4d4ec6996cbd616ea16bd95`, run its real `AwsCompatibleObservationPort.observe()` against repaired Foxtail disposable state; confirm no `UnsupportedAction`, missing instance-attribute/target-compatibility evidence, or `unsupported_capability`. Add a reproducible Foxtail-side harness when possible; report exact environment blocker otherwise; do not edit Unseen.
+- [x] 12. Broad regression: run format, full Rust tests, clippy with `-D warnings`, pinned fixture validators (including negatives), shell syntax, wrapper proof, diff check, and full disposable CLI interop with required LocalStack settings.
 - [x] 13. Contract/source report: update fixture schema/data/goldens/digests/source-owned facts where required and report exact final Foxtail commits/revision; never edit sibling Unseen pins/contracts.
 
 ## Execution Plan
@@ -307,14 +307,14 @@ Invariant: Foxtail owns only deterministic fixture facts and AWS-compatible read
 - [x] Implement one validated Foxtail observation boundary for `DescribeInstanceAttribute` and `DescribeInstanceTypes`, keeping route orchestration in `serve.rs` and fixture truth/schema/goldens in their owners.
 - [x] Add focused success/failure/identity/duplicate/integrity/pagination tests and wrapper/CLI smoke assertions; update deterministic fixture artefacts and docs as needed.
 - [x] Run focused verification, commit coherent implementation batches without amending, and review the complete diff against every acceptance criterion.
-- [ ] Run broad verification and sibling live compatibility proof; record exact results, residual gaps, and final commits below.
+- [x] Run broad verification and sibling live compatibility proof; record exact results, residual gaps, and final commits below.
 
 ## Issue #14 Results / Review
 
 The functional implementation is committed as `cbb8bf5e422b0fd1284e9474db6cf9117a034e19`.
-A non-amended source-pin/golden follow-up updates the checked-in manifest and
-the Foxtail-owned golden assertion to that functional revision; its exact hash
-and final branch head are reported in the worker handoff. The checked-in
+A non-amended source-pin/golden follow-up is committed as
+`b48695dd20bbefcacd9b08447782a0f90ade3d6a`, updating the checked-in manifest
+and Foxtail-owned golden assertion to the functional revision. The checked-in
 manifest now owns the
 strict `disable_api_termination` boolean for every realized read-only control
 and an exact catalogue for `m6i.large`, `t3.medium`, and `m6i.xlarge`; the
@@ -325,15 +325,29 @@ handler validates those facts before serving Query/XML observations.
   unsupported/continuation failures, and persisted digest preservation),
   `bash scripts/verify_wrapper_routing.sh`, and
   `python3 scripts/validate_release_fixture.py --negative`.
-- Focused fixture proof passed after source pinning: `cargo test
-  fixture::tests:: --lib` (18 tests). Full Rust tests and clippy will be rerun
-  in the broad verification pass.
-- The disposable CLI script and sibling `AwsCompatibleObservationPort.observe`
-  live proof remain pending because this environment has no checked-in
-  `mock_data.db`, no `FOXTAIL_MUTATION_AMI_ID`, and LocalStack at
-  `127.0.0.1:4666` is unavailable. The ordinary AWS CLI attribute/type
-  success path was separately proven against a temporary realized Foxtail
-  server; no Unseen files or contracts were edited.
+- Broad proof passed: `cargo fmt --all -- --check`, full `cargo test` (89
+  library, 5 API-contract, 20 mutation integration, 4 wrapper, doc tests),
+  `cargo clippy --all-targets --all-features -- -D warnings`, pinned fixture
+  validator with negatives, `bash -n` for both scripts, `git diff --check`,
+  and `bash scripts/verify_wrapper_routing.sh`.
+- Disposable proof passed against LocalStack 4.14.0 at `127.0.0.1:4566` with
+  a temporary seed database and fresh test account: the extended
+  `scripts/verify_cli_interop.sh` asserted exact attribute booleans, all type
+  compatibility fields, deterministic unknown/continuation failures, endpoint
+  separation, and the existing mutation lifecycle.
+- Sibling proof passed at Unseen commit
+  `f4c5e7802def856fb4d4ec6996cbd616ea16bd95`: real
+  `AwsCompatibleObservationPort.observe()` against Foxtail `:18082` and a
+  distinct fresh LocalStack account on `:4566` returned five controls, five
+  boolean attribute responses, and five target-compatibility responses with no
+  `UnsupportedAction`, missing evidence, or `unsupported_capability`. The
+  fresh LocalStack account was `222222222222` because shared account `123456789012`
+  already contained unrelated resources; Foxtail's authoritative manifest
+  account remains `123456789012` and was not changed. No Unseen files or
+  contracts were edited.
+- Final source revision is the functional Foxtail commit
+  `cbb8bf5e422b0fd1284e9474db6cf9117a034e19`; final branch head is the
+  non-amended source-pin commit `b48695dd20bbefcacd9b08447782a0f90ade3d6a`.
 
 ## Scenario Data Quality Verification
 
