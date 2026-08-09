@@ -260,6 +260,32 @@ targets are never exposed on this observation surface. Keep this Foxtail
 observation endpoint separate from the dedicated mutation LocalStack endpoint
 (for example, Foxtail on `127.0.0.1:8080` and mutation LocalStack on `:4666`).
 
+### Issue #16 exact assessor proof
+
+The committed verifier archives only Unseen revision
+`f4c5e7802def856fb4d4ec6996cbd616ea16bd95` from the read-only sibling Git
+repository, verifies the imported module paths, and then invokes the registered
+`assess_ec2_evidence:v1` adapter/assessor. Its default boundary mode proves the
+canonical positive fixture/public shape at `4.0` produces one `idle_instance`
+finding and that a copied exact-`5.0` input produces no finding:
+
+~~~~bash
+/Users/murphy/workspace/iacai0/unseen-agent/.venv/bin/python \
+  scripts/verify_issue16_unseen.py
+~~~~
+
+After a disposable Foxtail service is realized, `--live` is a separate proof
+mode. It collects ordinary AWS-compatible responses through Unseen's committed
+`AwsCompatibleObservationPort` and derives the five-control receipt; keep its
+Foxtail and LocalStack endpoints distinct:
+
+~~~~bash
+/Users/murphy/workspace/iacai0/unseen-agent/.venv/bin/python \
+  scripts/verify_issue16_unseen.py --live \
+  --observation-endpoint http://127.0.0.1:18086 \
+  --localstack-endpoint http://127.0.0.1:4666
+~~~~
+
 ### Cost Explorer
 
 - `ce get-cost-and-usage`

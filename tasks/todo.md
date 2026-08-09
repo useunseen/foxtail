@@ -1075,3 +1075,27 @@ Verification passed: `cargo fmt --all -- --check`, `cargo test` (91 library,
 disposable `scripts/verify_cli_interop.sh` gate against dedicated LocalStack
 4.14.0 (including mutation lifecycle and all AWS CLI surfaces). `git diff --check`
 also passed. The temporary LocalStack container and databases were removed.
+
+## Issue #16 repair review
+
+- [x] Committed `scripts/verify_issue16_unseen.py` archives and verifies only
+  Unseen `f4c5e7802def856fb4d4ec6996cbd616ea16bd95`, proves the registered
+  `assess_ec2_evidence:v1` identity, derives the canonical fixture/public
+  positive at `4.0` as one `idle_instance` finding, and proves its copied exact
+  `5.0` boundary as `no_finding`. Its separate `--live` mode uses the exact
+  committed `AwsCompatibleObservationPort` for the five-control receipt.
+- [x] `7a056e2` moves Compute Optimizer evidence SQL into the typed
+  `db::fetch_ec2_compute_optimizer_rows` helper and binds requested
+  `InstanceArns` to canonical account/region/service/resource identities;
+  malformed members fail with deterministic validation errors, while valid
+  out-of-scope ARNs return no local rows. Focused tests cover lower-camel
+  request fields, exact filtering, pagination, malformed values, and wrong
+  account/region scope.
+- [x] `4ee5edb` derives DescribeInstances root-device, architecture,
+  virtualization, and ENA facts from the fixture-owned instance-type
+  catalogue and fails closed on missing or inconsistent catalogue entries;
+  DescribeInstanceTypes remains unchanged and is covered by existing contract
+  tests plus a focused drift test.
+- [ ] Rerun the committed live receipt and all broad gates after the final
+  source-revision/golden pin; record exact outcomes, blockers, digests, and the
+  final clean worktree below.
