@@ -1162,5 +1162,48 @@ also passed. The temporary LocalStack container and databases were removed.
   unmodified fingerprint blockers; the verifier self-test covers canonical
   tags/formulas and missing-tag fail-closed behavior. Regenerate artifacts and
   pin source revision in a separate commit after the functional change.
-- [ ] Rerun boundary/live proofs, Rust/schema/validator/wrapper/CLI gates,
+- [x] Rerun boundary/live proofs, Rust/schema/validator/wrapper/CLI gates,
   inspect the complete diff, and record the final clean handoff.
+
+## Issue #16 frozen-review repair results
+
+- [x] Functional repair commit: `d199cd2711bc9a290291f28116d91cf9272216a3`.
+  Foxtail now publishes neutral `Owner`, `Criticality`, and `Environment`
+  classification tags from `observation_tags`; EC2 manifest validation requires
+  the same fixture-owned facts. No role, scenario, finding selector, or policy
+  threshold was added to the public evidence.
+- [x] `scripts/verify_issue16_unseen.py --self-test` passed. It consumes the
+  canonical manifest tags, definition history offsets/network formula, clock
+  anchor, and cost profile; deleting the canonical `Owner` tag fails closed;
+  the only boundary mutation updates CPU `Maximum` and compact CPU values to
+  exact `5.0` through one helper.
+- [x] Exact archived f4c5 boundary proof passed after the repair: registered
+  `assess_ec2_evidence:v1`, canonical `4.0` produced one `idle_instance`
+  `optimization_finding`, and copied exact `5.0` produced
+  `inventory_observation` with no finding.
+- [x] Unmodified live proof passed with manifest-account credentials against
+  disposable Foxtail `:18086` and LocalStack `:4666`: idle positive `finding`,
+  idle negative `no_finding`, degraded `blocked` specifically for
+  `incomplete_window:ec2-idle-degraded-001`, resize positive `finding`, resize
+  negative `no_finding`; complete-control blocker arrays were empty. The exact
+  expected consumer reasons remained
+  `read_only_estate_fingerprint_mismatch` and `estate_fingerprint_mismatch`,
+  plus the intentional degraded blocker and `oracle_outcome_blocked`. The
+  verifier left the live manifest untouched and reports receipt readiness as
+  deferred to the authorized Unseen consumer refresh.
+- [x] Separate source pin/golden commit: `86fdd590a2c85a7937a0a522bf717a026cb4b712`,
+  naming functional source revision `d199cd2711bc9a290291f28116d91cf9272216a3`.
+  Definition digest remains
+  `sha256:aad7cc86551a2e60ec37942cc801293bf61c952fa7bda4f1b5481e58cb9cbcdf`;
+  final manifest digest is
+  `sha256:c7e4a21153161821cbf25303db527962110c95ae34a00b2c5f5dc6622d8734a8`.
+- [x] Post-pin gates passed: `cargo fmt --all -- --check`, `cargo test` (94
+  library, 6 API-contract, 20 mutation, 4 wrapper, and doc tests), clippy
+  with `-D warnings`, Draft 2020-12 validator with negatives, both shell
+  syntax checks, wrapper routing, and `git diff --check`. Full disposable
+  `scripts/verify_cli_interop.sh` passed against dedicated LocalStack 4.14.0
+  (all fixture/EC2 observation, mutation lifecycle, CloudWatch, Cost Explorer,
+  Resource Groups, Pricing, Compute Optimizer, CUR, and wrapper checks); the
+  container, service, and temporary database were removed.
+- [x] Final checked-out HEAD is `86fdd590a2c85a7937a0a522bf717a026cb4b712`
+  with a clean worktree.
