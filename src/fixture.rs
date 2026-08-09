@@ -53,6 +53,14 @@ pub const DEFAULT_ACCOUNT_ID: &str = "123456789012";
 pub const DEFAULT_REGION: &str = "us-east-1";
 pub const DEFAULT_LOCALSTACK_ENDPOINT: &str = "http://localhost:4566";
 pub const EC2_INSTANCE_TYPE_CATALOGUE: [&str; 3] = ["m6i.large", "t3.medium", "m6i.xlarge"];
+/// Neutral classification facts required on the ordinary EC2 observation
+/// surface. These values deliberately carry no fixture role, expected
+/// outcome, or policy hint.
+pub const NEUTRAL_OBSERVATION_TAGS: [(&str, &str); 3] = [
+    ("Owner", "unknown"),
+    ("Criticality", "unknown"),
+    ("Environment", "unknown"),
+];
 /// Mutating fixture controls are deliberately opt-in. A caller must set this
 /// to `isolated` before a mutation can affect fixture-owned rows.
 pub const ISOLATED_QUALIFICATION_ENV: &str = "FOXTAIL_QUALIFICATION_ENV";
@@ -3859,9 +3867,9 @@ fn observation_tags(
     // Neutral classification facts are ordinary public evidence required by
     // downstream adapters. They intentionally carry no fixture role,
     // expected outcome, or policy hint.
-    tags.insert("Owner".to_string(), "unknown".to_string());
-    tags.insert("Criticality".to_string(), "unknown".to_string());
-    tags.insert("Environment".to_string(), "unknown".to_string());
+    for (key, value) in NEUTRAL_OBSERVATION_TAGS {
+        tags.insert(key.to_string(), value.to_string());
+    }
     tags
 }
 

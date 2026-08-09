@@ -355,16 +355,14 @@ pub fn observations_from_manifest(manifest: &Value) -> Result<ManifestObservatio
             bail!("fixture manifest control '{control_id}' has an out-of-scope availability zone");
         }
         let tags = parse_tags(observed.get("tags"))?;
-        let expected_tags = [
+        let mut expected_tags = vec![
             ("Name", resource_id.as_str()),
             ("FoxtailFixture", fixture::FIXTURE_VERSION),
             ("FoxtailControl", control_id),
             ("FoxtailRole", expected_role),
             ("FoxtailScenario", expected_scenario),
-            ("Owner", "unknown"),
-            ("Criticality", "unknown"),
-            ("Environment", "unknown"),
         ];
+        expected_tags.extend(fixture::NEUTRAL_OBSERVATION_TAGS);
         if expected_tags
             .iter()
             .any(|(key, expected)| tags.get(*key).map(String::as_str) != Some(*expected))
@@ -733,6 +731,18 @@ mod tests {
             .enumerate()
             .map(|(index, (control_id, role, scenario))| {
                 let resource_id = format!("i-handler-{index}");
+                let mut tags = serde_json::Map::new();
+                tags.insert("Name".to_string(), json!(resource_id));
+                tags.insert(
+                    "FoxtailFixture".to_string(),
+                    json!("release-qualification-v1"),
+                );
+                tags.insert("FoxtailControl".to_string(), json!(control_id));
+                tags.insert("FoxtailRole".to_string(), json!(role));
+                tags.insert("FoxtailScenario".to_string(), json!(scenario));
+                for (key, value) in crate::fixture::NEUTRAL_OBSERVATION_TAGS {
+                    tags.insert(key.to_string(), json!(value));
+                }
                 json!({
                     "control_id": control_id,
                     "role": role,
@@ -745,16 +755,7 @@ mod tests {
                         "instance_type": "m6i.large",
                         "disable_api_termination": false,
                         "availability_zone": "us-east-1a",
-                        "tags": {
-                            "Name": resource_id,
-                            "FoxtailFixture": "release-qualification-v1",
-                            "FoxtailControl": control_id,
-                            "FoxtailRole": role,
-                            "FoxtailScenario": scenario,
-                            "Owner": "unknown",
-                            "Criticality": "unknown",
-                            "Environment": "unknown"
-                        }
+                        "tags": tags
                     }
                 })
             })

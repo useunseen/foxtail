@@ -23,6 +23,7 @@ import copy
 import datetime as dt
 from dataclasses import dataclass
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -202,10 +203,16 @@ def _canonical_positive_facts(
     if observed.get("metric_count") != len(offsets) * 3 or observed.get("cost_record_count") != len(offsets):
         raise RuntimeError("canonical positive realization has inconsistent evidence counts")
     anchor = _timestamp(manifest.get("clock", {}).get("anchor"), "canonical clock anchor missing")
-    network_base = network_profile.get("network_in_base")
+    network_in_base = network_profile.get("network_in_base")
+    network_out_base = network_profile.get("network_out_base")
     network_increment = network_profile.get("per_day_increment")
-    if type(network_base) not in {int, float} or type(network_increment) not in {int, float}:
+    if any(
+        type(value) not in {int, float} or not math.isfinite(float(value))
+        for value in (network_in_base, network_out_base, network_increment)
+    ):
         raise RuntimeError("canonical network profile is missing numeric formulas")
+    if float(network_in_base) == float(network_out_base):
+        raise RuntimeError("canonical network profile must keep NetworkIn and NetworkOut bases distinct")
     catalogue = next(
         (item for item in manifest.get("ec2_instance_type_catalogue", []) if item.get("instance_type") == "m6i.large"),
         None,
@@ -228,7 +235,8 @@ def _canonical_positive_facts(
         "cost_amount": float(profile["cost_amount"]),
         "cpu_value": float(profile["cpu_value"]),
         "offsets": offsets,
-        "network_base": float(network_base),
+        "network_in_base": float(network_in_base),
+        "network_out_base": float(network_out_base),
         "network_increment": float(network_increment),
     }
 
@@ -236,8 +244,14 @@ def _canonical_positive_facts(
 def _metric_value(facts: Mapping[str, Any], metric_name: str, offset: int, cpu_value: float) -> float:
     if metric_name == "CPUUtilization":
         return cpu_value
+    if metric_name == "NetworkIn":
+        base_key = "network_in_base"
+    elif metric_name == "NetworkOut":
+        base_key = "network_out_base"
+    else:
+        raise RuntimeError(f"unsupported canonical metric {metric_name!r}")
     day = (abs(offset) - 3_600) // 86_400
-    return float(facts["network_base"]) + float(day) * float(facts["network_increment"])
+    return float(facts[base_key]) + float(day) * float(facts["network_increment"])
 
 
 def _public_payload(facts: Mapping[str, Any]) -> dict[str, Any]:
@@ -534,17 +548,47 @@ def run_self_tests() -> dict[str, Any]:
         raise RuntimeError("self-test payload did not consume canonical classification tags")
     if [row["seconds_from_now"] for row in payload["public_row"]["metrics"]][::3] != facts["offsets"]:
         raise RuntimeError("self-test payload did not consume canonical history offsets")
-    expected_network = max(
-        _metric_value(facts, "NetworkIn", offset, facts["cpu_value"])
-        for offset in facts["offsets"]
-    )
-    observed_network = max(
-        row["value"]
-        for row in payload["public_row"]["metrics"]
-        if row["metric_name"] == "NetworkIn"
-    )
-    if observed_network != expected_network:
-        raise RuntimeError("self-test payload did not consume canonical network formula")
+    for metric_name, base_key in (
+        ("NetworkIn", "network_in_base"),
+        ("NetworkOut", "network_out_base"),
+    ):
+        expected_network = max(
+            _metric_value(facts, metric_name, offset, facts["cpu_value"])
+            for offset in facts["offsets"]
+        )
+        observed_network = max(
+            row["value"]
+            for row in payload["public_row"]["metrics"]
+            if row["metric_name"] == metric_name
+        )
+        if observed_network != expected_network:
+            raise RuntimeError(
+                f"self-test payload did not consume canonical {metric_name} formula"
+            )
+        if facts[base_key] not in {facts["network_in_base"], facts["network_out_base"]}:
+            raise RuntimeError(f"self-test omitted canonical {base_key}")
+    if facts["network_in_base"] == facts["network_out_base"]:
+        raise RuntimeError("self-test canonical network bases unexpectedly collapsed")
+    missing_network_out = copy.deepcopy(definition)
+    del missing_network_out["generation_rules"]["network_profile"]["network_out_base"]
+    try:
+        _canonical_positive_facts(missing_network_out, manifest)
+    except RuntimeError as error:
+        if "network profile" not in str(error):
+            raise RuntimeError(f"self-test missing network_out_base failed for the wrong reason: {error}") from error
+    else:
+        raise RuntimeError("self-test accepted a canonical definition without network_out_base")
+    drifting_network_out = copy.deepcopy(definition)
+    drifting_network_out["generation_rules"]["network_profile"]["network_out_base"] = facts[
+        "network_in_base"
+    ]
+    try:
+        _canonical_positive_facts(drifting_network_out, manifest)
+    except RuntimeError as error:
+        if "distinct" not in str(error):
+            raise RuntimeError(f"self-test network base drift failed for the wrong reason: {error}") from error
+    else:
+        raise RuntimeError("self-test accepted collapsed NetworkIn/NetworkOut bases")
     missing_tags = copy.deepcopy(manifest)
     positive = next(
         item
@@ -576,6 +620,8 @@ def run_self_tests() -> dict[str, Any]:
     return {
         "canonical_tags": sorted(facts["tags"]),
         "canonical_offsets": len(facts["offsets"]),
+        "network_in_base": facts["network_in_base"],
+        "network_out_base": facts["network_out_base"],
         "boundary_peak": 5.0,
         "self_test": "passed",
     }

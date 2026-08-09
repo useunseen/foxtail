@@ -6,6 +6,7 @@ use chrono::{DateTime, Timelike, Utc};
 use foxtail::{db, fixture, serve};
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
+use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tower::ServiceExt;
 
@@ -121,10 +122,22 @@ async fn ec2_query_describe_instances_returns_exact_manifest_rows() {
     }
     assert_eq!(body.matches("<instanceId>").count(), 5);
     assert_eq!(body.matches("<item><instanceId>").count(), 5);
-    for key in ["Owner", "Criticality", "Environment"] {
-        assert_eq!(body.matches(&format!("<key>{key}</key>")).count(), 5);
+    for (key, _) in fixture::NEUTRAL_OBSERVATION_TAGS {
+        assert_eq!(
+            body.matches(&format!("<key>{key}</key>")).count(),
+            expected_ids.len()
+        );
     }
-    assert_eq!(body.matches("<value>unknown</value>").count(), 15);
+    let mut neutral_value_multiplicities = BTreeMap::new();
+    for (_, value) in fixture::NEUTRAL_OBSERVATION_TAGS {
+        *neutral_value_multiplicities.entry(value).or_insert(0usize) += 1;
+    }
+    for (value, multiplicity) in neutral_value_multiplicities {
+        assert_eq!(
+            body.matches(&format!("<value>{value}</value>")).count(),
+            expected_ids.len() * multiplicity
+        );
+    }
 }
 
 #[tokio::test]
