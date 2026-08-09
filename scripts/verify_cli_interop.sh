@@ -334,6 +334,75 @@ for instance in instances:
 PY
 log_step "Verified Foxtail AWS-compatible EC2 observation: exactly five manifest rows and stable metadata"
 
+while IFS=$'\t' read -r fixture_id expected_termination; do
+  FOXTAIL_ATTRIBUTE="$(aws_json ec2 describe-instance-attribute \
+    --instance-id "$fixture_id" --attribute disableApiTermination)"
+  FOXTAIL_ATTRIBUTE="$FOXTAIL_ATTRIBUTE" EXPECTED_TERMINATION="$expected_termination" \
+    FIXTURE_ID="$fixture_id" python3 - <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ["FOXTAIL_ATTRIBUTE"])
+value = payload.get("DisableApiTermination", {}).get("Value")
+expected = os.environ["EXPECTED_TERMINATION"].lower() == "true"
+if type(value) is not bool or value != expected:
+    raise SystemExit(
+        f"DescribeInstanceAttribute mismatch for {os.environ['FIXTURE_ID']}: {value!r} != {expected!r}"
+    )
+PY
+done < <(FIXTURE_MANIFEST="$FIXTURE_MANIFEST" python3 - <<'PY'
+import json
+import os
+
+manifest = json.loads(os.environ["FIXTURE_MANIFEST"])
+for resource in manifest["resources"]:
+    print(resource["resource_id"], str(resource["observed"]["disable_api_termination"]).lower(), sep="\t")
+PY
+)
+log_step "Verified Foxtail DescribeInstanceAttribute exact IDs and boolean fixture facts"
+
+for instance_type in m6i.large t3.medium m6i.xlarge; do
+  FOXTAIL_TYPES="$(aws_json ec2 describe-instance-types --instance-types "$instance_type")"
+  FOXTAIL_TYPES="$FOXTAIL_TYPES" EXPECTED_INSTANCE_TYPE="$instance_type" python3 - <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ["FOXTAIL_TYPES"])
+records = payload.get("InstanceTypes")
+if not isinstance(records, list) or len(records) != 1:
+    raise SystemExit("DescribeInstanceTypes did not return exactly one requested record")
+record = records[0]
+expected = os.environ["EXPECTED_INSTANCE_TYPE"]
+if record.get("InstanceType") != expected:
+    raise SystemExit(f"unexpected type record {record.get('InstanceType')!r} for {expected}")
+if record.get("SupportedRootDeviceTypes") != ["ebs"]:
+    raise SystemExit("missing or incorrect SupportedRootDeviceTypes")
+if record.get("SupportedVirtualizationTypes") != ["hvm"]:
+    raise SystemExit("missing or incorrect SupportedVirtualizationTypes")
+if (record.get("ProcessorInfo") or {}).get("SupportedArchitectures") != ["x86_64"]:
+    raise SystemExit("missing or incorrect ProcessorInfo.SupportedArchitectures")
+if (record.get("NetworkInfo") or {}).get("EnaSupport") != "required":
+    raise SystemExit("missing or incorrect NetworkInfo.EnaSupport")
+PY
+done
+log_step "Verified Foxtail DescribeInstanceTypes exact current/target catalogue and public fields"
+
+if aws_json ec2 describe-instance-types --instance-types t3.unknown >"$TMP_DIR/unsupported-type.json" 2>"$TMP_DIR/unsupported-type.err"; then
+  echo "unsupported DescribeInstanceTypes request unexpectedly succeeded" >&2
+  exit 1
+fi
+if ! grep -q "InvalidInstanceType.NotFound" "$TMP_DIR/unsupported-type.err"; then
+  echo "unsupported DescribeInstanceTypes request did not return deterministic error" >&2
+  cat "$TMP_DIR/unsupported-type.err" >&2
+  exit 1
+fi
+if aws_json ec2 describe-instance-types --instance-types m6i.large --next-token unsupported \
+  >"$TMP_DIR/continuation.json" 2>"$TMP_DIR/continuation.err"; then
+  echo "unsupported DescribeInstanceTypes continuation unexpectedly succeeded" >&2
+  exit 1
+fi
+log_step "Verified deterministic EC2 observation negatives and unsupported continuation handling"
+
 MUTATION_STATUS="$(curl -fsS "$ENDPOINT/_mock/fixture/mutation/status")"
 validate_mutation_document status "$MUTATION_STATUS"
 CLI_MUTATION_STATUS="$("$BIN" --database-url "sqlite:$TMP_DB" fixture mutation-status)"

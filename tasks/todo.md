@@ -279,6 +279,58 @@ Invariant: qualification mutations can affect only fresh, manifest-bound, one-us
 - Triaged todo `056` as external to this extracted service repo because the referenced runtime files do not exist in this checkout.
 - No remaining repo-local implementation todo is queued in `tasks/todo.md`; the remaining open items are external runtime work or intentionally out of scope for this local-only service.
 
+# Issue #14: EC2 Observation Oracle Evidence
+
+Pinned base: `fa7675813fa565cf6aa325bcb36e2b9abfc5b759` (`origin/main`, after merged PR #13).
+
+Invariant: Foxtail owns only deterministic fixture facts and AWS-compatible read-only observation responses. Every successful EC2 attribute or instance-type observation is bound to the exact realized fixture identity and persisted catalogue facts; malformed, duplicate, unknown, unsupported, inconsistent, or unsupported-continuation requests fail closed without synthesizing oracle outcomes. Unseen remains the authority for evidence validation, policy/oracle assessment, immutable receipts, and release qualification.
+
+## Acceptance Map
+
+- [x] 1. Attribute success: fixture manifest/data owns a required public termination-protection boolean; EC2 handler and Query dispatcher expose it for realized read-only fixture instances. Consumers are ordinary AWS CLI and Unseen `AwsCompatibleObservationPort`; prove handler/parser/route plus CLI JSON success and disposable smoke.
+- [x] 2. Attribute exact binding/shape: standard EC2 Query/XML binds exactly requested `InstanceId` and returns `DisableApiTermination.Value` as a real boolean from fixture facts, with no default synthesis; prove exact-ID and parser/serializer assertions.
+- [x] 3. Attribute failures: missing/unknown IDs, unsupported attributes, malformed members/forms, duplicate `Action`/`InstanceId`/`Attribute`, and inconsistent persisted fixture data return deterministic AWS-compatible non-2xx errors while preserving database state; prove focused negatives and fixture-integrity tests.
+- [x] 4. Instance-types success: exact current and recommendation target types (`m6i.large`, `t3.medium`, `m6i.xlarge`) work across realized controls; fixture owns an explicit exact catalogue; prove each request independently.
+- [x] 5. Type shape: every returned record contains `InstanceType`, `SupportedRootDeviceTypes`, `SupportedVirtualizationTypes`, `ProcessorInfo.SupportedArchitectures`, and `NetworkInfo.EnaSupport` in Query/XML decodable by ordinary AWS CLI; prove field-complete JSON/XML assertions.
+- [x] 6. Type exactness/fail closed: facts are fixture-owned per exact type; unknown/unsupported types, duplicate or malformed members/requests, inconsistent catalogue data, invalid pagination inputs/tokens, and fabricated current/target reuse error deterministically. If continuation is unsupported, reject it explicitly and test; otherwise bind/test tokens fully.
+- [x] 7. Dispatcher preservation: distinguish `DescribeInstances`, `DescribeInstanceAttribute`, and `DescribeInstanceTypes`, preserving existing read-only, lifecycle, and mutation behavior; prove dispatcher/route regressions.
+- [x] 8. Wrapper: route both operations through Foxtail, never the LocalStack mutation endpoint; extend Rust wrapper tests and `scripts/verify_wrapper_routing.sh` as needed.
+- [x] 9. Focused tests: cover handler/parser/manifest/serializer/dispatcher success, exact identity, duplicates, malformed/unsupported inputs, inconsistent data, and continuation-token behavior.
+- [x] 10. Disposable CLI interop: extend `scripts/verify_cli_interop.sh` for both operations against Foxtail, asserting exact IDs/boolean/type records/all public fields, deterministic negatives, and distinct Foxtail vs LocalStack endpoints while preserving lifecycle/mutation proof.
+- [ ] 11. Sibling proof: using Unseen read-only commit `f4c5e7802def856fb4d4ec6996cbd616ea16bd95`, run its real `AwsCompatibleObservationPort.observe()` against repaired Foxtail disposable state; confirm no `UnsupportedAction`, missing instance-attribute/target-compatibility evidence, or `unsupported_capability`. Add a reproducible Foxtail-side harness when possible; report exact environment blocker otherwise; do not edit Unseen.
+- [ ] 12. Broad regression: run format, full Rust tests, clippy with `-D warnings`, pinned fixture validators (including negatives), shell syntax, wrapper proof, diff check, and full disposable CLI interop with required LocalStack settings.
+- [ ] 13. Contract/source report: update fixture schema/data/goldens/digests/source-owned facts where required and report exact final Foxtail commits/revision; never edit sibling Unseen pins/contracts.
+
+## Execution Plan
+
+- [x] Inspect EC2 fixture schema/manifest, handler, dispatcher, wrapper, scripts, tests, migration, Compute Optimizer target logic, and sibling compatibility code at the pinned revisions.
+- [x] Implement one validated Foxtail observation boundary for `DescribeInstanceAttribute` and `DescribeInstanceTypes`, keeping route orchestration in `serve.rs` and fixture truth/schema/goldens in their owners.
+- [x] Add focused success/failure/identity/duplicate/integrity/pagination tests and wrapper/CLI smoke assertions; update deterministic fixture artefacts and docs as needed.
+- [ ] Run focused verification, commit coherent implementation batches without amending, and review the complete diff against every acceptance criterion.
+- [ ] Run broad verification and sibling live compatibility proof; record exact results, residual gaps, and final commits below.
+
+## Issue #14 Results / Review
+
+Implementation is complete and ready for the non-amended functional commit plus
+the required source-pin/golden follow-up. The checked-in manifest now owns the
+strict `disable_api_termination` boolean for every realized read-only control
+and an exact catalogue for `m6i.large`, `t3.medium`, and `m6i.xlarge`; the
+handler validates those facts before serving Query/XML observations.
+
+- Focused proof passed: `cargo test handlers::ec2 --lib`, the EC2 oracle
+  integration route (including exact IDs, boolean shape, duplicate/unknown/
+  unsupported/continuation failures, and persisted digest preservation),
+  `bash scripts/verify_wrapper_routing.sh`, and
+  `python3 scripts/validate_release_fixture.py --negative`.
+- Full Rust tests and clippy passed before the final duplicate/integrity test
+  tightening; they will be rerun in the broad verification pass.
+- The disposable CLI script and sibling `AwsCompatibleObservationPort.observe`
+  live proof remain pending because this environment has no checked-in
+  `mock_data.db`, no `FOXTAIL_MUTATION_AMI_ID`, and LocalStack at
+  `127.0.0.1:4666` is unavailable. The ordinary AWS CLI attribute/type
+  success path was separately proven against a temporary realized Foxtail
+  server; no Unseen files or contracts were edited.
+
 ## Scenario Data Quality Verification
 
 - [x] Compare generated metric and cost outputs across `baseline`, `spike`, and `idle-heavy` on an isolated temp database.

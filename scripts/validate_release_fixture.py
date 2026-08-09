@@ -278,7 +278,34 @@ def run_negative_checks(
             "finding_type", "idle_instance"
         ),
     )
-    for field in ("instance_state", "instance_type", "availability_zone", "tags"):
+    expect_schema_rejection(
+        manifest_schema,
+        manifest,
+        "manifest missing EC2 instance type catalogue",
+        lambda value: value.pop("ec2_instance_type_catalogue", None),
+    )
+    for field in (
+        "instance_type",
+        "supported_root_device_types",
+        "supported_virtualization_types",
+        "supported_architectures",
+        "ena_support",
+    ):
+        expect_schema_rejection(
+            manifest_schema,
+            manifest,
+            f"manifest.ec2_instance_type_catalogue[0] missing {field}",
+            lambda value, field=field: value["ec2_instance_type_catalogue"][0].pop(
+                field, None
+            ),
+        )
+    for field in (
+        "instance_state",
+        "instance_type",
+        "disable_api_termination",
+        "availability_zone",
+        "tags",
+    ):
         expect_schema_rejection(
             manifest_schema,
             manifest,

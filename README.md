@@ -237,11 +237,19 @@ Resource Groups Tagging. AWS may retain terminated instances in
 ### EC2 fixture observation
 
 - `ec2 describe-instances`
+- `ec2 describe-instance-attribute --instance-id <id> --attribute disableApiTermination`
+- `ec2 describe-instance-types --instance-types <type>...`
 
-The wrapper routes this read-only Query/XML operation to Foxtail. After the
-release-qualification fixture is realized, the response contains exactly the
-five manifest read-only controls, including their stable state, instance type,
-availability zone, and manifest-bound tags. The four disposable mutation
+The wrapper routes these read-only Query/XML operations to Foxtail. After the
+release-qualification fixture is realized, `describe-instances` contains
+exactly the five manifest read-only controls, including their stable state,
+instance type, availability zone, and manifest-bound tags. The attribute
+operation returns the manifest-owned `DisableApiTermination.Value` boolean for
+the exact requested instance ID. The type operation is deliberately finite:
+the fixture catalogue contains the current `m6i.large` type and Compute
+Optimizer targets `t3.medium`, `m6i.large`, and `m6i.xlarge`, with each public
+EC2 compatibility field serialized from that catalogue. Unknown types and
+unsupported continuation tokens fail closed. The four disposable mutation
 targets are never exposed on this observation surface. Keep this Foxtail
 observation endpoint separate from the dedicated mutation LocalStack endpoint
 (for example, Foxtail on `127.0.0.1:8080` and mutation LocalStack on `:4666`).

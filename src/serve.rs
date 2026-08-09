@@ -2524,7 +2524,10 @@ async fn dispatch_aws_request(
     } else if target.starts_with("GraniteServiceVersion20100801.") {
         handle_cloudwatch_json(target, pool, body, protocol, injected_now).await
     } else if target.is_empty() && content_type.contains("application/x-www-form-urlencoded") {
-        if ec2::action_from_form(&body).as_deref() == Some("DescribeInstances") {
+        if matches!(
+            ec2::action_from_form(&body).as_deref(),
+            Some("DescribeInstances" | "DescribeInstanceAttribute" | "DescribeInstanceTypes")
+        ) {
             handle_ec2_query(pool, body, protocol).await
         } else {
             handle_cloudwatch_query(pool, body, protocol, injected_now).await
@@ -2548,16 +2551,8 @@ async fn handle_ec2_query(
     body: Bytes,
     protocol: Protocol,
 ) -> axum::response::Response {
-    let query = match ec2::parse_query_from_form(&body) {
-        Ok(query) if ec2::validate_describe_instances(&query).is_ok() => query,
-        Ok(query) => {
-            return error_response(
-                protocol,
-                "InvalidAction",
-                &format!("The action '{}' is not supported", query.action),
-                StatusCode::BAD_REQUEST,
-            );
-        }
+    let query = match ec2::parse_ec2_query_from_form(&body) {
+        Ok(query) => query,
         Err(message) => {
             return error_response(
                 protocol,
@@ -2571,6 +2566,7 @@ async fn handle_ec2_query(
         account_id,
         anchor,
         observations,
+        instance_type_catalogue,
     } = match load_fixture_ec2_observations(&pool).await {
         Ok(value) => value,
         Err(error) => {
@@ -2584,34 +2580,83 @@ async fn handle_ec2_query(
         }
     };
 
-    let selected = if query.instance_ids.is_empty() {
-        observations
-    } else {
-        let by_id = observations
-            .into_iter()
-            .map(|observation| (observation.resource_id.clone(), observation))
-            .collect::<BTreeMap<_, _>>();
-        let mut selected = Vec::with_capacity(query.instance_ids.len());
-        for resource_id in query.instance_ids {
-            let Some(observation) = by_id.get(&resource_id) else {
+    match query {
+        ec2::Ec2Query::Instances(query) => {
+            let selected = if query.instance_ids.is_empty() {
+                observations
+            } else {
+                let by_id = observations
+                    .into_iter()
+                    .map(|observation| (observation.resource_id.clone(), observation))
+                    .collect::<BTreeMap<_, _>>();
+                let mut selected = Vec::with_capacity(query.instance_ids.len());
+                for resource_id in query.instance_ids {
+                    let Some(observation) = by_id.get(&resource_id) else {
+                        return error_response(
+                            protocol,
+                            "InvalidInstanceID.NotFound",
+                            &format!("The instance ID '{resource_id}' does not exist"),
+                            StatusCode::BAD_REQUEST,
+                        );
+                    };
+                    selected.push(observation.clone());
+                }
+                selected
+            };
+            let xml = ec2::describe_instances_xml(&account_id, &anchor, &selected);
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/xml; charset=utf-8")],
+                xml,
+            )
+                .into_response()
+        }
+        ec2::Ec2Query::InstanceAttribute(query) => {
+            let Some(observation) = observations
+                .iter()
+                .find(|observation| observation.resource_id == query.instance_id)
+            else {
                 return error_response(
                     protocol,
                     "InvalidInstanceID.NotFound",
-                    &format!("The instance ID '{resource_id}' does not exist"),
+                    &format!("The instance ID '{}' does not exist", query.instance_id),
                     StatusCode::BAD_REQUEST,
                 );
             };
-            selected.push(observation.clone());
+            let xml = ec2::describe_instance_attribute_xml(observation, &query);
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/xml; charset=utf-8")],
+                xml,
+            )
+                .into_response()
         }
-        selected
-    };
-    let xml = ec2::describe_instances_xml(&account_id, &anchor, &selected);
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "text/xml; charset=utf-8")],
-        xml,
-    )
-        .into_response()
+        ec2::Ec2Query::InstanceTypes(query) => {
+            let by_type = instance_type_catalogue
+                .into_iter()
+                .map(|instance_type| (instance_type.instance_type.clone(), instance_type))
+                .collect::<BTreeMap<_, _>>();
+            let mut selected = Vec::with_capacity(query.instance_types.len());
+            for instance_type in query.instance_types {
+                let Some(observation) = by_type.get(&instance_type) else {
+                    return error_response(
+                        protocol,
+                        "InvalidInstanceType.NotFound",
+                        &format!("The instance type '{instance_type}' does not exist"),
+                        StatusCode::BAD_REQUEST,
+                    );
+                };
+                selected.push(observation.clone());
+            }
+            let xml = ec2::describe_instance_types_xml(&selected);
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/xml; charset=utf-8")],
+                xml,
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn handle_resource_groups_tagging(
