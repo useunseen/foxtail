@@ -208,6 +208,7 @@ struct GetProductsRequest {
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct ComputeOptimizerRequest {
+    instance_arns: Option<Vec<String>>,
     next_token: Option<String>,
     max_results: Option<u64>,
 }
@@ -4941,6 +4942,25 @@ async fn handle_get_ec2_instance_recommendations(
     let req: ComputeOptimizerRequest = serde_json::from_slice(&body)
         .map_err(|e| CostUsageError::Validation(format!("Invalid JSON body: {}", e)))?;
 
+    let requested_instance_ids = req
+        .instance_arns
+        .map(|arns| {
+            arns.into_iter()
+                .map(|arn| {
+                    arn.rsplit('/')
+                        .next()
+                        .filter(|resource_id| !resource_id.is_empty())
+                        .map(str::to_string)
+                        .ok_or_else(|| {
+                            CostUsageError::Validation(
+                                "InstanceArns contains a malformed instance ARN.".to_string(),
+                            )
+                        })
+                })
+                .collect::<std::result::Result<BTreeSet<_>, _>>()
+        })
+        .transpose()?;
+
     let page_start = parse_usize_token(req.next_token.as_deref(), "nextToken")?;
     let page_size = clamp_page_size(req.max_results, 50, 100);
     let rows = sqlx::query(
@@ -4957,6 +4977,15 @@ async fn handle_get_ec2_instance_recommendations(
     .fetch_all(&pool)
     .await
     .map_err(|e| CostUsageError::Internal(e.into()))?;
+
+    let rows = rows
+        .into_iter()
+        .filter(|row| {
+            requested_instance_ids
+                .as_ref()
+                .is_none_or(|requested| requested.contains(row.get::<String, _>("id").as_str()))
+        })
+        .collect::<Vec<_>>();
 
     if page_start > rows.len() {
         return Err(CostUsageError::Validation(
@@ -8030,6 +8059,63 @@ mod tests {
         assert_eq!(recs[0]["finding"], "UNDER_PROVISIONED");
         assert_eq!(recs[1]["instanceName"], "idle-node");
         assert_eq!(recs[1]["finding"], "OVER_PROVISIONED");
+    }
+
+    #[tokio::test]
+    async fn compute_optimizer_ec2_recommendations_bind_requested_instance_arns() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO resources (id, resource_type, region, scenario, tags)
+             VALUES
+             ('i-low', 'ec2', 'us-east-1', 'Baseline', '{\"Name\":\"idle-node\"}'),
+             ('i-high', 'ec2', 'us-east-1', 'Baseline', '{\"Name\":\"busy-node\"}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (resource_id, value) in [("i-low", 8.0), ("i-high", 82.0)] {
+            sqlx::query(
+                "INSERT INTO metrics (resource_id, namespace, metric_name, seconds_from_now, value)
+                 VALUES (?, 'AWS/EC2', 'CPUUtilization', -3600, ?)",
+            )
+            .bind(resource_id)
+            .bind(value)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let app = build_app(pool);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-amz-json-1.0")
+                    .header(
+                        "x-amz-target",
+                        "ComputeOptimizerService.GetEC2InstanceRecommendations",
+                    )
+                    .body(Body::from(
+                        json!({
+                            "InstanceArns": [
+                                "arn:aws:ec2:us-east-1:123456789012:instance/i-low"
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        let recs = body["instanceRecommendations"].as_array().unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0]["instanceName"], "idle-node");
+        assert_eq!(recs[0]["finding"], "OVER_PROVISIONED");
+        assert!(recs[0]["instanceArn"].as_str().unwrap().ends_with("/i-low"));
     }
 
     #[tokio::test]
