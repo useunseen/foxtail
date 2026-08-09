@@ -361,6 +361,9 @@ pub fn observations_from_manifest(manifest: &Value) -> Result<ManifestObservatio
             ("FoxtailControl", control_id),
             ("FoxtailRole", expected_role),
             ("FoxtailScenario", expected_scenario),
+            ("Owner", "unknown"),
+            ("Criticality", "unknown"),
+            ("Environment", "unknown"),
         ];
         if expected_tags
             .iter()
@@ -747,7 +750,10 @@ mod tests {
                             "FoxtailFixture": "release-qualification-v1",
                             "FoxtailControl": control_id,
                             "FoxtailRole": role,
-                            "FoxtailScenario": scenario
+                            "FoxtailScenario": scenario,
+                            "Owner": "unknown",
+                            "Criticality": "unknown",
+                            "Environment": "unknown"
                         }
                     }
                 })

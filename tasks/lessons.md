@@ -18,3 +18,9 @@
   manifest to make a cross-repository receipt ready; preserve the exact
   contract, report the downstream fingerprint/source-refresh blocker, and leave
   contract refresh ownership with the consumer repository.
+
+- A cross-repository boundary verifier must consume canonical fixture tags and
+  evidence formulas directly. If a downstream adapter needs classification
+  fields, add neutral fixture-owned public facts and make missing values fail
+  closed; never invent them in the verifier or reconstruct timestamps/costs
+  from unrelated constants.

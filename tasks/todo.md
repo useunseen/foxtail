@@ -1145,3 +1145,22 @@ also passed. The temporary LocalStack container and databases were removed.
   `sha256:aad7cc86551a2e60ec37942cc801293bf61c952fa7bda4f1b5481e58cb9cbcdf`;
   checked-in manifest digest is
   `sha256:b203911790524c465059a9d619abf64544638563b1390a1825076bb98ef5bccf`.
+
+## Issue #16 frozen-review repair plan (ac247d5)
+
+- [x] Replace verifier-injected classification tags and reconstructed metric,
+  timestamp, network, and cost evidence with neutral fixture-owned facts read
+  from the canonical definition/manifest and ordinary public responses. The
+  fixture now emits neutral `Owner`, `Criticality`, and `Environment` tags as
+  ordinary public evidence; roles/scenarios remain unchanged and are not used
+  as assessor input.
+- [x] Keep the exact archived f4c5 boundary proof and unmodified live blocker
+  reporting while moving archived imports/temp lifetime into a typed owner and
+  encapsulating the one deliberate CPU 5.0 boundary mutation.
+- [x] Add focused assertions for canonical classification/evidence consumption,
+  absent-tag failure, assessor identity, 4.0 finding, 5.0 no-finding, and the
+  unmodified fingerprint blockers; the verifier self-test covers canonical
+  tags/formulas and missing-tag fail-closed behavior. Regenerate artifacts and
+  pin source revision in a separate commit after the functional change.
+- [ ] Rerun boundary/live proofs, Rust/schema/validator/wrapper/CLI gates,
+  inspect the complete diff, and record the final clean handoff.

@@ -267,11 +267,23 @@ The committed verifier archives only Unseen revision
 repository, verifies the imported module paths, and then invokes the registered
 `assess_ec2_evidence:v1` adapter/assessor. Its default boundary mode proves the
 canonical positive fixture/public shape at `4.0` produces one `idle_instance`
-finding and that a copied exact-`5.0` input produces no finding:
+finding and that a copied exact-`5.0` input produces no finding. The boundary
+payload consumes the canonical manifest's neutral `Owner`, `Criticality`, and
+`Environment` tags plus the definition's metric formulas, history offsets,
+clock anchor, and cost profile; it does not invent classification or evidence
+values:
 
 ~~~~bash
 /Users/murphy/workspace/iacai0/unseen-agent/.venv/bin/python \
   scripts/verify_issue16_unseen.py
+~~~~
+
+Run the local verifier self-test to assert that canonical tags and metric
+formulas are consumed and that removing a required classification tag fails
+closed, without importing Unseen:
+
+~~~~bash
+python3 scripts/verify_issue16_unseen.py --self-test
 ~~~~
 
 After a disposable Foxtail service is realized, `--live` is a separate proof

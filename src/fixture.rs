@@ -3856,6 +3856,12 @@ fn observation_tags(
     tags.insert("FoxtailControl".to_string(), control_id.to_string());
     tags.insert("FoxtailRole".to_string(), role.to_string());
     tags.insert("FoxtailScenario".to_string(), scenario.to_string());
+    // Neutral classification facts are ordinary public evidence required by
+    // downstream adapters. They intentionally carry no fixture role,
+    // expected outcome, or policy hint.
+    tags.insert("Owner".to_string(), "unknown".to_string());
+    tags.insert("Criticality".to_string(), "unknown".to_string());
+    tags.insert("Environment".to_string(), "unknown".to_string());
     tags
 }
 
