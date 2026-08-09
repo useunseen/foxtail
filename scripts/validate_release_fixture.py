@@ -29,6 +29,7 @@ except ImportError as error:  # pragma: no cover - exercised by the CLI
 
 
 REQUIRED_JSONSCHEMA_VERSION = "4.26.0"
+SUPPORTED_FINDING_TYPES = frozenset({"idle_instance", "rightsizing"})
 FORBIDDEN_KEYS = frozenset(
     {
         "Required",
@@ -63,6 +64,65 @@ def iter_forbidden_paths(value: Any, path: str = "$") -> Iterable[str]:
             yield from iter_forbidden_paths(child, f"{path}[{index}]")
 
 
+def iter_finding_type_paths(value: Any, path: str = "$") -> Iterable[tuple[str, Any]]:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_path = f"{path}.{key}"
+            if key == "finding_type":
+                yield child_path, child
+            yield from iter_finding_type_paths(child, child_path)
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            yield from iter_finding_type_paths(child, f"{path}[{index}]")
+
+
+def is_definition_control_path(path: str) -> bool:
+    prefix = "$.controls["
+    if not path.startswith(prefix) or not path.endswith("]"):
+        return False
+    index = path[len(prefix) : -1]
+    return bool(index) and index.isdigit()
+
+
+def validate_finding_type_fields(document: Any) -> None:
+    if not isinstance(document, dict):
+        return
+    is_definition = document.get("schema") == "foxtail.release-fixture-definition/v1"
+    for path, selector in iter_finding_type_paths(document):
+        parent_path = path[: -len(".finding_type")]
+        if not is_definition or not is_definition_control_path(parent_path):
+            raise ValueError(f"finding_type is misplaced at {path}")
+        if not isinstance(selector, str) or not selector:
+            raise ValueError(f"finding_type must be a non-empty string at {path}")
+        if selector not in SUPPORTED_FINDING_TYPES:
+            raise ValueError(f"unsupported finding_type at {path}: {selector!r}")
+
+    if not is_definition:
+        return
+    controls = document.get("controls")
+    if not isinstance(controls, list):
+        raise ValueError("definition controls must be an array")
+    for index, control in enumerate(controls):
+        if not isinstance(control, dict):
+            raise ValueError(f"definition control at index {index} must be an object")
+        role = control.get("role")
+        if role in {"positive", "negative", "degraded"}:
+            selector = control.get("finding_type")
+            if not isinstance(selector, str) or not selector:
+                raise ValueError(
+                    f"read-only definition control at index {index} requires finding_type"
+                )
+            if selector not in SUPPORTED_FINDING_TYPES:
+                raise ValueError(
+                    f"unsupported finding_type for definition control at index {index}"
+                )
+        elif role == "mutation":
+            if "finding_type" in control:
+                raise ValueError(
+                    f"mutation definition control at index {index} must not declare finding_type"
+                )
+
+
 def validate(schema_path: Path, document_path: Path) -> Any:
     schema = load_json(schema_path)
     document = load_json(document_path)
@@ -79,6 +139,11 @@ def validate(schema_path: Path, document_path: Path) -> Any:
             for error in errors[:5]
         )
         raise SystemExit(f"{document_path} failed Draft 2020-12 validation: {details}")
+
+    try:
+        validate_finding_type_fields(document)
+    except ValueError as error:
+        raise SystemExit(f"{document_path} failed selector validation: {error}") from error
 
     forbidden = list(iter_forbidden_paths(document))
     if forbidden:
@@ -103,12 +168,25 @@ def expect_forbidden_rejection(schema_path: Path, document: Any, label: str, pat
     raise SystemExit(f"negative policy check unexpectedly accepted {label}.{key}")
 
 
-def validate_value(schema_path: Path, document: Any) -> None:
+def schema_errors(schema_path: Path, document: Any) -> list[jsonschema.ValidationError]:
     schema = load_json(schema_path)
+    try:
+        jsonschema.Draft202012Validator.check_schema(schema)
+    except jsonschema.exceptions.SchemaError as error:
+        raise SystemExit(f"invalid Draft 2020-12 schema {schema_path}: {error}") from error
     validator = jsonschema.Draft202012Validator(schema, format_checker=jsonschema.FormatChecker())
-    errors = list(validator.iter_errors(document))
+    return list(validator.iter_errors(document))
+
+
+def validate_value(schema_path: Path, document: Any) -> None:
+    errors = schema_errors(schema_path, document)
+    selector_error = None
+    try:
+        validate_finding_type_fields(document)
+    except ValueError as error:
+        selector_error = error
     forbidden = list(iter_forbidden_paths(document))
-    if errors or forbidden:
+    if errors or forbidden or selector_error:
         raise ValueError("forbidden policy field rejected")
 
 
@@ -120,11 +198,9 @@ def expect_schema_rejection(
 ) -> None:
     mutated = copy.deepcopy(document)
     mutate(mutated)
-    try:
-        validate_value(schema_path, mutated)
-    except ValueError:
+    if schema_errors(schema_path, mutated):
         return
-    raise SystemExit(f"negative schema check unexpectedly accepted {label}")
+    raise SystemExit(f"published schema unexpectedly accepted {label}")
 
 
 def run_negative_checks(
@@ -153,6 +229,54 @@ def run_negative_checks(
         "manifest.control_catalogue[0]",
         ("control_catalogue", 0),
         "Stretch",
+    )
+    expect_schema_rejection(
+        definition_schema,
+        definition,
+        "definition.controls[0] missing finding_type",
+        lambda value: value["controls"][0].pop("finding_type", None),
+    )
+    expect_schema_rejection(
+        definition_schema,
+        definition,
+        "definition.controls[0] empty finding_type",
+        lambda value: value["controls"][0].__setitem__("finding_type", ""),
+    )
+    expect_schema_rejection(
+        definition_schema,
+        definition,
+        "definition.controls[0] unsupported finding_type",
+        lambda value: value["controls"][0].__setitem__("finding_type", "unsupported"),
+    )
+    expect_schema_rejection(
+        definition_schema,
+        definition,
+        "definition mutation control finding_type",
+        lambda value: value["controls"][5].__setitem__("finding_type", "idle_instance"),
+    )
+    expect_schema_rejection(
+        definition_schema,
+        definition,
+        "definition nested finding_type",
+        lambda value: value["controls"][0]["evidence"].__setitem__(
+            "finding_type", "idle_instance"
+        ),
+    )
+    expect_schema_rejection(
+        manifest_schema,
+        manifest,
+        "manifest resource nested finding_type",
+        lambda value: value["resources"][0]["evidence"].__setitem__(
+            "finding_type", "idle_instance"
+        ),
+    )
+    expect_schema_rejection(
+        manifest_schema,
+        manifest,
+        "manifest control catalogue finding_type",
+        lambda value: value["control_catalogue"][0].__setitem__(
+            "finding_type", "idle_instance"
+        ),
     )
     for field in ("instance_state", "instance_type", "availability_zone", "tags"):
         expect_schema_rejection(

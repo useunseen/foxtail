@@ -4,6 +4,11 @@
 //! AWS-compatible observation surface.  The definition is a stable declaration
 //! of intent; a manifest is one canonical realization of that definition
 //! against the currently discovered EC2 estate.
+//!
+//! A read-only definition control's finding_type selects the matching
+//! production policy registration in the consuming qualification runtime.  It
+//! is metadata for routing only: evidence remains the source of oracle
+//! outcomes, and roles, scenarios, tags, and prose never become findings.
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
@@ -42,7 +47,8 @@ const FORBIDDEN_POLICY_KEYS: [&str; 9] = [
 pub const FIXTURE_VERSION: &str = "release-qualification-v1";
 pub const DEFINITION_SCHEMA: &str = "foxtail.release-fixture-definition/v1";
 pub const MANIFEST_SCHEMA: &str = "foxtail.release-fixture-manifest/v1";
-pub const DEFINITION_REVISION: &str = "1.0.0";
+pub const DEFINITION_REVISION: &str = "1.0.1";
+pub const SUPPORTED_FINDING_TYPES: [&str; 2] = ["idle_instance", "rightsizing"];
 pub const DEFAULT_ACCOUNT_ID: &str = "123456789012";
 pub const DEFAULT_REGION: &str = "us-east-1";
 pub const DEFAULT_LOCALSTACK_ENDPOINT: &str = "http://localhost:4566";
@@ -306,6 +312,7 @@ pub fn canonical_digest(value: &Value) -> Result<String> {
 /// Validate a persisted/document value without silently rewriting its digest.
 pub fn validate_document(value: &Value, digest_field: &str) -> Result<(Vec<u8>, String)> {
     validate_policy_fields(value, "$")?;
+    validate_finding_type_fields(value)?;
     let actual = canonical_digest(value)?;
     if let Some(declared) = value.get(digest_field).and_then(Value::as_str)
         && declared != actual
@@ -319,6 +326,90 @@ pub fn validate_document(value: &Value, digest_field: &str) -> Result<(Vec<u8>, 
     }
     let bytes = canonical_bytes(value)?;
     Ok((bytes, actual))
+}
+
+/// Validate the production-policy selector boundary without deriving an
+/// oracle outcome from fixture intent.  finding_type is allowed only as a
+/// direct field on a read-only definition control; manifests and all nested
+/// evidence/catalogue values must remain selector-free.
+fn validate_finding_type_fields(value: &Value) -> Result<()> {
+    let is_definition = value.get("schema").and_then(Value::as_str) == Some(DEFINITION_SCHEMA);
+    validate_finding_type_paths(value, "$", is_definition)?;
+    if !is_definition {
+        return Ok(());
+    }
+
+    let controls = value
+        .get("controls")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("definition controls must be an array"))?;
+    for (index, control) in controls.iter().enumerate() {
+        let object = control
+            .as_object()
+            .ok_or_else(|| anyhow!("definition control at index {index} must be an object"))?;
+        let role = object
+            .get("role")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("definition control at index {index} has no role"))?;
+        let selector = object.get("finding_type");
+        match role {
+            "positive" | "negative" | "degraded" => {
+                let selector = selector
+                    .and_then(Value::as_str)
+                    .filter(|selector| !selector.is_empty())
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "read-only definition control at index {index} requires a non-empty finding_type"
+                        )
+                    })?;
+                if !SUPPORTED_FINDING_TYPES.contains(&selector) {
+                    bail!(
+                        "read-only definition control at index {index} has unsupported finding_type '{selector}'"
+                    );
+                }
+            }
+            "mutation" => {
+                if selector.is_some() {
+                    bail!(
+                        "mutation definition control at index {index} must not declare finding_type"
+                    );
+                }
+            }
+            other => bail!("definition control at index {index} has unsupported role '{other}'"),
+        }
+    }
+    Ok(())
+}
+
+fn validate_finding_type_paths(value: &Value, path: &str, is_definition: bool) -> Result<()> {
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object {
+                let child_path = format!("{path}.{key}");
+                if key == "finding_type" && !(is_definition && is_definition_control_path(path)) {
+                    bail!(
+                        "finding_type is only allowed on read-only definition controls at {child_path}"
+                    );
+                }
+                validate_finding_type_paths(child, &child_path, is_definition)?;
+            }
+        }
+        Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                validate_finding_type_paths(child, &format!("{path}[{index}]"), is_definition)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn is_definition_control_path(path: &str) -> bool {
+    path.strip_prefix("$.controls[")
+        .and_then(|suffix| suffix.strip_suffix(']'))
+        .is_some_and(|index| {
+            !index.is_empty() && index.chars().all(|character| character.is_ascii_digit())
+        })
 }
 
 fn validate_policy_fields(value: &Value, path: &str) -> Result<()> {
@@ -347,6 +438,7 @@ pub fn definition_value() -> Value {
         control_definition(
             "ec2-idle-positive-001",
             "positive",
+            Some("idle_instance"),
             "ec2.idle.complete-history",
             "idle utilization with complete public history",
             json!({
@@ -358,6 +450,7 @@ pub fn definition_value() -> Value {
         control_definition(
             "ec2-idle-negative-001",
             "negative",
+            Some("idle_instance"),
             "ec2.busy.complete-history",
             "busy utilization is not an idle candidate",
             json!({
@@ -369,6 +462,7 @@ pub fn definition_value() -> Value {
         control_definition(
             "ec2-idle-degraded-001",
             "degraded",
+            Some("idle_instance"),
             "ec2.idle.scoped-missing-day",
             "idle utilization with a declared incomplete evidence window",
             json!({
@@ -380,6 +474,7 @@ pub fn definition_value() -> Value {
         control_definition(
             "ec2-resize-positive-001",
             "positive",
+            Some("rightsizing"),
             "ec2.resize.fresh-compatible-recommendation",
             "current instance identity has fresh resize evidence",
             json!({
@@ -390,6 +485,7 @@ pub fn definition_value() -> Value {
         control_definition(
             "ec2-resize-negative-001",
             "negative",
+            Some("rightsizing"),
             "ec2.resize.no-compatible-recommendation",
             "current instance identity has no compatible resize action",
             json!({
@@ -400,6 +496,7 @@ pub fn definition_value() -> Value {
         control_definition(
             "ec2-mutation-stop-001",
             "mutation",
+            None,
             "ec2.mutation.disposable-stop",
             "disposable stop target is provisioned per isolated mutation generation",
             json!({
@@ -413,6 +510,7 @@ pub fn definition_value() -> Value {
         control_definition(
             "ec2-mutation-resize-001",
             "mutation",
+            None,
             "ec2.mutation.disposable-resize",
             "disposable resize target is provisioned per isolated mutation generation",
             json!({
@@ -430,6 +528,7 @@ pub fn definition_value() -> Value {
         control_definition(
             "ec2-mutation-stop-recovery-001",
             "mutation",
+            None,
             "ec2.mutation.disposable-stop-recovery",
             "disposable stop-recovery target is provisioned per isolated mutation generation",
             json!({
@@ -444,6 +543,7 @@ pub fn definition_value() -> Value {
         control_definition(
             "ec2-mutation-resize-restoration-001",
             "mutation",
+            None,
             "ec2.mutation.disposable-resize-restoration",
             "disposable resize-restoration target is provisioned per isolated mutation generation",
             json!({
@@ -480,18 +580,23 @@ pub fn definition_value() -> Value {
 fn control_definition(
     control_id: &str,
     role: &str,
+    finding_type: Option<&str>,
     scenario_intent: &str,
     realization_intent: &str,
     evidence: Value,
 ) -> Value {
-    json!({
+    let mut control = json!({
         "control_id": control_id,
         "role": role,
         "service": "ec2",
         "scenario_intent": scenario_intent,
         "realization_intent": realization_intent,
         "evidence": evidence
-    })
+    });
+    if let Some(finding_type) = finding_type {
+        control["finding_type"] = Value::String(finding_type.to_string());
+    }
+    control
 }
 
 fn materialization_profile(control_id: &str) -> Result<&'static MaterializationProfile> {
@@ -3988,7 +4093,7 @@ mod tests {
     }
 
     #[test]
-    fn definition_contains_all_roles_without_policy_maturity_or_findings() {
+    fn definition_contains_all_roles_without_policy_maturity_or_expected_findings() {
         let definition = definition_with_digest().unwrap();
         let controls = definition["controls"].as_array().unwrap();
         let roles = controls
@@ -4008,6 +4113,36 @@ mod tests {
         ] {
             assert!(!text.contains(forbidden), "definition contains {forbidden}");
         }
+    }
+
+    #[test]
+    fn definition_declares_the_exact_production_policy_selector_map() {
+        let definition = definition_with_digest().unwrap();
+        let selectors = definition["controls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|control| {
+                (
+                    control["control_id"].as_str().unwrap(),
+                    control.get("finding_type").and_then(Value::as_str),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            selectors,
+            BTreeMap::from([
+                ("ec2-idle-positive-001", Some("idle_instance")),
+                ("ec2-idle-negative-001", Some("idle_instance")),
+                ("ec2-idle-degraded-001", Some("idle_instance")),
+                ("ec2-resize-positive-001", Some("rightsizing")),
+                ("ec2-resize-negative-001", Some("rightsizing")),
+                ("ec2-mutation-stop-001", None),
+                ("ec2-mutation-resize-001", None),
+                ("ec2-mutation-stop-recovery-001", None),
+                ("ec2-mutation-resize-restoration-001", None),
+            ])
+        );
     }
 
     #[test]
@@ -4124,6 +4259,61 @@ mod tests {
     }
 
     #[test]
+    fn validation_rejects_missing_empty_unsupported_and_mutation_selectors() {
+        for (path, replacement) in [
+            ("/controls/0/finding_type", Value::Null),
+            ("/controls/0/finding_type", json!("")),
+            ("/controls/0/finding_type", json!(" idle_instance ")),
+            ("/controls/0/finding_type", json!("unknown_policy")),
+            ("/controls/5/finding_type", json!("idle_instance")),
+        ] {
+            let mut definition = definition_with_digest().unwrap();
+            if replacement.is_null() {
+                definition["controls"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("finding_type");
+            } else {
+                set_pointer(&mut definition, path, replacement);
+            }
+            let error = validate_document(&definition, "digest")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("finding_type"),
+                "selector mutation should fail closed: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn validation_rejects_nested_or_manifest_selectors() {
+        let mut definition = definition_with_digest().unwrap();
+        definition["controls"][0]["evidence"]["finding_type"] = json!("idle_instance");
+        let error = validate_document(&definition, "digest")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("finding_type"));
+
+        let manifest = json!({
+            "schema": MANIFEST_SCHEMA,
+            "finding_type": "idle_instance"
+        });
+        let error = validate_document(&manifest, "digest")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("finding_type"));
+        let manifest = json!({
+            "schema": MANIFEST_SCHEMA,
+            "control_catalogue": [{"finding_type": "idle_instance"}]
+        });
+        let error = validate_document(&manifest, "digest")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("finding_type"));
+    }
+
+    #[test]
     fn definition_matches_checked_in_canonical_golden() {
         let (bytes, _) = canonical_definition().unwrap();
         let golden = include_bytes!("../tests/fixtures/release-qualification-v1.definition.json");
@@ -4140,7 +4330,7 @@ mod tests {
         assert_eq!(value["digest"], digest);
         assert_eq!(
             value["generator"]["source_revision"],
-            "dbe899e5df8a56c434768a71643e55b9e1315582"
+            "71a74458325b6f836d5b195084a7d28218bf9241"
         );
         assert_eq!(
             value["environment"]["estate_fingerprint"],
@@ -4154,6 +4344,10 @@ mod tests {
             .unwrap()
         );
         assert_eq!(value["resources"].as_array().unwrap().len(), 5);
+        assert!(
+            !value.to_string().contains("finding_type"),
+            "manifest must not duplicate definition selector metadata"
+        );
     }
 
     #[tokio::test]

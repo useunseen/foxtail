@@ -2,6 +2,40 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://useunseen.dev/foxtail/schemas/release-fixture-definition-v1.schema.json",
   "title": "Foxtail release qualification Fixture Definition v1",
+  "$defs": {
+    "selector_free_value": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "finding_type": false
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/selector_free_value"
+          }
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/selector_free_value"
+          }
+        },
+        {"type": "string"},
+        {"type": "number"},
+        {"type": "boolean"},
+        {"type": "null"}
+      ]
+    },
+    "selector_free_object": {
+      "type": "object",
+      "properties": {
+        "finding_type": false
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/selector_free_value"
+      }
+    }
+  },
   "type": "object",
   "required": [
     "schema",
@@ -17,7 +51,7 @@
   "properties": {
     "schema": {"const": "foxtail.release-fixture-definition/v1"},
     "name": {"const": "release-qualification-v1"},
-    "revision": {"type": "string", "const": "1.0.0"},
+    "revision": {"type": "string", "const": "1.0.1"},
     "namespace": {"type": "string"},
     "clock_contract": {
       "type": "object",
@@ -156,8 +190,14 @@
           "service": {"const": "ec2"},
           "scenario_intent": {"type": "string"},
           "realization_intent": {"type": "string"},
+          "finding_type": {
+            "type": "string",
+            "minLength": 1,
+            "enum": ["idle_instance", "rightsizing"],
+            "description": "Production policy-registration metadata only; it never declares an expected oracle outcome."
+          },
           "evidence": {
-            "type": "object",
+            "$ref": "#/$defs/selector_free_object",
             "patternProperties": {
               "^(Required|Stretch|required|stretch|expected_finding|expected_findings|authoritative_expected_finding|finding)$": false
             }
@@ -178,7 +218,27 @@
             {"required": ["finding"]}
           ]
         },
-        "additionalProperties": true
+        "allOf": [
+          {
+            "if": {
+              "required": ["role"],
+              "properties": {
+                "role": {"enum": ["positive", "negative", "degraded"]}
+              }
+            },
+            "then": {"required": ["finding_type"]}
+          },
+          {
+            "if": {
+              "required": ["role"],
+              "properties": {"role": {"const": "mutation"}}
+            },
+            "then": {"not": {"required": ["finding_type"]}}
+          }
+        ],
+        "additionalProperties": {
+          "$ref": "#/$defs/selector_free_value"
+        }
       }
     },
     "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
