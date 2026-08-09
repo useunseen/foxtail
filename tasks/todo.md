@@ -988,40 +988,90 @@ outcomes.
 
 ## Acceptance Map
 
-- [ ] 1. Lower only the fixture-owned positive CPU realization while preserving
+- [x] 1. Lower only the fixture-owned positive CPU realization while preserving
   14 complete daily CPU/network/cost samples, identity/scope/provenance, and
   positive costs; prove the public CloudWatch/Cost/EC2 responses and exact
   Unseen idle outcome.
-- [ ] 2. Preserve idle-negative `no_finding`, idle-degraded `blocked` for its
+- [x] 2. Preserve idle-negative `no_finding`, idle-degraded `blocked` for its
   missing day, resize-positive finding, and resize-negative `no_finding`.
-- [ ] 3. Keep finding selectors as registration metadata only; retain recursive
+- [x] 3. Keep finding selectors as registration metadata only; retain recursive
   forbidden-policy validation and add no expected-outcome truth or copied
   Unseen threshold logic.
-- [ ] 4. Keep all five explicit `finding_type` selectors and fail-closed
+- [x] 4. Keep all five explicit `finding_type` selectors and fail-closed
   selector placement/unsupported cases across canonical documents and schemas.
-- [ ] 5. Preserve ordinary CloudWatch metric names/statistics, timestamps,
+- [x] 5. Preserve ordinary CloudWatch metric names/statistics, timestamps,
   identity binding, pagination/provenance, and malformed/truncated failures.
-- [ ] 6. Regenerate definition/manifest goldens and digests deterministically;
+- [x] 6. Regenerate definition/manifest goldens and digests deterministically;
   pin `generator.source_revision` to the functional commit in a separate
   follow-up commit.
-- [ ] 7-8. Run an explicit read-only proof using only committed Unseen
+- [x] 7-8. Run an explicit read-only proof using only committed Unseen
   `f4c5e7802def856fb4d4ec6996cbd616ea16bd95` source: positive finding,
   exact-5.0 boundary no-finding, and the five-control outcome matrix without
   unsupported capability, stale-window, identity, or fabricated-tag blockers.
-- [ ] 9-10. Run formatting, Rust/schema/validator/CLI gates and report exact
+- [x] 9-10. Run formatting, Rust/schema/validator/CLI gates and report exact
   commits, digests, source revision, proof outcomes, blockers, and clean status.
 
 ## Execution Plan
 
 - [x] Record the acceptance map and inspect the canonical materialization,
   public handlers, goldens, validators, and exact Unseen assessor boundary.
-- [ ] Change the single positive materialization profile, add focused evidence
+- [x] Change the single positive materialization profile, add focused evidence
   assertions, and regenerate fixture definition/manifest goldens.
-- [ ] Commit functional behavior first; update the source pin/golden assertion
+- [x] Commit functional behavior first; update the source pin/golden assertion
   in one separate non-amended commit.
-- [ ] Review the frozen diff and run focused plus broad verification, including
+- [x] Review the frozen diff and run focused plus broad verification, including
   the disposable/public proof where the environment permits.
 
 ## Results
 
-Pending functional implementation and verification.
+Functional behavior is committed in four focused commits:
+
+- `0e7a7be4f2a5cca1cf6efc66cacf7818f7097731` lowers only the positive CPU
+  realization from `5.0` to `4.0`, adds deterministic 14-day CloudWatch/API
+  assertions, and regenerates the canonical definition/manifest evidence.
+- `5db306f` adds the fixture-owned EC2 root-device, architecture,
+  virtualization, ENA, and empty dependency facts required by the ordinary
+  public compatibility contract.
+- `1c3d881` binds Compute Optimizer `InstanceArns` to returned rows and adds a
+  focused selector test; `deedb31` accepts the AWS lower-camel request member.
+- `b08908dafc725c756117c5cdd3f4d525f3602e0e` derives recommendation freshness
+  from the latest fixture metric offset so public evidence is current without
+  copying policy thresholds.
+
+The separate source-pin/golden commit is `97dc684`; its checked-in manifest
+and assertion name functional revision
+`b08908dafc725c756117c5cdd3f4d525f3602e0e`.
+
+Canonical artifacts are deterministic: definition digest
+`sha256:aad7cc86551a2e60ec37942cc801293bf61c952fa7bda4f1b5481e58cb9cbcdf`
+and manifest digest
+`sha256:5d3527a257698aa604aa19a60b77d7536a9c00d84bf005d1c32e26cbf6d7fa3b`.
+The manifest contains no selector or expected-outcome fields.
+
+Exact committed Unseen `f4c5e7802def856fb4d4ec6996cbd616ea16bd95` was imported
+from a temporary archive only. The registered `assess_ec2_evidence:v1`
+assessor returned `finding` for a realized `4.0` CPU peak and `no_finding` at
+the exact `5.0` boundary. Its read-only AWS-compatible collector against a
+disposable Foxtail service returned this outcome matrix:
+
+| control | outcome | blocker |
+| --- | --- | --- |
+| `ec2-idle-positive-001` | `finding` | none |
+| `ec2-idle-negative-001` | `no_finding` | none |
+| `ec2-idle-degraded-001` | `blocked` | `incomplete_window` (intentional missing day) |
+| `ec2-resize-positive-001` | `finding` | none |
+| `ec2-resize-negative-001` | `no_finding` | none |
+
+Receipt readiness was blocked only by the declared degraded incomplete window;
+complete controls had no unsupported-capability, stale-window, identity,
+compatibility, missing-attribute, or fixture-intent blockers. Public collector
+fingerprints were `read_only=sha256:1de2246f4e7f9f1996dee680b8286e9e6c3fb425911b1d37b4468ae7cd30450b`
+and `estate=sha256:6dbfa4cc4c38a1075c7e948404d205816e615baa82e3ac99abfb1dc2bc21ab92`.
+
+Verification passed: `cargo fmt --all -- --check`, `cargo test` (91 library,
+6 API-contract, 20 mutation, 4 wrapper, and doc tests),
+`cargo clippy --all-targets --all-features -- -D warnings`, fixture Draft
+2020-12 validation with negatives, wrapper routing, `bash -n`, and the full
+disposable `scripts/verify_cli_interop.sh` gate against dedicated LocalStack
+4.14.0 (including mutation lifecycle and all AWS CLI surfaces). `git diff --check`
+also passed. The temporary LocalStack container and databases were removed.
