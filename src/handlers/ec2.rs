@@ -908,7 +908,7 @@ mod tests {
         let missing = describe_instances_xml(
             "123456789012",
             "2026-08-05T00:00:00Z",
-            &[observation.clone()],
+            std::slice::from_ref(&observation),
             &[],
         )
         .unwrap_err()
