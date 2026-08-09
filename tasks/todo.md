@@ -793,10 +793,14 @@ Pinned base: `eaf5f12c97a7997bd3a00cfff16e516c17c0477d`
 ## Review and Results
 
 The functional implementation is committed as `71a74458325b6f836d5b195084a7d28218bf9241`.
+The frozen implementation head reviewed before this repair was
+`7702c7e7046d48e0a7460b67c03158e7fccae2b1`.
 The follow-up source-pin/golden commit updates the checked-in manifest's
 `generator.source_revision` and the Foxtail-owned golden assertion to that
 functional commit without amending it; its exact hash and final branch head
-are reported in the worker handoff.
+are reported in the worker handoff. The repair is likewise one focused,
+non-amended commit; because a commit cannot durably contain its own hash, the
+repair hash and final head are reported in that handoff.
 
 - Canonical definition selectors are exact: idle positive/negative/degraded
   map to `idle_instance`; resize positive/negative map to `rightsizing`; all
@@ -809,8 +813,69 @@ are reported in the worker handoff.
   The manifest binds that digest and contains no `finding_type` key.
 - Focused proof passed: Rust selector/definition tests, full `cargo test -q`,
   `cargo clippy --all-targets --all-features -- -D warnings`, canonical-format
-  checks, `python3 scripts/validate_release_fixture.py --negative`, and the
-  read-only Unseen policy-registration compatibility command plus four focused
-  Unseen oracle tests. No Unseen files or external tracker state were changed.
-- No residual implementation gap is known; the parent should run its broad
-  verification matrix and any available LocalStack/CLI smoke before publication.
+  checks, `python3 scripts/validate_release_fixture.py` and
+  `python3 scripts/validate_release_fixture.py --negative`. Selector-negative
+  cases now call a schema-only Draft 2020-12 path, while recursive/runtime and
+  forbidden-policy checks remain separate.
+- Read-only Unseen compatibility command shape (run from this Foxtail
+  worktree; it imports the sibling checkout but does not write it):
+
+  ```sh
+  python3 - <<'PY'
+  import copy, json, sys
+  from pathlib import Path
+  sys.path.insert(0, "/Users/murphy/workspace/iacai0/unseen-agent")
+  from unseen.extensions.scan.evidence_policy_registry import EVIDENCE_POLICY_REGISTRATIONS
+  from unseen.extensions.scan.oracle_derivation import _manifest_read_only_controls, _registration_for
+
+  root = Path("/Users/murphy/.codex/worktrees/6d3a/foxtail")
+  definition = json.loads((root / "tests/fixtures/release-qualification-v1.definition.json").read_text())
+  manifest = json.loads((root / "tests/fixtures/release-qualification-v1.manifest.json").read_text())
+  controls, reasons = _manifest_read_only_controls(
+      definition, manifest, manifest["environment"], EVIDENCE_POLICY_REGISTRATIONS
+  )
+  assert not reasons, reasons
+  expected = {
+      "ec2-idle-positive-001": "idle_instance",
+      "ec2-idle-negative-001": "idle_instance",
+      "ec2-idle-degraded-001": "idle_instance",
+      "ec2-resize-positive-001": "rightsizing",
+      "ec2-resize-negative-001": "rightsizing",
+  }
+  actual = {
+      control.control_id: _registration_for(
+          control.definition, EVIDENCE_POLICY_REGISTRATIONS
+      ).registration.finding_type
+      for control in controls
+  }
+  assert actual == expected, actual
+  absent = copy.deepcopy(definition)
+  absent["controls"][0].pop("finding_type")
+  _, absent_reasons = _manifest_read_only_controls(
+      absent, manifest, manifest["environment"], EVIDENCE_POLICY_REGISTRATIONS
+  )
+  assert "unsupported_capability:ec2-idle-positive-001" in absent_reasons
+  print("unseen_policy_selector_compatibility=pass")
+  print("absent_selector=unsupported_capability:ec2-idle-positive-001")
+  PY
+  ```
+
+  Result: `unseen_policy_selector_compatibility=pass`; all five selectors
+  selected `idle_instance`/`rightsizing` with no `unsupported_capability`, and
+  removing one selector produced
+  `unsupported_capability:ec2-idle-positive-001`.
+- Focused positive/negative/degraded oracle proof:
+
+  ```sh
+  pytest -q tests/unit/test_runtime_oracle.py -k 'production_oracle_ignores_fixture_tags_and_freezes_receipt or oracle_blocks_degraded_control_and_rejects_positive_contradiction or pinned_unqualified_fixture_controls_block_without_registration_metadata or oracle_does_not_infer_capability_from_fixture_prose' --disable-warnings
+  ```
+
+  Result: `4 passed, 24 deselected, 2 warnings` (the known shell wrapper also
+  emitted `(eval):5: parse error near \`end\`` before pytest ran).
+- The Unseen checkout remained at exact head
+  `f4c5e7802def856fb4d4ec6996cbd616ea16bd95` and clean. No Unseen files,
+  external tracker state, or Issue #12 completion record were changed; tracker
+  recording remains for an authorized future issue update.
+- No implementation gap remains in this repair slice; the parent should run
+  its broad verification matrix and any available LocalStack/CLI smoke before
+  publication.

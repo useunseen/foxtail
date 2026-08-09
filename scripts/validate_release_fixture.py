@@ -168,10 +168,18 @@ def expect_forbidden_rejection(schema_path: Path, document: Any, label: str, pat
     raise SystemExit(f"negative policy check unexpectedly accepted {label}.{key}")
 
 
-def validate_value(schema_path: Path, document: Any) -> None:
+def schema_errors(schema_path: Path, document: Any) -> list[jsonschema.ValidationError]:
     schema = load_json(schema_path)
+    try:
+        jsonschema.Draft202012Validator.check_schema(schema)
+    except jsonschema.exceptions.SchemaError as error:
+        raise SystemExit(f"invalid Draft 2020-12 schema {schema_path}: {error}") from error
     validator = jsonschema.Draft202012Validator(schema, format_checker=jsonschema.FormatChecker())
-    errors = list(validator.iter_errors(document))
+    return list(validator.iter_errors(document))
+
+
+def validate_value(schema_path: Path, document: Any) -> None:
+    errors = schema_errors(schema_path, document)
     selector_error = None
     try:
         validate_finding_type_fields(document)
@@ -190,11 +198,9 @@ def expect_schema_rejection(
 ) -> None:
     mutated = copy.deepcopy(document)
     mutate(mutated)
-    try:
-        validate_value(schema_path, mutated)
-    except ValueError:
+    if schema_errors(schema_path, mutated):
         return
-    raise SystemExit(f"negative schema check unexpectedly accepted {label}")
+    raise SystemExit(f"published schema unexpectedly accepted {label}")
 
 
 def run_negative_checks(

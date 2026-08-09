@@ -4295,7 +4295,7 @@ mod tests {
             .to_string();
         assert!(error.contains("finding_type"));
 
-        let mut manifest = json!({
+        let manifest = json!({
             "schema": MANIFEST_SCHEMA,
             "finding_type": "idle_instance"
         });
@@ -4303,7 +4303,10 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("finding_type"));
-        manifest["control_catalogue"] = json!([{"finding_type": "idle_instance"}]);
+        let manifest = json!({
+            "schema": MANIFEST_SCHEMA,
+            "control_catalogue": [{"finding_type": "idle_instance"}]
+        });
         let error = validate_document(&manifest, "digest")
             .unwrap_err()
             .to_string();
