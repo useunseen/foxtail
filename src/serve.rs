@@ -208,8 +208,11 @@ struct GetProductsRequest {
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct ComputeOptimizerRequest {
+    #[serde(alias = "instanceArns")]
     instance_arns: Option<Vec<String>>,
+    #[serde(alias = "nextToken")]
     next_token: Option<String>,
+    #[serde(alias = "maxResults")]
     max_results: Option<u64>,
 }
 
@@ -8098,7 +8101,7 @@ mod tests {
                     )
                     .body(Body::from(
                         json!({
-                            "InstanceArns": [
+                            "instanceArns": [
                                 "arn:aws:ec2:us-east-1:123456789012:instance/i-low"
                             ]
                         })
