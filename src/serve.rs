@@ -16,6 +16,7 @@ use std::net::SocketAddr;
 use tracing::{debug, info, warn};
 
 use crate::cli::Scenario;
+use crate::db;
 use crate::fixture;
 use crate::generator;
 use crate::handlers::{aws, cloudwatch as cw, cost_explorer as ce, ec2};
@@ -214,6 +215,52 @@ struct ComputeOptimizerRequest {
     next_token: Option<String>,
     #[serde(alias = "maxResults")]
     max_results: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Ec2InstanceArn {
+    region: String,
+    account_id: String,
+    instance_id: String,
+}
+
+impl Ec2InstanceArn {
+    fn parse(value: &str) -> std::result::Result<Self, String> {
+        let parts = value.split(':').collect::<Vec<_>>();
+        if parts.len() != 6
+            || parts[0] != "arn"
+            || parts[1] != "aws"
+            || parts[2] != "ec2"
+            || parts[3].is_empty()
+            || parts[4].len() != 12
+            || !parts[4].chars().all(|character| character.is_ascii_digit())
+        {
+            return Err("InstanceArns contains a malformed EC2 instance ARN.".to_string());
+        }
+        let Some(instance_id) = parts[5].strip_prefix("instance/") else {
+            return Err("InstanceArns contains a malformed EC2 instance ARN.".to_string());
+        };
+        if !instance_id.starts_with("i-")
+            || instance_id.len() <= 2
+            || !instance_id
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        {
+            return Err("InstanceArns contains a malformed EC2 instance ARN.".to_string());
+        }
+        Ok(Self {
+            region: parts[3].to_string(),
+            account_id: parts[4].to_string(),
+            instance_id: instance_id.to_string(),
+        })
+    }
+
+    fn canonical(&self) -> String {
+        format!(
+            "arn:aws:ec2:{}:{}:instance/{}",
+            self.region, self.account_id, self.instance_id
+        )
+    }
 }
 
 #[derive(Deserialize)]
@@ -2607,7 +2654,22 @@ async fn handle_ec2_query(
                 }
                 selected
             };
-            let xml = ec2::describe_instances_xml(&account_id, &anchor, &selected);
+            let xml = match ec2::describe_instances_xml(
+                &account_id,
+                &anchor,
+                &selected,
+                &instance_type_catalogue,
+            ) {
+                Ok(xml) => xml,
+                Err(error) => {
+                    return error_response(
+                        protocol,
+                        "InternalError",
+                        &error.to_string(),
+                        StatusCode::BAD_REQUEST,
+                    );
+                }
+            };
             (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "text/xml; charset=utf-8")],
@@ -4945,20 +5007,14 @@ async fn handle_get_ec2_instance_recommendations(
     let req: ComputeOptimizerRequest = serde_json::from_slice(&body)
         .map_err(|e| CostUsageError::Validation(format!("Invalid JSON body: {}", e)))?;
 
-    let requested_instance_ids = req
+    let requested_instance_arns = req
         .instance_arns
         .map(|arns| {
             arns.into_iter()
                 .map(|arn| {
-                    arn.rsplit('/')
-                        .next()
-                        .filter(|resource_id| !resource_id.is_empty())
-                        .map(str::to_string)
-                        .ok_or_else(|| {
-                            CostUsageError::Validation(
-                                "InstanceArns contains a malformed instance ARN.".to_string(),
-                            )
-                        })
+                    Ec2InstanceArn::parse(&arn)
+                        .map(|parsed| parsed.canonical())
+                        .map_err(CostUsageError::Validation)
                 })
                 .collect::<std::result::Result<BTreeSet<_>, _>>()
         })
@@ -4966,28 +5022,16 @@ async fn handle_get_ec2_instance_recommendations(
 
     let page_start = parse_usize_token(req.next_token.as_deref(), "nextToken")?;
     let page_size = clamp_page_size(req.max_results, 50, 100);
-    let rows = sqlx::query(
-        "SELECT r.id, r.region, r.tags, AVG(m.value) AS avg_cpu,
-                MAX(m.seconds_from_now) AS latest_metric_offset
-         FROM resources r
-         LEFT JOIN metrics m
-           ON m.resource_id = r.id
-          AND m.namespace = 'AWS/EC2'
-          AND m.metric_name = 'CPUUtilization'
-         WHERE r.resource_type = 'ec2'
-         GROUP BY r.id, r.region, r.tags
-         ORDER BY r.id ASC",
-    )
-    .fetch_all(&pool)
-    .await
-    .map_err(|e| CostUsageError::Internal(e.into()))?;
+    let rows = db::fetch_ec2_compute_optimizer_rows(&pool)
+        .await
+        .map_err(CostUsageError::Internal)?;
 
     let rows = rows
         .into_iter()
         .filter(|row| {
-            requested_instance_ids
-                .as_ref()
-                .is_none_or(|requested| requested.contains(row.get::<String, _>("id").as_str()))
+            requested_instance_arns.as_ref().is_none_or(|requested| {
+                requested.contains(&resource_arn("ec2", &row.region, &row.resource_id))
+            })
         })
         .collect::<Vec<_>>();
 
@@ -5002,20 +5046,11 @@ async fn handle_get_ec2_instance_recommendations(
     let recommendations = rows[page_start..page_end]
         .iter()
         .map(|row| {
-            let instance_id = row.get::<String, _>("id");
-            let region = row.get::<String, _>("region");
-            let tags_json = row.try_get::<Option<String>, _>("tags").ok().flatten();
-            let average_cpu = row
-                .try_get::<Option<f64>, _>("avg_cpu")
-                .ok()
-                .flatten()
-                .unwrap_or(0.0);
-            let latest_metric_offset = row
-                .try_get::<Option<i64>, _>("latest_metric_offset")
-                .ok()
-                .flatten()
-                .unwrap_or(0)
-                .min(0);
+            let instance_id = &row.resource_id;
+            let region = &row.region;
+            let tags_json = row.tags.as_deref();
+            let average_cpu = row.average_cpu;
+            let latest_metric_offset = row.latest_metric_offset.min(0);
             let last_refresh = (now + chrono::Duration::seconds(latest_metric_offset)).to_rfc3339();
             let (finding, target_instance_type, projected_cpu, monthly_savings_pct) =
                 if average_cpu < 15.0 {
@@ -5043,8 +5078,8 @@ async fn handle_get_ec2_instance_recommendations(
 
             json!({
                 "accountId": mock_account_id(),
-                "instanceArn": resource_arn("ec2", &region, &instance_id),
-                "instanceName": resource_name_from_tags(tags_json.as_deref(), &instance_id),
+                "instanceArn": resource_arn("ec2", region, instance_id),
+                "instanceName": resource_name_from_tags(tags_json, instance_id),
                 "currentInstanceType": "m6i.large",
                 "finding": finding,
                 "lookBackPeriodInDays": 14.0,
@@ -8127,6 +8162,171 @@ mod tests {
         assert_eq!(recs[0]["instanceName"], "idle-node");
         assert_eq!(recs[0]["finding"], "OVER_PROVISIONED");
         assert!(recs[0]["instanceArn"].as_str().unwrap().ends_with("/i-low"));
+    }
+
+    #[tokio::test]
+    async fn compute_optimizer_ec2_recommendations_bind_scope_and_pagination() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO resources (id, resource_type, region, scenario, tags)
+             VALUES
+             ('i-low', 'ec2', 'us-east-1', 'Baseline', '{\"Name\":\"idle-node\"}'),
+             ('i-high', 'ec2', 'us-east-1', 'Baseline', '{\"Name\":\"busy-node\"}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (resource_id, value) in [("i-low", 8.0), ("i-high", 82.0)] {
+            sqlx::query(
+                "INSERT INTO metrics (resource_id, namespace, metric_name, seconds_from_now, value)
+                 VALUES (?, 'AWS/EC2', 'CPUUtilization', -3600, ?)",
+            )
+            .bind(resource_id)
+            .bind(value)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let app = build_app(pool);
+        let requested = json!([
+            "arn:aws:ec2:us-east-1:123456789012:instance/i-low",
+            "arn:aws:ec2:us-east-1:123456789012:instance/i-high"
+        ]);
+        let first_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-amz-json-1.0")
+                    .header(
+                        "x-amz-target",
+                        "ComputeOptimizerService.GetEC2InstanceRecommendations",
+                    )
+                    .body(Body::from(
+                        json!({"instanceArns": requested, "maxResults": 1}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first_response.status(), StatusCode::OK);
+        let first = response_json(first_response).await;
+        assert_eq!(
+            first["instanceRecommendations"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            first["instanceRecommendations"][0]["instanceName"],
+            "busy-node"
+        );
+        assert_eq!(first["nextToken"], "1");
+
+        let second_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-amz-json-1.0")
+                    .header(
+                        "x-amz-target",
+                        "ComputeOptimizerService.GetEC2InstanceRecommendations",
+                    )
+                    .body(Body::from(
+                        json!({"instanceArns": requested, "nextToken": "1", "maxResults": 1})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second_response.status(), StatusCode::OK);
+        let second = response_json(second_response).await;
+        assert_eq!(
+            second["instanceRecommendations"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            second["instanceRecommendations"][0]["instanceName"],
+            "idle-node"
+        );
+        assert!(second.get("nextToken").is_none());
+    }
+
+    #[tokio::test]
+    async fn compute_optimizer_ec2_recommendations_reject_malformed_or_out_of_scope_arns() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO resources (id, resource_type, region, scenario, tags)
+             VALUES ('i-low', 'ec2', 'us-east-1', 'Baseline', '{\"Name\":\"idle-node\"}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO metrics (resource_id, namespace, metric_name, seconds_from_now, value)
+             VALUES ('i-low', 'AWS/EC2', 'CPUUtilization', -3600, 8.0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let app = build_app(pool);
+        for value in [
+            "i-low",
+            "foo/bar",
+            "arn:aws:ec2:us-east-1:123456789012:volume/i-low",
+            "arn:aws:ec2:us-east-1:123456789012:instance/",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/")
+                        .header("content-type", "application/x-amz-json-1.0")
+                        .header(
+                            "x-amz-target",
+                            "ComputeOptimizerService.GetEC2InstanceRecommendations",
+                        )
+                        .body(Body::from(json!({"instanceArns": [value]}).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{value}");
+        }
+
+        for value in [
+            "arn:aws:ec2:us-east-1:000000000000:instance/i-low",
+            "arn:aws:ec2:us-west-2:123456789012:instance/i-low",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/")
+                        .header("content-type", "application/x-amz-json-1.0")
+                        .header(
+                            "x-amz-target",
+                            "ComputeOptimizerService.GetEC2InstanceRecommendations",
+                        )
+                        .body(Body::from(json!({"instanceArns": [value]}).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{value}");
+            let body = response_json(response).await;
+            assert!(
+                body["instanceRecommendations"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 
     #[tokio::test]
