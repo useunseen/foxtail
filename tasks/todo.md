@@ -312,10 +312,11 @@ Invariant: Foxtail owns only deterministic fixture facts and AWS-compatible read
 ## Issue #14 Results / Review
 
 The functional implementation is committed as `cbb8bf5e422b0fd1284e9474db6cf9117a034e19`.
-A non-amended source-pin/golden follow-up is committed as
+A non-amended source-pin/golden follow-up candidate was committed as
 `b48695dd20bbefcacd9b08447782a0f90ade3d6a`, updating the checked-in manifest
-and Foxtail-owned golden assertion to the functional revision. The checked-in
-manifest now owns the
+and Foxtail-owned golden assertion to the functional revision. That commit was
+the pre-review implementation/source-pin candidate; the parent final report
+owns the eventual exact reviewed branch head. The checked-in manifest now owns the
 strict `disable_api_termination` boolean for every realized read-only control
 and an exact catalogue for `m6i.large`, `t3.medium`, and `m6i.xlarge`; the
 handler validates those facts before serving Query/XML observations.
@@ -345,9 +346,27 @@ handler validates those facts before serving Query/XML observations.
   already contained unrelated resources; Foxtail's authoritative manifest
   account remains `123456789012` and was not changed. No Unseen files or
   contracts were edited.
-- Final source revision is the functional Foxtail commit
-  `cbb8bf5e422b0fd1284e9474db6cf9117a034e19`; final branch head is the
-  non-amended source-pin commit `b48695dd20bbefcacd9b08447782a0f90ade3d6a`.
+- Final fixture source revision remains the functional Foxtail commit
+  `cbb8bf5e422b0fd1284e9474db6cf9117a034e19`. The frozen review identified
+  parser-compatibility, error-code, documentation, catalogue-ownership, and
+  naming repairs; those repairs are recorded in the follow-up commit(s) and
+  re-reviewed by the parent. This section intentionally does not claim its
+  own current commit is the final branch head; the parent final report owns
+  that exact hash.
+- Frozen-head repair status: `DescribeInstances` again preserves the base
+  parser's ignored filters/pagination-like/unknown members, while the two new
+  observation actions remain strict; parser models now use full action names;
+  unknown instance-type errors use `InvalidInstanceType`; and CLI type checks
+  derive every requested type and public field from the realized catalogue.
+  Focused and broad local proofs passed. The exact sibling
+  `AwsCompatibleObservationPort.observe()` proof also passed against a
+  temporary Foxtail server and fresh LocalStack account `222222222222`
+  (five controls with five attribute and five compatibility responses).
+  A fresh rerun of the full disposable CLI script was blocked by stale
+  resources in the shared LocalStack account `123456789012`; the script's
+  freshness gate stopped before mutation, and the attempted isolated
+  container lacked an authorized LocalStack license token. The shared
+  container and account were not modified.
 
 ## Scenario Data Quality Verification
 

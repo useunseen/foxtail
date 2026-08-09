@@ -2581,7 +2581,7 @@ async fn handle_ec2_query(
     };
 
     match query {
-        ec2::Ec2Query::Instances(query) => {
+        ec2::Ec2Query::DescribeInstances(query) => {
             let selected = if query.instance_ids.is_empty() {
                 observations
             } else {
@@ -2611,7 +2611,7 @@ async fn handle_ec2_query(
             )
                 .into_response()
         }
-        ec2::Ec2Query::InstanceAttribute(query) => {
+        ec2::Ec2Query::DescribeInstanceAttribute(query) => {
             let Some(observation) = observations
                 .iter()
                 .find(|observation| observation.resource_id == query.instance_id)
@@ -2631,7 +2631,7 @@ async fn handle_ec2_query(
             )
                 .into_response()
         }
-        ec2::Ec2Query::InstanceTypes(query) => {
+        ec2::Ec2Query::DescribeInstanceTypes(query) => {
             let by_type = instance_type_catalogue
                 .into_iter()
                 .map(|instance_type| (instance_type.instance_type.clone(), instance_type))
@@ -2641,7 +2641,7 @@ async fn handle_ec2_query(
                 let Some(observation) = by_type.get(&instance_type) else {
                     return error_response(
                         protocol,
-                        "InvalidInstanceType.NotFound",
+                        "InvalidInstanceType",
                         &format!("The instance type '{instance_type}' does not exist"),
                         StatusCode::BAD_REQUEST,
                     );

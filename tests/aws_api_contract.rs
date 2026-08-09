@@ -211,6 +211,11 @@ async fn ec2_oracle_observation_routes_bind_exact_fixture_facts_and_fail_closed(
             !response.status().is_success(),
             "unexpected success for {body}"
         );
+        let response_body = response_text(response).await;
+        if body.contains("t3.unknown") {
+            assert!(response_body.contains("InvalidInstanceType"));
+            assert!(!response_body.contains("InvalidInstanceType.NotFound"));
+        }
     }
     let state_after = fixture::read_state(&pool).await.unwrap();
     assert_eq!(

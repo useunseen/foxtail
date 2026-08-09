@@ -7,7 +7,7 @@ use crate::fixture;
 /// The subset of the EC2 Query protocol needed by the read-only fixture
 /// observation surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Query {
+pub struct DescribeInstancesQuery {
     pub action: String,
     pub instance_ids: Vec<String>,
 }
@@ -24,10 +24,11 @@ pub struct DescribeInstanceTypesQuery {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 pub enum Ec2Query {
-    Instances(Query),
-    InstanceAttribute(DescribeInstanceAttributeQuery),
-    InstanceTypes(DescribeInstanceTypesQuery),
+    DescribeInstances(DescribeInstancesQuery),
+    DescribeInstanceAttribute(DescribeInstanceAttributeQuery),
+    DescribeInstanceTypes(DescribeInstanceTypesQuery),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,34 +58,47 @@ pub struct ManifestObservations {
     pub instance_type_catalogue: Vec<InstanceTypeObservation>,
 }
 
-#[allow(dead_code)]
-pub fn parse_query_from_form(body: &[u8]) -> std::result::Result<Query, String> {
-    let pairs: Vec<(String, String)> = serde_urlencoded::from_bytes(body)
-        .map_err(|error| format!("Failed to parse EC2 Query body: {error}"))?;
-    let mut action = None;
-    let mut instance_ids = BTreeMap::new();
-    for (key, value) in pairs {
-        match key.as_str() {
-            "Action" => set_unique(&mut action, value, "Action")?,
-            key if key.starts_with("InstanceId.") => {
-                insert_member(&mut instance_ids, key, value, "InstanceId")?
-            }
-            // Keep the legacy parser available for DescribeInstances-focused
-            // callers; the dispatcher uses parse_ec2_query_from_form for all
-            // supported observation operations and therefore rejects these
-            // members for the wrong action.
-            _ => {}
-        }
-    }
-    Ok(Query {
-        action: action.ok_or_else(|| "Missing required field 'Action'.".to_string())?,
-        instance_ids: contiguous_members(instance_ids, "InstanceId")?,
-    })
-}
-
 pub fn parse_ec2_query_from_form(body: &[u8]) -> std::result::Result<Ec2Query, String> {
     let pairs: Vec<(String, String)> = serde_urlencoded::from_bytes(body)
         .map_err(|error| format!("Failed to parse EC2 Query body: {error}"))?;
+    let actions = pairs
+        .iter()
+        .filter_map(|(key, value)| (key == "Action").then_some(value.as_str()))
+        .collect::<Vec<_>>();
+    let action = actions
+        .last()
+        .ok_or_else(|| "Missing required field 'Action'.".to_string())?;
+    if actions.len() == 1 && *action == "DescribeInstances" {
+        return parse_legacy_describe_instances(&pairs);
+    }
+    parse_strict_ec2_query(&pairs)
+}
+
+/// Preserve the base DescribeInstances Query surface.  The original parser
+/// intentionally ignored unsupported members so AWS CLI filters and
+/// pagination-like inputs remained harmlessly compatible; only indexed
+/// InstanceId members were validated and bound.
+fn parse_legacy_describe_instances(
+    pairs: &[(String, String)],
+) -> std::result::Result<Ec2Query, String> {
+    let action = pairs
+        .iter()
+        .filter_map(|(key, value)| (key == "Action").then_some(value.clone()))
+        .next_back()
+        .ok_or_else(|| "Missing required field 'Action'.".to_string())?;
+    let mut instance_ids = BTreeMap::new();
+    for (key, value) in pairs {
+        if key.starts_with("InstanceId.") {
+            insert_member(&mut instance_ids, key, value.clone(), "InstanceId")?;
+        }
+    }
+    Ok(Ec2Query::DescribeInstances(DescribeInstancesQuery {
+        action,
+        instance_ids: contiguous_members(instance_ids, "InstanceId")?,
+    }))
+}
+
+fn parse_strict_ec2_query(pairs: &[(String, String)]) -> std::result::Result<Ec2Query, String> {
     let mut action = None;
     let mut instance_id = None;
     let mut attribute = None;
@@ -94,17 +108,17 @@ pub fn parse_ec2_query_from_form(body: &[u8]) -> std::result::Result<Ec2Query, S
     let mut max_results = None;
     for (key, value) in pairs {
         match key.as_str() {
-            "Action" => set_unique(&mut action, value, "Action")?,
+            "Action" => set_unique(&mut action, value.clone(), "Action")?,
             "Version" => {}
-            "InstanceId" => set_unique(&mut instance_id, value, "InstanceId")?,
-            "Attribute" => set_unique(&mut attribute, value, "Attribute")?,
-            "NextToken" => set_unique(&mut next_token, value, "NextToken")?,
-            "MaxResults" => set_unique(&mut max_results, value, "MaxResults")?,
+            "InstanceId" => set_unique(&mut instance_id, value.clone(), "InstanceId")?,
+            "Attribute" => set_unique(&mut attribute, value.clone(), "Attribute")?,
+            "NextToken" => set_unique(&mut next_token, value.clone(), "NextToken")?,
+            "MaxResults" => set_unique(&mut max_results, value.clone(), "MaxResults")?,
             key if key.starts_with("InstanceId.") => {
-                insert_member(&mut instance_ids, key, value, "InstanceId")?
+                insert_member(&mut instance_ids, key, value.clone(), "InstanceId")?
             }
             key if key.starts_with("InstanceType.") || key.starts_with("InstanceTypes.") => {
-                insert_member_any_prefix(&mut instance_types, key, value, "InstanceType")?
+                insert_member_any_prefix(&mut instance_types, key, value.clone(), "InstanceType")?
             }
             _ => return Err(format!("Unsupported EC2 Query member '{key}'.")),
         }
@@ -122,7 +136,7 @@ pub fn parse_ec2_query_from_form(body: &[u8]) -> std::result::Result<Ec2Query, S
                 return Err("DescribeInstances received an unsupported member.".to_string());
             }
             let instance_ids = contiguous_members(instance_ids, "InstanceId")?;
-            Ok(Ec2Query::Instances(Query {
+            Ok(Ec2Query::DescribeInstances(DescribeInstancesQuery {
                 action,
                 instance_ids,
             }))
@@ -140,7 +154,7 @@ pub fn parse_ec2_query_from_form(body: &[u8]) -> std::result::Result<Ec2Query, S
             if attribute != "disableApiTermination" {
                 return Err(format!("The attribute '{attribute}' is not supported."));
             }
-            Ok(Ec2Query::InstanceAttribute(
+            Ok(Ec2Query::DescribeInstanceAttribute(
                 DescribeInstanceAttributeQuery {
                     instance_id,
                     attribute,
@@ -164,9 +178,9 @@ pub fn parse_ec2_query_from_form(body: &[u8]) -> std::result::Result<Ec2Query, S
             if instance_types.iter().collect::<BTreeSet<_>>().len() != instance_types.len() {
                 return Err("DescribeInstanceTypes received duplicate instance types.".to_string());
             }
-            Ok(Ec2Query::InstanceTypes(DescribeInstanceTypesQuery {
-                instance_types,
-            }))
+            Ok(Ec2Query::DescribeInstanceTypes(
+                DescribeInstanceTypesQuery { instance_types },
+            ))
         }
         _ => Err(format!("The action '{}' is not supported", action)),
     }
@@ -249,15 +263,6 @@ pub fn action_from_form(body: &[u8]) -> Option<String> {
                 .into_iter()
                 .find_map(|(key, value)| (key == "Action").then_some(value))
         })
-}
-
-#[allow(dead_code)]
-pub fn validate_describe_instances(query: &Query) -> std::result::Result<(), String> {
-    if query.action == "DescribeInstances" {
-        Ok(())
-    } else {
-        Err(format!("The action '{}' is not supported", query.action))
-    }
 }
 
 pub fn observations_from_manifest(manifest: &Value) -> Result<ManifestObservations> {
@@ -658,10 +663,10 @@ fn xml_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DescribeInstanceTypesQuery, Ec2Query, ManifestObservations, Observation, Query,
-        action_from_form, describe_instance_attribute_xml, describe_instance_types_xml,
-        describe_instances_xml, observations_from_manifest, parse_ec2_query_from_form,
-        parse_query_from_form, state_code, validate_describe_instances,
+        DescribeInstanceTypesQuery, DescribeInstancesQuery, Ec2Query, ManifestObservations,
+        Observation, action_from_form, describe_instance_attribute_xml,
+        describe_instance_types_xml, describe_instances_xml, observations_from_manifest,
+        parse_ec2_query_from_form, state_code,
     };
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
@@ -737,20 +742,20 @@ mod tests {
 
     #[test]
     fn parser_rejects_malformed_and_zero_member_indexes() {
-        assert!(parse_query_from_form(b"%zz").is_err());
-        assert!(parse_query_from_form(b"Action=DescribeInstances&InstanceId.0=i-1").is_err());
+        assert!(parse_ec2_query_from_form(b"%zz").is_err());
+        assert!(parse_ec2_query_from_form(b"Action=DescribeInstances&InstanceId.0=i-1").is_err());
         assert!(
-            parse_query_from_form(b"Action=DescribeInstances&InstanceId.1=i-1&InstanceId.1=i-2")
-                .is_err()
+            parse_ec2_query_from_form(
+                b"Action=DescribeInstances&InstanceId.1=i-1&InstanceId.1=i-2"
+            )
+            .is_err()
         );
     }
 
     #[test]
     fn parser_requires_action_and_rejects_unsupported_action() {
-        assert!(parse_query_from_form(b"Version=2016-11-15").is_err());
-        let query = parse_query_from_form(b"Action=DescribeImages").unwrap();
-        assert_eq!(query.action, "DescribeImages");
-        assert!(validate_describe_instances(&query).is_err());
+        assert!(parse_ec2_query_from_form(b"Version=2016-11-15").is_err());
+        assert!(parse_ec2_query_from_form(b"Action=DescribeImages").is_err());
         assert_eq!(
             action_from_form(b"Action=DescribeImages"),
             Some("DescribeImages".to_string())
@@ -854,16 +859,41 @@ mod tests {
 
     #[test]
     fn parser_preserves_ordered_instance_members() {
-        let query =
-            parse_query_from_form(b"Action=DescribeInstances&InstanceId.2=i-2&InstanceId.1=i-1")
-                .unwrap();
+        let query = parse_ec2_query_from_form(
+            b"Action=DescribeInstances&InstanceId.2=i-2&InstanceId.1=i-1",
+        )
+        .unwrap();
         assert_eq!(
             query,
-            Query {
+            Ec2Query::DescribeInstances(DescribeInstancesQuery {
                 action: "DescribeInstances".to_string(),
                 instance_ids: vec!["i-1".to_string(), "i-2".to_string()]
-            }
+            })
         );
+    }
+
+    #[test]
+    fn describe_instances_preserves_legacy_ignored_members() {
+        let query = parse_ec2_query_from_form(
+            b"Action=DescribeInstances&Version=2016-11-15&InstanceId=i-scalar&InstanceId.1=i-1&Filter.1.Name=instance-state-name&Filter.1.Value.1=running&NextToken=legacy-token&MaxResults=1&UnknownMember=ignored",
+        )
+        .unwrap();
+        assert_eq!(
+            query,
+            Ec2Query::DescribeInstances(DescribeInstancesQuery {
+                action: "DescribeInstances".to_string(),
+                instance_ids: vec!["i-1".to_string()],
+            })
+        );
+
+        for body in [
+            b"Action=DescribeInstanceAttribute&InstanceId=i-1&Attribute=disableApiTermination&Filter.1.Name=ignored" as &[u8],
+            b"Action=DescribeInstanceTypes&InstanceType.1=m6i.large&NextToken=legacy-token",
+            b"Action=DescribeInstanceTypes&InstanceType.1=m6i.large&MaxResults=1",
+            b"Action=DescribeInstanceTypes&InstanceType.1=m6i.large&UnknownMember=ignored",
+        ] {
+            assert!(parse_ec2_query_from_form(body).is_err());
+        }
     }
 
     #[test]
@@ -882,7 +912,7 @@ mod tests {
             b"Action=DescribeInstanceAttribute&Version=2016-11-15&InstanceId=i-1&Attribute=disableApiTermination",
         )
         .unwrap();
-        assert!(matches!(attribute, Ec2Query::InstanceAttribute(_)));
+        assert!(matches!(attribute, Ec2Query::DescribeInstanceAttribute(_)));
 
         let types = parse_ec2_query_from_form(
             b"Action=DescribeInstanceTypes&InstanceType.2=m6i.xlarge&InstanceType.1=m6i.large",
@@ -890,7 +920,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             types,
-            Ec2Query::InstanceTypes(DescribeInstanceTypesQuery {
+            Ec2Query::DescribeInstanceTypes(DescribeInstanceTypesQuery {
                 instance_types: vec!["m6i.large".to_string(), "m6i.xlarge".to_string()]
             })
         );

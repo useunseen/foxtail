@@ -361,37 +361,61 @@ PY
 )
 log_step "Verified Foxtail DescribeInstanceAttribute exact IDs and boolean fixture facts"
 
-for instance_type in m6i.large t3.medium m6i.xlarge; do
+while IFS= read -r instance_type; do
   FOXTAIL_TYPES="$(aws_json ec2 describe-instance-types --instance-types "$instance_type")"
-  FOXTAIL_TYPES="$FOXTAIL_TYPES" EXPECTED_INSTANCE_TYPE="$instance_type" python3 - <<'PY'
+  FOXTAIL_TYPES="$FOXTAIL_TYPES" EXPECTED_INSTANCE_TYPE="$instance_type" \
+    FIXTURE_MANIFEST="$FIXTURE_MANIFEST" python3 - <<'PY'
 import json
 import os
 
 payload = json.loads(os.environ["FOXTAIL_TYPES"])
+manifest = json.loads(os.environ["FIXTURE_MANIFEST"])
 records = payload.get("InstanceTypes")
 if not isinstance(records, list) or len(records) != 1:
     raise SystemExit("DescribeInstanceTypes did not return exactly one requested record")
 record = records[0]
 expected = os.environ["EXPECTED_INSTANCE_TYPE"]
-if record.get("InstanceType") != expected:
+catalogue = next(
+    (item for item in manifest["ec2_instance_type_catalogue"] if item["instance_type"] == expected),
+    None,
+)
+if catalogue is None:
+    raise SystemExit(f"fixture catalogue is missing requested type {expected}")
+expected_record = {
+    "InstanceType": catalogue["instance_type"],
+    "SupportedRootDeviceTypes": catalogue["supported_root_device_types"],
+    "SupportedVirtualizationTypes": catalogue["supported_virtualization_types"],
+    "ProcessorInfo": {"SupportedArchitectures": catalogue["supported_architectures"]},
+    "NetworkInfo": {"EnaSupport": catalogue["ena_support"]},
+}
+if record.get("InstanceType") != expected_record["InstanceType"]:
     raise SystemExit(f"unexpected type record {record.get('InstanceType')!r} for {expected}")
-if record.get("SupportedRootDeviceTypes") != ["ebs"]:
-    raise SystemExit("missing or incorrect SupportedRootDeviceTypes")
-if record.get("SupportedVirtualizationTypes") != ["hvm"]:
-    raise SystemExit("missing or incorrect SupportedVirtualizationTypes")
-if (record.get("ProcessorInfo") or {}).get("SupportedArchitectures") != ["x86_64"]:
-    raise SystemExit("missing or incorrect ProcessorInfo.SupportedArchitectures")
-if (record.get("NetworkInfo") or {}).get("EnaSupport") != "required":
-    raise SystemExit("missing or incorrect NetworkInfo.EnaSupport")
+for key in (
+    "SupportedRootDeviceTypes",
+    "SupportedVirtualizationTypes",
+    "ProcessorInfo",
+    "NetworkInfo",
+):
+    if record.get(key) != expected_record[key]:
+        raise SystemExit(f"missing or incorrect {key} for {expected}")
 PY
-done
+done < <(FIXTURE_MANIFEST="$FIXTURE_MANIFEST" python3 - <<'PY'
+import json
+import os
+
+manifest = json.loads(os.environ["FIXTURE_MANIFEST"])
+for item in manifest["ec2_instance_type_catalogue"]:
+    print(item["instance_type"])
+PY
+)
 log_step "Verified Foxtail DescribeInstanceTypes exact current/target catalogue and public fields"
 
 if aws_json ec2 describe-instance-types --instance-types t3.unknown >"$TMP_DIR/unsupported-type.json" 2>"$TMP_DIR/unsupported-type.err"; then
   echo "unsupported DescribeInstanceTypes request unexpectedly succeeded" >&2
   exit 1
 fi
-if ! grep -q "InvalidInstanceType.NotFound" "$TMP_DIR/unsupported-type.err"; then
+if grep -q "InvalidInstanceType.NotFound" "$TMP_DIR/unsupported-type.err" \
+  || ! grep -q "InvalidInstanceType" "$TMP_DIR/unsupported-type.err"; then
   echo "unsupported DescribeInstanceTypes request did not return deterministic error" >&2
   cat "$TMP_DIR/unsupported-type.err" >&2
   exit 1
