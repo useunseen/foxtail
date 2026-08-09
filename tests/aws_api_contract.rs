@@ -110,6 +110,10 @@ async fn ec2_query_describe_instances_returns_exact_manifest_rows() {
     assert!(body.contains("<DescribeInstancesResponse"));
     assert!(body.contains("<instanceState><code>16</code><name>running</name>"));
     assert!(body.contains("<instanceType>m6i.large</instanceType>"));
+    assert!(body.contains("<rootDeviceType>ebs</rootDeviceType>"));
+    assert!(body.contains("<architecture>x86_64</architecture>"));
+    assert!(body.contains("<virtualizationType>hvm</virtualizationType>"));
+    assert!(body.contains("<enaSupport>true</enaSupport>"));
     assert!(body.contains("<availabilityZone>us-east-1a</availabilityZone>"));
     for resource_id in &expected_ids {
         assert!(body.contains(&format!("<instanceId>{resource_id}</instanceId>")));

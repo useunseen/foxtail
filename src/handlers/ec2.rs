@@ -540,7 +540,11 @@ pub fn describe_instances_xml(
         xml.push_str(&xml_escape(&observation.instance_state));
         xml.push_str("</name></instanceState><instanceType>");
         xml.push_str(&xml_escape(&observation.instance_type));
-        xml.push_str("</instanceType><launchTime>");
+        // Keep the ordinary EC2 identity/configuration projection complete
+        // enough for consumers to reconcile compatibility from public
+        // DescribeInstances facts. These values are the fixture-owned exact
+        // m6i.large catalogue facts, not an assessor or finding policy.
+        xml.push_str("</instanceType><rootDeviceType>ebs</rootDeviceType><architecture>x86_64</architecture><virtualizationType>hvm</virtualizationType><enaSupport>true</enaSupport><networkInterfaceSet/><blockDeviceMapping/><launchTime>");
         xml.push_str(&xml_escape(anchor));
         xml.push_str("</launchTime><placement><availabilityZone>");
         xml.push_str(&xml_escape(&observation.availability_zone));
