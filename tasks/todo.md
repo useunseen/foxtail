@@ -1207,5 +1207,5 @@ also passed. The temporary LocalStack container and databases were removed.
   container, service, and temporary database were removed.
 - [x] Focused public-contract test commit `192e1f1` asserts every realized
   `DescribeInstances` row carries all three neutral classification tags.
-- [x] Final checked-out HEAD is
-  `192e1f14892609c40622d6fa06e4697f2c089d96` with a clean worktree.
+- [x] The final checked-out worktree is clean after the commits above; the
+  exact current HEAD is reported in the handoff below.
