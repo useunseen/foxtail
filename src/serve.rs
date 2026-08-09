@@ -4967,7 +4967,8 @@ async fn handle_get_ec2_instance_recommendations(
     let page_start = parse_usize_token(req.next_token.as_deref(), "nextToken")?;
     let page_size = clamp_page_size(req.max_results, 50, 100);
     let rows = sqlx::query(
-        "SELECT r.id, r.region, r.tags, AVG(m.value) AS avg_cpu
+        "SELECT r.id, r.region, r.tags, AVG(m.value) AS avg_cpu,
+                MAX(m.seconds_from_now) AS latest_metric_offset
          FROM resources r
          LEFT JOIN metrics m
            ON m.resource_id = r.id
@@ -4996,7 +4997,7 @@ async fn handle_get_ec2_instance_recommendations(
         ));
     }
 
-    let last_refresh = Utc::now().to_rfc3339();
+    let now = Utc::now();
     let page_end = std::cmp::min(page_start + page_size, rows.len());
     let recommendations = rows[page_start..page_end]
         .iter()
@@ -5009,6 +5010,13 @@ async fn handle_get_ec2_instance_recommendations(
                 .ok()
                 .flatten()
                 .unwrap_or(0.0);
+            let latest_metric_offset = row
+                .try_get::<Option<i64>, _>("latest_metric_offset")
+                .ok()
+                .flatten()
+                .unwrap_or(0)
+                .min(0);
+            let last_refresh = (now + chrono::Duration::seconds(latest_metric_offset)).to_rfc3339();
             let (finding, target_instance_type, projected_cpu, monthly_savings_pct) =
                 if average_cpu < 15.0 {
                     (
