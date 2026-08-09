@@ -4372,7 +4372,7 @@ mod tests {
         assert_eq!(value["digest"], digest);
         assert_eq!(
             value["generator"]["source_revision"],
-            "4ee5edbc06bb2f74dcc5243880cf62a09c304bb7"
+            "d199cd2711bc9a290291f28116d91cf9272216a3"
         );
         assert_eq!(
             value["environment"]["estate_fingerprint"],
