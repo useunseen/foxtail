@@ -121,6 +121,10 @@ async fn ec2_query_describe_instances_returns_exact_manifest_rows() {
     }
     assert_eq!(body.matches("<instanceId>").count(), 5);
     assert_eq!(body.matches("<item><instanceId>").count(), 5);
+    for key in ["Owner", "Criticality", "Environment"] {
+        assert_eq!(body.matches(&format!("<key>{key}</key>")).count(), 5);
+    }
+    assert_eq!(body.matches("<value>unknown</value>").count(), 15);
 }
 
 #[tokio::test]
