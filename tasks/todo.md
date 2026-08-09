@@ -767,3 +767,29 @@ external mutation or durable partial state.
 - Frozen-object Spec/correctness review was clean across all twelve acceptance
   criteria. Standards review found no code issue and identified only the
   previously incomplete progress/results record closed by this section.
+
+# Issue #12: Publish Explicit Oracle Policy Selectors
+
+Pinned base: `eaf5f12c97a7997bd3a00cfff16e516c17c0477d`
+
+## Acceptance Map
+
+- [ ] Add the exact `finding_type` map to Foxtail's canonical definition builder and prove all five read-only controls in the canonical golden/CLI/HTTP output.
+- [ ] Require supported non-empty `finding_type` for positive, negative, and degraded definition controls in the Draft 2020-12 schema and runtime/negative validation; mutation controls must omit it.
+- [ ] Document selector authority as production policy-registration metadata only and reject nested/misplaced selector or expected-outcome encodings while preserving existing forbidden policy fields.
+- [ ] Advance `DEFINITION_REVISION`, schema consts, canonical definition/manifest digests, and checked-in goldens deterministically; update Foxtail-owned source-revision assertions without editing Unseen.
+- [ ] Keep the manifest bound to the exact definition digest without duplicating selector truth; preserve canonical CLI/HTTP parity and schema validation.
+- [ ] Preserve mutation/readiness/AWS CLI/interoperability behavior and run focused Unseen #355 compatibility proof read-only.
+- [ ] Commit the functional implementation, then a separate source-pin/golden update commit if required; report exact hashes and final head.
+
+## Execution Plan
+
+- [x] Inspect current definition, manifest, schema, validator, CLI/HTTP parity, and sibling Unseen policy registration.
+- [x] Implement selectors, schema/runtime validation, docs, focused tests, and regenerate goldens.
+- [x] Run focused Rust/schema/CLI checks and the read-only Unseen compatibility command.
+- [ ] Commit the functional change and any separate source-pin/golden change without amending.
+- [ ] Review the complete diff against every acceptance criterion and record results, residual gaps, and final git status.
+
+## Review and Results
+
+Pending implementation and frozen-head review.

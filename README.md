@@ -177,6 +177,16 @@ routes remain the authoritative evidence surfaces. The default public account
 scope is `123456789012`; an explicit fixture `account_id` must match it so
 manifest ARNs and public identities cannot diverge.
 
+Each positive, negative, or degraded read-only control declares a non-empty
+`finding_type` selector: the three idle controls use `idle_instance`, and the
+two resize controls use `rightsizing`. This field is production
+policy-registration metadata only. It selects which registered assessor
+handles the control; evidence from the ordinary AWS-compatible surfaces
+determines the oracle outcome. Foxtail does not copy selectors into the
+manifest, and roles, scenario/realization prose, tags, or expected-outcome
+fields are never authoritative policy input. Mutation controls remain outside
+the read-only oracle namespace and deliberately omit the selector.
+
 Without the exact `FOXTAIL_QUALIFICATION_ENV=isolated` value, `fixture realize`
 keeps those mutation controls declared-only and does not call EC2 or write a
 mutation generation. In isolated mode, Foxtail uses the `AWS_ENDPOINT_URL` (or

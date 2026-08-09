@@ -2,6 +2,40 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://useunseen.dev/foxtail/schemas/release-fixture-manifest-v1.schema.json",
   "title": "Foxtail release qualification Fixture Manifest v1",
+  "$defs": {
+    "selector_free_value": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "finding_type": false
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/selector_free_value"
+          }
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/selector_free_value"
+          }
+        },
+        {"type": "string"},
+        {"type": "number"},
+        {"type": "boolean"},
+        {"type": "null"}
+      ]
+    },
+    "selector_free_object": {
+      "type": "object",
+      "properties": {
+        "finding_type": false
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/selector_free_value"
+      }
+    }
+  },
   "type": "object",
   "required": [
     "schema",
@@ -26,7 +60,7 @@
       "required": ["name", "revision", "digest"],
       "properties": {
         "name": {"const": "release-qualification-v1"},
-        "revision": {"const": "1.0.0"},
+        "revision": {"const": "1.0.1"},
         "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
       },
       "additionalProperties": false
@@ -101,9 +135,12 @@
           "aws_identity": {"type": "string"},
           "scenario": {"type": "string"},
           "evidence": {
-            "type": "object",
+            "$ref": "#/$defs/selector_free_object",
             "patternProperties": {
-              "^(Required|Stretch|required|stretch|expected_finding|expected_findings|authoritative_expected_finding|finding)$": false
+              "^(Required|Stretch|required|stretch|expected_finding|expected_findings|authoritative_expected_finding|finding|finding_type)$": false
+            },
+            "additionalProperties": {
+              "$ref": "#/$defs/selector_free_value"
             }
           },
           "observed": {
@@ -115,16 +152,20 @@
               "availability_zone": {"type": "string"},
               "tags": {
                 "type": "object",
+                "properties": {"finding_type": false},
                 "additionalProperties": {"type": "string"}
               }
             },
             "patternProperties": {
-              "^(Required|Stretch|required|stretch|expected_finding|expected_findings|authoritative_expected_finding|finding)$": false
+              "^(Required|Stretch|required|stretch|expected_finding|expected_findings|authoritative_expected_finding|finding|finding_type)$": false
+            },
+            "additionalProperties": {
+              "$ref": "#/$defs/selector_free_value"
             }
           }
         },
         "patternProperties": {
-          "^(Required|Stretch|required|stretch|expected_finding|expected_findings|authoritative_expected_finding|finding)$": false
+          "^(Required|Stretch|required|stretch|expected_finding|expected_findings|authoritative_expected_finding|finding|finding_type)$": false
         },
         "not": {
           "anyOf": [
@@ -137,7 +178,9 @@
             {"required": ["finding"]}
           ]
         },
-        "additionalProperties": true
+        "additionalProperties": {
+          "$ref": "#/$defs/selector_free_value"
+        }
       }
     },
     "mutation_resources": {
@@ -187,8 +230,14 @@
       "minItems": 5,
       "items": {
         "type": "object",
+        "properties": {
+          "finding_type": false
+        },
         "patternProperties": {
-          "^(Required|Stretch|required|stretch|expected_finding|expected_findings|authoritative_expected_finding|finding)$": false
+          "^(Required|Stretch|required|stretch|expected_finding|expected_findings|authoritative_expected_finding|finding|finding_type)$": false
+        },
+        "additionalProperties": {
+          "$ref": "#/$defs/selector_free_value"
         }
       }
     },
@@ -203,7 +252,7 @@
           "role": {"enum": ["positive", "negative", "degraded", "mutation"]}
         },
         "patternProperties": {
-          "^(Required|Stretch|required|stretch|expected_finding|expected_findings|authoritative_expected_finding|finding)$": false
+          "^(Required|Stretch|required|stretch|expected_finding|expected_findings|authoritative_expected_finding|finding|finding_type)$": false
         },
         "not": {
           "anyOf": [
@@ -216,15 +265,23 @@
             {"required": ["finding"]}
           ]
         },
-        "additionalProperties": true
+        "additionalProperties": {
+          "$ref": "#/$defs/selector_free_value"
+        }
       }
     },
     "fault_profiles": {
       "type": "array",
       "items": {
         "type": "object",
+        "properties": {
+          "finding_type": false
+        },
         "patternProperties": {
-          "^(Required|Stretch|required|stretch|expected_finding|expected_findings|authoritative_expected_finding|finding)$": false
+          "^(Required|Stretch|required|stretch|expected_finding|expected_findings|authoritative_expected_finding|finding|finding_type)$": false
+        },
+        "additionalProperties": {
+          "$ref": "#/$defs/selector_free_value"
         }
       }
     },
