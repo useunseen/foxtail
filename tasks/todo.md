@@ -299,20 +299,23 @@ Invariant: Foxtail owns only deterministic fixture facts and AWS-compatible read
 - [x] 10. Disposable CLI interop: extend `scripts/verify_cli_interop.sh` for both operations against Foxtail, asserting exact IDs/boolean/type records/all public fields, deterministic negatives, and distinct Foxtail vs LocalStack endpoints while preserving lifecycle/mutation proof.
 - [ ] 11. Sibling proof: using Unseen read-only commit `f4c5e7802def856fb4d4ec6996cbd616ea16bd95`, run its real `AwsCompatibleObservationPort.observe()` against repaired Foxtail disposable state; confirm no `UnsupportedAction`, missing instance-attribute/target-compatibility evidence, or `unsupported_capability`. Add a reproducible Foxtail-side harness when possible; report exact environment blocker otherwise; do not edit Unseen.
 - [ ] 12. Broad regression: run format, full Rust tests, clippy with `-D warnings`, pinned fixture validators (including negatives), shell syntax, wrapper proof, diff check, and full disposable CLI interop with required LocalStack settings.
-- [ ] 13. Contract/source report: update fixture schema/data/goldens/digests/source-owned facts where required and report exact final Foxtail commits/revision; never edit sibling Unseen pins/contracts.
+- [x] 13. Contract/source report: update fixture schema/data/goldens/digests/source-owned facts where required and report exact final Foxtail commits/revision; never edit sibling Unseen pins/contracts.
 
 ## Execution Plan
 
 - [x] Inspect EC2 fixture schema/manifest, handler, dispatcher, wrapper, scripts, tests, migration, Compute Optimizer target logic, and sibling compatibility code at the pinned revisions.
 - [x] Implement one validated Foxtail observation boundary for `DescribeInstanceAttribute` and `DescribeInstanceTypes`, keeping route orchestration in `serve.rs` and fixture truth/schema/goldens in their owners.
 - [x] Add focused success/failure/identity/duplicate/integrity/pagination tests and wrapper/CLI smoke assertions; update deterministic fixture artefacts and docs as needed.
-- [ ] Run focused verification, commit coherent implementation batches without amending, and review the complete diff against every acceptance criterion.
+- [x] Run focused verification, commit coherent implementation batches without amending, and review the complete diff against every acceptance criterion.
 - [ ] Run broad verification and sibling live compatibility proof; record exact results, residual gaps, and final commits below.
 
 ## Issue #14 Results / Review
 
-Implementation is complete and ready for the non-amended functional commit plus
-the required source-pin/golden follow-up. The checked-in manifest now owns the
+The functional implementation is committed as `cbb8bf5e422b0fd1284e9474db6cf9117a034e19`.
+A non-amended source-pin/golden follow-up updates the checked-in manifest and
+the Foxtail-owned golden assertion to that functional revision; its exact hash
+and final branch head are reported in the worker handoff. The checked-in
+manifest now owns the
 strict `disable_api_termination` boolean for every realized read-only control
 and an exact catalogue for `m6i.large`, `t3.medium`, and `m6i.xlarge`; the
 handler validates those facts before serving Query/XML observations.
@@ -322,8 +325,9 @@ handler validates those facts before serving Query/XML observations.
   unsupported/continuation failures, and persisted digest preservation),
   `bash scripts/verify_wrapper_routing.sh`, and
   `python3 scripts/validate_release_fixture.py --negative`.
-- Full Rust tests and clippy passed before the final duplicate/integrity test
-  tightening; they will be rerun in the broad verification pass.
+- Focused fixture proof passed after source pinning: `cargo test
+  fixture::tests:: --lib` (18 tests). Full Rust tests and clippy will be rerun
+  in the broad verification pass.
 - The disposable CLI script and sibling `AwsCompatibleObservationPort.observe`
   live proof remain pending because this environment has no checked-in
   `mock_data.db`, no `FOXTAIL_MUTATION_AMI_ID`, and LocalStack at
