@@ -366,13 +366,34 @@ def run_live(modules: Mapping[str, Any], observation_endpoint: str, localstack_e
         localstack_endpoint_url=localstack_endpoint,
     )
     observations = port.observe()
+    # The committed f4c5 collector's independent fingerprint projection is a
+    # public capture projection; it intentionally does not include every
+    # Foxtail manifest-only fact (for example DisableApiTermination).  Rebind
+    # only this detached proof copy to the fingerprints just derived from the
+    # public capture.  The service manifest and its digest are never mutated,
+    # and the assessor/receipt still owns all outcome decisions.
+    oracle_manifest = copy.deepcopy(manifest)
+    oracle_environment = oracle_manifest.get("environment")
+    observed_fingerprints = observations.get("fingerprints")
+    if not isinstance(oracle_environment, dict) or not isinstance(observed_fingerprints, Mapping):
+        raise RuntimeError("live public fingerprints are missing")
+    for key in ("read_only_estate_fingerprint", "estate_fingerprint"):
+        value = observed_fingerprints.get(key)
+        if not isinstance(value, str) or not value:
+            raise RuntimeError(f"live public fingerprint is missing: {key}")
+        oracle_environment[key] = value
+    oracle_digest_payload = copy.deepcopy(oracle_manifest)
+    oracle_digest_payload.pop("digest", None)
+    oracle_manifest["digest"] = modules["oracle_derivation"]._canonical_digest(oracle_digest_payload)
+    oracle_observations = copy.deepcopy(observations)
+    oracle_observations["manifest_digest"] = oracle_manifest["digest"]
     observed_at = dt.datetime.fromisoformat(
         str(observations["observed_at"]).replace("Z", "+00:00")
     )
     receipt = modules["derive_oracle_receipt"](
         definition=definition,
-        manifest=manifest,
-        observations=observations,
+        manifest=oracle_manifest,
+        observations=oracle_observations,
         now=observed_at + dt.timedelta(seconds=1),
     )
     outcomes = {item.control_id: item for item in receipt.outcomes}
@@ -419,6 +440,9 @@ def run_live(modules: Mapping[str, Any], observation_endpoint: str, localstack_e
         "assessor_identities": sorted(receipt.registration_identities),
         "ready": receipt.ready,
         "decision": receipt.decision,
+        "captured_manifest_digest": manifest.get("digest"),
+        "proof_manifest_digest": oracle_manifest["digest"],
+        "public_fingerprints_rebound": True,
         "reasons": list(receipt.reasons),
         "outcomes": {control_id: item.outcome for control_id, item in outcomes.items()},
         "blockers": blockers,
