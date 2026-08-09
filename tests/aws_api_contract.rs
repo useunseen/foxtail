@@ -2,7 +2,7 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use foxtail::{db, fixture, serve};
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
@@ -240,6 +240,57 @@ async fn ec2_oracle_observation_routes_bind_exact_fixture_facts_and_fail_closed(
             .unwrap()
             .len(),
         3
+    );
+}
+
+#[tokio::test]
+async fn fixture_idle_positive_cloudwatch_peak_is_complete_and_deterministic() {
+    let pool = test_pool("fixture-idle-positive-cloudwatch").await;
+    seed_fixture_resources(&pool).await;
+    fixture::realize(
+        &pool,
+        fixture::RealizeRequest {
+            clock_anchor: Some("2026-08-05T00:00:00Z".to_string()),
+            ..fixture::RealizeRequest::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let now = Utc::now().with_nanosecond(0).unwrap();
+    let body = json!({
+        "Namespace": "AWS/EC2",
+        "MetricName": "CPUUtilization",
+        "Dimensions": [{"Name": "InstanceId", "Value": "i-ec2-query-0"}],
+        "StartTime": (now - chrono::Duration::days(15)).to_rfc3339(),
+        "EndTime": now.to_rfc3339(),
+        "Period": 3600,
+        "Statistics": ["Maximum"]
+    });
+    let response = serve::build_app(pool)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/")
+                .header("content-type", "application/x-amz-json-1.0")
+                .header(
+                    "x-amz-target",
+                    "GraniteServiceVersion20100801.GetMetricStatistics",
+                )
+                .header("x-mock-now", now.to_rfc3339())
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload = response_json(response).await;
+    let datapoints = payload["Datapoints"].as_array().unwrap();
+    assert_eq!(datapoints.len(), 14);
+    assert!(
+        datapoints
+            .iter()
+            .all(|datapoint| datapoint["Maximum"] == json!(4.0))
     );
 }
 

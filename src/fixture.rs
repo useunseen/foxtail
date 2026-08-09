@@ -96,7 +96,7 @@ struct MaterializationProfile {
 const MATERIALIZATION_PROFILES: [MaterializationProfile; 5] = [
     MaterializationProfile {
         control_id: "ec2-idle-positive-001",
-        cpu_value: 5.0,
+        cpu_value: 4.0,
         cost_amount: 1.0,
         missing_cpu_day: None,
     },
@@ -4422,6 +4422,15 @@ mod tests {
         let golden = golden.strip_suffix(b"\n").unwrap_or(golden);
         let expected: Value = serde_json::from_slice(golden).unwrap();
         let mut manifest: Value = serde_json::from_slice(&snapshot.manifest_bytes).unwrap();
+        let positive = manifest["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|resource| resource["control_id"] == "ec2-idle-positive-001")
+            .unwrap();
+        assert_eq!(positive["observed"]["average_cpu"], json!(4.0));
+        assert_eq!(positive["observed"]["metric_count"], json!(42));
+        assert_eq!(positive["observed"]["cost_record_count"], json!(14));
         manifest["generator"]["source_revision"] = expected["generator"]["source_revision"].clone();
         manifest["digest"] = json!(canonical_digest(&manifest).unwrap());
         assert_eq!(canonical_bytes(&manifest).unwrap(), golden);

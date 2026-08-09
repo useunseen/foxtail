@@ -799,12 +799,21 @@ import os
 control_id = os.environ["CONTROL_ID"]
 datapoints = json.loads(os.environ["CPU_HISTORY"]).get("Datapoints", [])
 expected = 13 if control_id == "ec2-idle-degraded-001" else 14
+expected_cpu = {
+    "ec2-idle-positive-001": 4.0,
+    "ec2-idle-negative-001": 85.0,
+    "ec2-idle-degraded-001": 7.0,
+    "ec2-resize-positive-001": 6.0,
+    "ec2-resize-negative-001": 40.0,
+}[control_id]
 if len(datapoints) != expected:
     raise SystemExit(
         f"{control_id} expected {expected} CPU history points, found {len(datapoints)}"
     )
 if not all(point.get("Average", 0) > 0 for point in datapoints):
     raise SystemExit(f"{control_id} returned a non-positive CPU history point")
+if {float(point.get("Average", 0)) for point in datapoints} != {expected_cpu}:
+    raise SystemExit(f"{control_id} returned an unexpected CPU profile")
 PY
 done <<<"$FIXTURE_IDS"
 log_step "Verified release fixture: identity-matched CloudWatch metrics and scoped history gaps"

@@ -177,6 +177,12 @@ routes remain the authoritative evidence surfaces. The default public account
 scope is `123456789012`; an explicit fixture `account_id` must match it so
 manifest ARNs and public identities cannot diverge.
 
+The canonical generation rules publish the five fixture-owned evidence
+profiles. The idle-positive control emits 14 complete daily CPU samples at a
+deterministic `4.0` peak, with positive daily network and cost rows; the
+negative and degraded controls retain their complete/bounded-history profiles,
+and the two resize controls retain their complete recommendation evidence.
+
 Each positive, negative, or degraded read-only control declares a non-empty
 `finding_type` selector: the three idle controls use `idle_instance`, and the
 two resize controls use `rightsizing`. This field is production

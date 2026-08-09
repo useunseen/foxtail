@@ -975,3 +975,53 @@ repair hash and final head are reported in that handoff.
 - No implementation gap remains in this repair slice; the parent should run
   its broad verification matrix and any available LocalStack/CLI smoke before
   publication.
+
+# Issue #16: Align Idle-Positive Fixture Evidence
+
+Pinned base: `9b3f99d86aad059c66e12479bf721c38050054ee` (`origin/main`).
+
+Invariant: Foxtail owns deterministic ordinary AWS-compatible evidence only;
+the realized `ec2-idle-positive-001` CPU peak must land strictly on the
+finding-producing side of the exact registered Unseen idle assessor, while
+the assessor itself remains the authority for the 5.0 boundary and all five
+outcomes.
+
+## Acceptance Map
+
+- [ ] 1. Lower only the fixture-owned positive CPU realization while preserving
+  14 complete daily CPU/network/cost samples, identity/scope/provenance, and
+  positive costs; prove the public CloudWatch/Cost/EC2 responses and exact
+  Unseen idle outcome.
+- [ ] 2. Preserve idle-negative `no_finding`, idle-degraded `blocked` for its
+  missing day, resize-positive finding, and resize-negative `no_finding`.
+- [ ] 3. Keep finding selectors as registration metadata only; retain recursive
+  forbidden-policy validation and add no expected-outcome truth or copied
+  Unseen threshold logic.
+- [ ] 4. Keep all five explicit `finding_type` selectors and fail-closed
+  selector placement/unsupported cases across canonical documents and schemas.
+- [ ] 5. Preserve ordinary CloudWatch metric names/statistics, timestamps,
+  identity binding, pagination/provenance, and malformed/truncated failures.
+- [ ] 6. Regenerate definition/manifest goldens and digests deterministically;
+  pin `generator.source_revision` to the functional commit in a separate
+  follow-up commit.
+- [ ] 7-8. Run an explicit read-only proof using only committed Unseen
+  `f4c5e7802def856fb4d4ec6996cbd616ea16bd95` source: positive finding,
+  exact-5.0 boundary no-finding, and the five-control outcome matrix without
+  unsupported capability, stale-window, identity, or fabricated-tag blockers.
+- [ ] 9-10. Run formatting, Rust/schema/validator/CLI gates and report exact
+  commits, digests, source revision, proof outcomes, blockers, and clean status.
+
+## Execution Plan
+
+- [x] Record the acceptance map and inspect the canonical materialization,
+  public handlers, goldens, validators, and exact Unseen assessor boundary.
+- [ ] Change the single positive materialization profile, add focused evidence
+  assertions, and regenerate fixture definition/manifest goldens.
+- [ ] Commit functional behavior first; update the source pin/golden assertion
+  in one separate non-amended commit.
+- [ ] Review the frozen diff and run focused plus broad verification, including
+  the disposable/public proof where the environment permits.
+
+## Results
+
+Pending functional implementation and verification.
